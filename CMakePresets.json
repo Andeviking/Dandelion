@@ -1,0 +1,60 @@
+{
+  "version": 10,
+  "cmakeMinimumRequired": { "major": 4, "minor": 5, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "ninja-base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": true,
+        "DANDELION_BUILD_TESTS": true
+      }
+    },
+    {
+      "name": "debug",
+      "displayName": "Debug with ASan + UBSan (select CXX on first configure)",
+      "inherits": "ninja-base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug", "DANDELION_ENABLE_SANITIZERS": true }
+    },
+    {
+      "name": "release",
+      "displayName": "Release (select CXX on first configure)",
+      "inherits": "ninja-base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release", "DANDELION_ENABLE_SANITIZERS": false }
+    },
+    {
+      "name": "relwithdebinfo",
+      "displayName": "RelWithDebInfo (select CXX on first configure)",
+      "inherits": "ninja-base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo", "DANDELION_ENABLE_SANITIZERS": false }
+    },
+    {
+      "name": "clang-debug",
+      "displayName": "Clang Debug (set CXX=clang++ on first configure)",
+      "inherits": "debug",
+      "cacheVariables": { "DANDELION_ENABLE_SANITIZERS": false }
+    },
+    {
+      "name": "gcc-asan-ubsan",
+      "displayName": "GCC ASan + UBSan (set CXX=g++ on first configure)",
+      "inherits": "debug",
+      "cacheVariables": { "DANDELION_ENABLE_SANITIZERS": true }
+    }
+  ],
+  "buildPresets": [
+    { "name": "debug", "configurePreset": "debug" },
+    { "name": "release", "configurePreset": "release" },
+    { "name": "relwithdebinfo", "configurePreset": "relwithdebinfo" },
+    { "name": "clang-debug", "configurePreset": "clang-debug" },
+    { "name": "gcc-asan-ubsan", "configurePreset": "gcc-asan-ubsan" }
+  ],
+  "testPresets": [
+    { "name": "debug", "configurePreset": "debug", "output": { "outputOnFailure": true }, "execution": { "noTestsAction": "error" } },
+    { "name": "release", "configurePreset": "release", "output": { "outputOnFailure": true }, "execution": { "noTestsAction": "error" } },
+    { "name": "relwithdebinfo", "configurePreset": "relwithdebinfo", "output": { "outputOnFailure": true }, "execution": { "noTestsAction": "error" } },
+    { "name": "clang-debug", "configurePreset": "clang-debug", "output": { "outputOnFailure": true }, "execution": { "noTestsAction": "error" } },
+    { "name": "gcc-asan-ubsan", "configurePreset": "gcc-asan-ubsan", "output": { "outputOnFailure": true }, "execution": { "noTestsAction": "error" } }
+  ]
+}

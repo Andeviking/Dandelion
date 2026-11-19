@@ -1,0 +1,16 @@
+BasedOnStyle: Google
+Language: Cpp
+Standard: c++23
+IndentWidth: 2
+ColumnLimit: 80
+# Preserve include order until dependencies are audited.
+SortIncludes:
+  Enabled: false
+IncludeBlocks: Preserve
+# Formatting must not add/remove braces or reorder qualifiers.
+InsertBraces: false
+RemoveBracesLLVM: false
+RemoveParentheses: Leave
+RemoveSemicolon: false
+QualifierAlignment: Leave
+SortUsingDeclarations: Never

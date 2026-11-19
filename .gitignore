@@ -43,6 +43,17 @@ build/
 Build/
 build-*/
 
+# Project-managed dependency sources and acquisition state
+/subprojects/benchmark-1.10.0/
+/subprojects/.benchmark-1.10.0-*.tmp/
+/subprojects/.benchmark-1.10.0.lock
+/subprojects/googletest-1.18.0/
+/subprojects/.googletest-1.18.0-*.tmp/
+/subprojects/.googletest-1.18.0.lock
+/subprojects/gmp-6.3.0/
+/subprojects/.gmp-6.3.0-*.tmp/
+/subprojects/.gmp-6.3.0.lock
+
 # CMake generated files
 CMakeFiles/
 CMakeCache.txt
@@ -66,3 +77,6 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+dist/
+CMakeUserPresets.json
+__pycache__/

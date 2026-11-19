@@ -1,0 +1,4 @@
+#pragma once
+
+inline constexpr char kDandelionSourceDir[] = "@DANDELION_ESCAPED_PROJECT_SOURCE_DIR@";
+inline constexpr char kDandelionPython[] = "@DANDELION_ESCAPED_Python3_EXECUTABLE@";
