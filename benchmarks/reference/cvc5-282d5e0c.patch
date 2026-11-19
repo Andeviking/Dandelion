@@ -1,0 +1,823 @@
+--- /dev/null
++++ b/src/expr/dandelion_trace.h
+@@ -0,0 +1,42 @@
++// Dandelion's bounded expression capture for the pinned cvc5 revision.
++#pragma once
++
++#include <cstdint>
++#include <string>
++
++#include <cvc5/cvc5_export.h>
++
++namespace cvc5::internal {
++class NodeManager;
++namespace expr {
++class NodeValue;
++}
++
++namespace dandelion_trace {
++
++class CVC5_EXPORT Phase
++{
++ public:
++  explicit Phase(const char* phase);
++  ~Phase();
++  Phase(const Phase&) = delete;
++  Phase& operator=(const Phase&) = delete;
++ private:
++  const char* d_previous;
++};
++
++bool Enabled();
++void Request(const expr::NodeValue* node, bool sort, const char* outcome);
++void Type(const NodeManager* manager, uint64_t node, uint64_t sort);
++void SortArity(const NodeManager* manager, uint64_t sort, uint64_t arity);
++void Lifetime(const expr::NodeValue* node, const char* event);
++CVC5_EXPORT void Root(const char* role, uint64_t id);
++void Snapshot(const char* role);
++void Visit(uint64_t id);
++void Cache(const char* kind, unsigned theory, uint64_t key, uint64_t value);
++void CacheLookup(const char* kind, uint64_t key, bool hit);
++void Metadata(const char* event, const std::string& fields);
++CVC5_EXPORT void Command(const std::string& name);
++
++}  // namespace dandelion_trace
++}  // namespace cvc5::internal
+--- /dev/null
++++ b/src/expr/dandelion_trace.cpp
+@@ -0,0 +1,301 @@
++#include "expr/dandelion_trace.h"
++
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <sstream>
++#include <string_view>
++
++#include "expr/array_store_all.h"
++#include "expr/metakind.h"
++#include "expr/node.h"
++#include "expr/type_node.h"
++#include "util/bitvector.h"
++#include "util/divisible.h"
++#include "util/floatingpoint.h"
++#include "util/rational.h"
++#include "util/roundingmode.h"
++
++namespace cvc5::internal::dandelion_trace {
++namespace {
++
++thread_local const char* phase = "setup";
++
++struct Output
++{
++  FILE* file = nullptr;
++  const NodeManager* manager = nullptr;
++  uint64_t cap = 0;
++  uint64_t bytes = 0;
++  uint64_t events = 0;
++  const char* failure = nullptr;
++
++  Output()
++  {
++    const char* path = std::getenv("DANDELION_CVC5_TRACE");
++    if (!path) return;
++    const char* limit = std::getenv("DANDELION_CVC5_TRACE_BYTES");
++    cap = limit ? std::strtoull(limit, nullptr, 10) : 134217728;
++    file = std::fopen(path, "wb");
++    if (!file) return;
++    bytes = std::fwrite("dandelion-cvc5 1\n", 1, 17, file);
++  }
++
++  ~Output()
++  {
++    if (!file) return;
++    if (failure) std::fprintf(file, "truncated %s\n", failure);
++    else std::fprintf(file, "end %llu\n", static_cast<unsigned long long>(events));
++    std::fclose(file);
++  }
++
++  bool select(const NodeManager* candidate)
++  {
++    if (!file || failure) return false;
++    if (!manager) manager = candidate;
++    if (manager != candidate)
++    {
++      failure = "multiple-node-managers";
++      return false;
++    }
++    return true;
++  }
++
++  void write(const char* event, std::string_view fields)
++  {
++    if (!file || failure) return;
++    const uint64_t size = std::strlen(event) + std::strlen(phase) + fields.size() + 3;
++    if (bytes + size > cap)
++    {
++      failure = "byte-limit";
++      return;
++    }
++    if (std::fprintf(file, "%s %s %.*s\n", event, phase,
++                     static_cast<int>(fields.size()), fields.data()) < 0)
++    {
++      failure = "write-error";
++      return;
++    }
++    bytes += size;
++    ++events;
++  }
++};
++
++Output& GetOutput()
++{
++  static Output output;
++  return output;
++}
++
++void Format(std::ostream& out, const FloatingPointSize& size)
++{
++  out << ' ' << size.exponentWidth() << ' ' << size.significandWidth();
++}
++
++void Payload(std::ostream& out, const expr::NodeValue* node)
++{
++  switch (node->getKind())
++  {
++    case Kind::BITVECTOR_TYPE:
++      out << ' ' << uint32_t(node->getConst<BitVectorSize>());
++      break;
++    case Kind::FLOATINGPOINT_TYPE:
++      Format(out, node->getConst<FloatingPointSize>());
++      break;
++    case Kind::CONST_BOOLEAN:
++      out << ' ' << node->getConst<bool>();
++      break;
++    case Kind::CONST_INTEGER:
++    case Kind::CONST_RATIONAL:
++      out << ' ' << node->getConst<Rational>().toString();
++      break;
++    case Kind::CONST_BITVECTOR:
++    {
++      const auto& value = node->getConst<BitVector>();
++      out << ' ' << value.getSize() << ' ' << value.toString(10);
++      break;
++    }
++    case Kind::CONST_FLOATINGPOINT:
++    {
++      const auto& value = node->getConst<FloatingPoint>();
++      Format(out, value.getSize());
++      out << ' ' << (value.isNaN() ? "nan" : value.pack().toString(10));
++      break;
++    }
++    case Kind::CONST_ROUNDINGMODE:
++    {
++      const auto mode = node->getConst<RoundingMode>();
++      const auto ordinal = mode == RoundingMode::ROUND_NEAREST_TIES_TO_EVEN ? 0
++          : mode == RoundingMode::ROUND_NEAREST_TIES_TO_AWAY ? 1
++          : mode == RoundingMode::ROUND_TOWARD_POSITIVE ? 2
++          : mode == RoundingMode::ROUND_TOWARD_NEGATIVE ? 3 : 4;
++      out << ' ' << ordinal;
++      break;
++    }
++    case Kind::BITVECTOR_EXTRACT_OP:
++    {
++      const auto& value = node->getConst<BitVectorExtract>();
++      out << ' ' << value.d_high << ' ' << value.d_low;
++      break;
++    }
++    case Kind::BITVECTOR_REPEAT_OP:
++      out << ' ' << uint32_t(node->getConst<BitVectorRepeat>());
++      break;
++    case Kind::BITVECTOR_ZERO_EXTEND_OP:
++      out << ' ' << uint32_t(node->getConst<BitVectorZeroExtend>());
++      break;
++    case Kind::BITVECTOR_SIGN_EXTEND_OP:
++      out << ' ' << uint32_t(node->getConst<BitVectorSignExtend>());
++      break;
++    case Kind::BITVECTOR_ROTATE_LEFT_OP:
++      out << ' ' << uint32_t(node->getConst<BitVectorRotateLeft>());
++      break;
++    case Kind::BITVECTOR_ROTATE_RIGHT_OP:
++      out << ' ' << uint32_t(node->getConst<BitVectorRotateRight>());
++      break;
++    case Kind::INT_TO_BITVECTOR_OP:
++      out << ' ' << uint32_t(node->getConst<IntToBitVector>());
++      break;
++    case Kind::DIVISIBLE_OP: out << ' ' << node->getConst<Divisible>().k; break;
++    case Kind::FLOATINGPOINT_TO_FP_FROM_IEEE_BV_OP:
++      Format(out, node->getConst<FloatingPointToFPIEEEBitVector>().getSize());
++      break;
++    case Kind::FLOATINGPOINT_TO_FP_FROM_FP_OP:
++      Format(out, node->getConst<FloatingPointToFPFloatingPoint>().getSize());
++      break;
++    case Kind::FLOATINGPOINT_TO_FP_FROM_REAL_OP:
++      Format(out, node->getConst<FloatingPointToFPReal>().getSize());
++      break;
++    case Kind::FLOATINGPOINT_TO_FP_FROM_SBV_OP:
++      Format(out, node->getConst<FloatingPointToFPSignedBitVector>().getSize());
++      break;
++    case Kind::FLOATINGPOINT_TO_FP_FROM_UBV_OP:
++      Format(out, node->getConst<FloatingPointToFPUnsignedBitVector>().getSize());
++      break;
++    case Kind::FLOATINGPOINT_TO_SBV_OP:
++      out << ' ' << uint32_t(node->getConst<FloatingPointToSBV>());
++      break;
++    case Kind::FLOATINGPOINT_TO_UBV_OP:
++      out << ' ' << uint32_t(node->getConst<FloatingPointToUBV>());
++      break;
++    default: break;
++  }
++}
++
++}  // namespace
++
++Phase::Phase(const char* name) : d_previous(phase)
++{
++  if (std::strcmp(name, "rewrite") != 0) phase = name;
++  else if (std::strstr(phase, "rewrite") != nullptr) return;
++  else if (std::strcmp(phase, "parse") == 0) phase = "parse.rewrite";
++  else if (std::strcmp(phase, "solve") == 0) phase = "solve.rewrite";
++  else if (std::strcmp(phase, "preprocess") == 0) phase = "preprocess.rewrite";
++  else if (std::strcmp(phase, "command") == 0) phase = "command.rewrite";
++  else phase = "setup.rewrite";
++}
++
++Phase::~Phase() { phase = d_previous; }
++
++bool Enabled()
++{
++  auto& output = GetOutput();
++  return output.file && !output.failure;
++}
++
++void Request(const expr::NodeValue* node, bool sort, const char* outcome)
++{
++  auto& output = GetOutput();
++  if (!output.select(node->getNodeManager())) return;
++  if (std::strcmp(outcome, "hit") == 0)
++  {
++    output.write(outcome, std::to_string(node->getId()));
++    return;
++  }
++  std::ostringstream fields;
++  fields << (sort ? 's' : 'e') << ' ' << node->getId() << ' ';
++  if (node->getKind() == Kind::TYPE_CONSTANT)
++  {
++    switch (node->getConst<TypeConstant>())
++    {
++      case BOOLEAN_TYPE: fields << "BOOLEAN_TYPE"; break;
++      case INTEGER_TYPE: fields << "INTEGER_TYPE"; break;
++      case ROUNDINGMODE_TYPE: fields << "ROUNDINGMODE_TYPE"; break;
++      case REAL_TYPE: fields << "REAL_TYPE"; break;
++      case STRING_TYPE: fields << "STRING_TYPE"; break;
++      case BUILTIN_OPERATOR_TYPE: fields << "BUILTIN_OPERATOR_TYPE"; break;
++      default: fields << "TYPE_CONSTANT_" << static_cast<unsigned>(node->getConst<TypeConstant>());
++    }
++  }
++  else
++    fields << kind::toString(node->getKind());
++  if (node->getMetaKind() == kind::metakind::PARAMETERIZED)
++    fields << ' ' << node->getOperator()->getId();
++  else
++    fields << " -";
++  if (node->getKind() == Kind::STORE_ALL)
++  {
++    const auto& literal = node->getConst<ArrayStoreAll>();
++    fields << " 1 " << literal.getValue().getId() << ' ' << literal.getType().getId();
++  }
++  else
++  {
++    const auto count = node->getNumChildren();
++    fields << ' ' << count;
++    for (uint32_t i = 0; i < count; ++i)
++      fields << ' ' << node->getChild(i)->getId();
++    Payload(fields, node);
++  }
++  output.write(outcome, fields.str());
++}
++
++void Type(const NodeManager* manager, uint64_t node, uint64_t sort)
++{
++  auto& output = GetOutput();
++  if (output.select(manager))
++    output.write("type", std::to_string(node) + ' ' + std::to_string(sort));
++}
++void SortArity(const NodeManager* manager, uint64_t sort, uint64_t arity)
++{
++  auto& output = GetOutput();
++  if (output.select(manager))
++    output.write("arity", std::to_string(sort) + ' ' + std::to_string(arity));
++}
++void Lifetime(const expr::NodeValue* node, const char* event)
++{
++  auto& output = GetOutput();
++  if (output.select(node->getNodeManager()))
++    output.write(event, std::to_string(node->getId()));
++}
++void Root(const char* role, uint64_t id)
++{
++  if (Enabled()) GetOutput().write("root", std::string(role) + ' ' + std::to_string(id));
++}
++void Snapshot(const char* role)
++{
++  GetOutput().write("snapshot", role);
++}
++void Visit(uint64_t id)
++{
++  if (Enabled()) GetOutput().write("visit", std::to_string(id));
++}
++void Cache(const char* kind, unsigned theory, uint64_t key, uint64_t value)
++{
++  if (Enabled())
++    GetOutput().write("cache", kind + std::to_string(theory) + ' '
++                      + std::to_string(key) + ' '
++                      + (key == value ? "-" : std::to_string(value)));
++}
++void CacheLookup(const char* kind, uint64_t key, bool hit)
++{
++  if (Enabled())
++    GetOutput().write("cache-lookup", std::string(kind) + ' '
++                      + std::to_string(key) + (hit ? " hit" : " miss"));
++}
++void Metadata(const char* event, const std::string& fields)
++{
++  GetOutput().write(event, fields);
++}
++void Command(const std::string& name) { GetOutput().write("command", name); }
++
++}  // namespace cvc5::internal::dandelion_trace
+--- a/src/expr/CMakeLists.txt
++++ b/src/expr/CMakeLists.txt
+@@ -59,6 +59,7 @@
+   node.h
+   node_algorithm.cpp
+   node_algorithm.h
++  dandelion_trace.cpp
+   node_builder.cpp
+   node_builder.h
+   node_converter.cpp
+--- a/src/expr/node_builder.h
++++ b/src/expr/node_builder.h
+@@ -354,7 +354,7 @@
+   void crop();
+ 
+   /** Construct the node value out of the node builder */
+-  expr::NodeValue* constructNV();
++  expr::NodeValue* constructNV(bool sort);
+ 
+ #ifdef CVC5_DEBUG
+   // Throws a TypeCheckingExceptionPrivate on a failure.
+--- a/src/expr/node_builder.cpp
++++ b/src/expr/node_builder.cpp
+@@ -11,6 +11,8 @@
+  */
+ 
+ #include "expr/node_builder.h"
++
++#include "expr/dandelion_trace.h"
+ 
+ #include <memory>
+ 
+@@ -340,13 +342,13 @@
+ TypeNode NodeBuilder::constructTypeNode()
+ {
+   // NOLINTNEXTLINE(clang-analyzer-unix.Malloc)
+-  return TypeNode(constructNV());
++  return TypeNode(constructNV(true));
+ }
+ 
+ Node NodeBuilder::constructNode()
+ {
+   // NOLINTNEXTLINE(clang-analyzer-unix.Malloc)
+-  Node n(constructNV());
++  Node n(constructNV(false));
+   maybeCheckType(n);
+   return n;
+ }
+@@ -355,7 +357,7 @@
+ 
+ NodeBuilder::operator TypeNode() { return constructTypeNode(); }
+ 
+-expr::NodeValue* NodeBuilder::constructNV()
++expr::NodeValue* NodeBuilder::constructNV(bool sort)
+ {
+   Assert(!isUsed()) << "NodeBuilder is one-shot only; "
+                        "attempt to access it after conversion";
+@@ -402,6 +404,7 @@
+       nv->printAst(Trace("gc"));
+       Trace("gc") << std::endl;
+     }
++    dandelion_trace::Request(nv, sort, "fresh");
+     return nv;
+   }
+ 
+@@ -448,6 +451,7 @@
+       decrRefCounts();
+       d_inlineNv.d_nchildren = 0;
+       setUsed();
++      dandelion_trace::Request(poolNv, sort, "hit");
+       return poolNv;
+     }
+     else
+@@ -495,6 +499,7 @@
+         nv->printAst(Trace("gc"));
+         Trace("gc") << std::endl;
+       }
++      dandelion_trace::Request(nv, sort, "new");
+       return nv;
+     }
+   }
+@@ -520,6 +525,7 @@
+ 
+       dealloc();
+       setUsed();
++      dandelion_trace::Request(poolNv, sort, "hit");
+       return poolNv;
+     }
+     else
+@@ -546,6 +552,7 @@
+       d_nm->poolInsert(nv);
+       Trace("gc") << "creating node value " << nv << " [" << nv->d_id
+                   << "]: " << *nv << "\n";
++      dandelion_trace::Request(nv, sort, "new");
+       return nv;
+     }
+   }
+--- a/src/expr/node_manager_template.cpp
++++ b/src/expr/node_manager_template.cpp
+@@ -18,6 +18,7 @@
+ #include "base/listener.h"
+ #include "expr/attribute.h"
+ #include "expr/bound_var_manager.h"
++#include "expr/dandelion_trace.h"
+ #include "expr/dtype.h"
+ #include "expr/dtype_cons.h"
+ #include "expr/metakind.h"
+@@ -221,6 +222,7 @@
+ 
+ NodeManager::~NodeManager()
+ {
++  dandelion_trace::Phase trace_phase("teardown");
+   // Destroy skolem and bound var manager before cleaning up attributes and
+   // zombies
+   d_skManager = nullptr;
+@@ -401,6 +403,8 @@
+         nv->printAst(Trace("gc"));
+         Trace("gc") << endl;
+       }
++
++      dandelion_trace::Lifetime(nv, "collect");
+ 
+       // remove from the pool
+       kind::MetaKind mk = nv->getMetaKind();
+@@ -764,6 +768,26 @@
+     }
+   }
+ 
++  if (dandelion_trace::Enabled() && !dtts.empty())
++  {
++    auto base = [](const TypeNode& t) {
++      return t.getKind() == Kind::PARAMETRIC_DATATYPE
++                 ? t.d_nv->getChild(0)->getId() : t.getId();
++    };
++    const auto group = base(dtts.front());
++    for (const auto& t : dtts)
++    {
++      if (t.getKind() != Kind::DATATYPE_TYPE
++          && t.getKind() != Kind::PARAMETRIC_DATATYPE) continue;
++      if (t.getDType().isCodatatype() || t.getDType().isSygus()) continue;
++      std::ostringstream fields;
++      fields << group << ' ' << base(t);
++      for (uint32_t i = 1; i < t.getNumChildren(); ++i)
++        fields << ' ' << t.d_nv->getChild(i)->getId();
++      dandelion_trace::Metadata("datatype", fields.str());
++    }
++  }
++
+   // Lastly, perform the final resolutions and checks.
+   for (const TypeNode& ut : dtts)
+   {
+@@ -791,6 +815,16 @@
+              && ctorType.getNumChildren() == c.getNumArgs() + 1
+              && ctorType.getRangeType() == ut)
+           << "malformed constructor in datatype post-resolution";
++      const bool trace_dt = dandelion_trace::Enabled()
++          && (ut.getKind() == Kind::DATATYPE_TYPE || ut.getKind() == Kind::PARAMETRIC_DATATYPE)
++          && !dt.isCodatatype() && !dt.isSygus();
++      std::ostringstream fields;
++      if (trace_dt)
++      {
++        fields << (ut.getKind() == Kind::PARAMETRIC_DATATYPE
++                       ? ut.d_nv->getChild(0)->getId() : ut.getId())
++               << ' ' << c.d_constructor.getId() << ' ' << c.d_tester.getId();
++      }
+       // for all selectors...
+       for (size_t j = 0, nargs = c.getNumArgs(); j < nargs; j++)
+       {
+@@ -802,12 +836,15 @@
+         // This next one's a "hard" check, performed in non-debug builds
+         // as well; the other ones should all be guaranteed by the
+         // cvc5::internal::DType class, but this actually needs to be checked.
+-        if (!selectorType.getRangeType().isFirstClass())
++        const TypeNode fieldType = selectorType.getRangeType();
++        if (trace_dt) fields << ' ' << a.d_selector.getId() << ' ' << fieldType.getId();
++        if (!fieldType.isFirstClass())
+         {
+           throw Exception(
+               "cannot use fields in datatypes that are not first class types");
+         }
+       }
++      if (trace_dt) dandelion_trace::Metadata("constructor", fields.str());
+     }
+   }
+ 
+@@ -1364,6 +1401,7 @@
+ 
+   if (nv != nullptr)
+   {
++    dandelion_trace::Request(nv, std::is_same_v<NodeClass, TypeNode>, "hit");
+     return NodeClass(nv);
+   }
+ 
+@@ -1382,6 +1420,7 @@
+   new (&nv->d_children) T(val);
+ 
+   poolInsert(nv);
++  dandelion_trace::Request(nv, std::is_same_v<NodeClass, TypeNode>, "new");
+   if (TraceIsOn("gc"))
+   {
+     Trace("gc") << "creating node value " << nv << " [" << nv->d_id << "]: ";
+--- a/src/expr/node_value.cpp
++++ b/src/expr/node_value.cpp
+@@ -15,6 +15,8 @@
+  * reference count on NodeValue instances.
+  */
+ #include "expr/node_value.h"
++
++#include "expr/dandelion_trace.h"
+ 
+ #include <sstream>
+ 
+@@ -117,6 +119,7 @@
+       << "No current NodeManager on destruction of NodeValue: "
+          "maybe a public cvc5 interface function is missing a "
+          "NodeManagerScope ?";
++  dandelion_trace::Lifetime(this, "zero");
+   d_nm->markForDeletion(this);
+ }
+ 
+--- a/src/expr/attribute.h
++++ b/src/expr/attribute.h
+@@ -15,6 +15,7 @@
+ /* There are strong constraints on ordering of declarations of
+  * attributes and nodes due to template use */
+ #include "expr/node.h"
++#include "expr/dandelion_trace.h"
+ #include "expr/type_node.h"
+ 
+ #ifndef CVC5__EXPR__ATTRIBUTE_H
+@@ -561,6 +562,11 @@
+   return d_attrManager->getAttribute(nv, AttrKind(), ret);
+ }
+ 
++namespace expr::attr {
++struct TypeTag;
++struct SortArityTag;
++}
++
+ template <class AttrKind>
+ inline void NodeManager::setAttribute(
+     expr::NodeValue* nv,
+@@ -568,6 +574,14 @@
+     const typename AttrKind::value_type& value)
+ {
+   d_attrManager->setAttribute(nv, AttrKind(), value);
++  if constexpr (std::is_same_v<AttrKind, expr::Attribute<expr::attr::TypeTag, TypeNode>>)
++  {
++    if (!value.isNull()) dandelion_trace::Type(this, nv->getId(), value.getId());
++  }
++  else if constexpr (std::is_same_v<AttrKind, expr::Attribute<expr::attr::SortArityTag, uint64_t>>)
++  {
++    dandelion_trace::SortArity(this, nv->getId(), value);
++  }
+ }
+ 
+ template <class AttrKind>
+@@ -595,7 +609,7 @@
+ inline void NodeManager::setAttribute(
+     TNode n, const AttrKind&, const typename AttrKind::value_type& value)
+ {
+-  d_attrManager->setAttribute(n.d_nv, AttrKind(), value);
++  setAttribute(n.d_nv, AttrKind(), value);
+ }
+ 
+ template <class AttrKind>
+@@ -623,7 +637,7 @@
+ inline void NodeManager::setAttribute(
+     TypeNode n, const AttrKind&, const typename AttrKind::value_type& value)
+ {
+-  d_attrManager->setAttribute(n.d_nv, AttrKind(), value);
++  setAttribute(n.d_nv, AttrKind(), value);
+ }
+ 
+ }  // namespace cvc5::internal
+--- a/src/expr/dtype_cons.h
++++ b/src/expr/dtype_cons.h
+@@ -34,6 +34,7 @@
+ class DTypeConstructor
+ {
+   friend class DType;
++  friend class NodeManager;
+ 
+  public:
+   /**
+--- a/src/expr/dtype_selector.h
++++ b/src/expr/dtype_selector.h
+@@ -34,6 +34,7 @@
+   friend class DatatypeConstructorArg;
+   friend class DTypeConstructor;
+   friend class DType;
++  friend class NodeManager;
+ 
+  public:
+   /** constructor */
+--- a/src/main/portfolio_driver.cpp
++++ b/src/main/portfolio_driver.cpp
+@@ -28,6 +28,7 @@
+ #include "base/exception.h"
+ #include "base/output.h"
+ #include "main/command_executor.h"
++#include "expr/dandelion_trace.h"
+ #include "parser/command_status.h"
+ #include "parser/commands.h"
+ 
+@@ -49,7 +50,11 @@
+   bool status = true;
+   while (status)
+   {
+-    cmd = parser->nextCommand();
++    {
++      internal::dandelion_trace::Phase trace_phase("parse");
++      cmd = parser->nextCommand();
++      if (!cmd.isNull()) internal::dandelion_trace::Command(cmd.getCommandName());
++    }
+     if (cmd.isNull())
+     {
+       break;
+@@ -63,7 +68,10 @@
+         break;
+       }
+     }
+-    status = d_executor->doCommand(&cmd);
++    {
++      internal::dandelion_trace::Phase trace_phase("command");
++      status = d_executor->doCommand(&cmd);
++    }
+     if (!status && cc->interrupted())
+     {
+       solver().getDriverOptions().out() << CommandInterrupted();
+--- a/src/smt/solver_engine.cpp
++++ b/src/smt/solver_engine.cpp
+@@ -11,6 +11,8 @@
+  */
+ 
+ #include "smt/solver_engine.h"
++
++#include "expr/dandelion_trace.h"
+ 
+ #include "base/check.h"
+ #include "base/exception.h"
+@@ -832,6 +834,10 @@
+   // Call the SMT solver driver to check for satisfiability. Note that in the
+   // case of options like e.g. deep restarts, this may invokve multiple calls
+   // to check satisfiability in the underlying SMT solver
++  dandelion_trace::Phase trace_phase("solve");
++  if (!d_isInternalSubsolver)
++    for (const auto& assumption : assumptions)
++      dandelion_trace::Root("input", assumption.getId());
+   Result r = d_smtDriver->checkSat(assumptions);
+ 
+   Trace("smt") << "SolverEngine::checkSat(" << assumptions << ") => " << r
+@@ -963,6 +969,7 @@
+   beginCall();
+   ensureWellFormedTerm(formula, "assertFormula");
+   assertFormulaInternal(formula);
++  if (!d_isInternalSubsolver) dandelion_trace::Root("input", formula.getId());
+ }
+ 
+ Node SolverEngine::eliminateSubtypesForProof(const Node& n) const
+--- a/src/smt/smt_solver.cpp
++++ b/src/smt/smt_solver.cpp
+@@ -11,6 +11,8 @@
+  */
+ 
+ #include "smt/smt_solver.h"
++
++#include "expr/dandelion_trace.h"
+ 
+ #include "options/arith_options.h"
+ #include "options/arrays_options.h"
+@@ -140,7 +142,14 @@
+   d_env.getResourceManager()->spendResource(Resource::PreprocessStep);
+ 
+   // process the assertions with the preprocessor
++  dandelion_trace::Phase trace_phase("preprocess");
+   d_pp.process(ap);
++  if (dandelion_trace::Enabled())
++  {
++    dandelion_trace::Snapshot("preprocessed");
++    for (const auto& root : ap.ref())
++      dandelion_trace::Root("preprocessed", root.getId());
++  }
+ 
+   // end: INVARIANT to maintain: no reordering of assertions or
+   // introducing new ones
+--- a/src/theory/rewriter.cpp
++++ b/src/theory/rewriter.cpp
+@@ -11,6 +11,8 @@
+  */
+ 
+ #include "theory/rewriter.h"
++
++#include "expr/dandelion_trace.h"
+ 
+ #include <deque>
+ 
+@@ -212,6 +214,7 @@
+                          Node node,
+                          TConvProofGenerator* tcpg)
+ {
++  dandelion_trace::Phase trace_phase("rewrite");
+ #ifdef CVC5_ASSERTIONS
+   bool isEquality = node.getKind() == Kind::EQUAL
+                     && !node[0].getType().isBoolean()
+@@ -228,6 +231,7 @@
+ 
+   // Check if it's been cached already
+   Node cached = getPostRewriteCache(theoryId, node);
++  dandelion_trace::CacheLookup("entry", node.getId(), !cached.isNull());
+   if (!cached.isNull() && (tcpg == nullptr || hasRewrittenWithProofs(node)))
+   {
+     return cached;
+@@ -257,6 +261,7 @@
+     RewriteStackElement::State state = rewriteStackTop.getState();
+     if (state == RewriteStackElement::PRE_REWRITE)
+     {
++      dandelion_trace::Visit(rewriteStackTop.d_node.getId());
+       // Check if the pre-rewrite has already been done (it's in the cache)
+       cached = getPreRewriteCache(rewriteStackTop.getTheoryId(),
+                                   rewriteStackTop.d_node);
+@@ -305,6 +310,9 @@
+         }
+ 
+         // Cache the rewrite
++        dandelion_trace::Cache("pre", rewriteStackTop.getOriginalTheoryId(),
++                              rewriteStackTop.d_original.getId(),
++                              rewriteStackTop.d_node.getId());
+         setPreRewriteCache(rewriteStackTop.getOriginalTheoryId(),
+                            rewriteStackTop.d_original,
+                            rewriteStackTop.d_node);
+@@ -466,6 +474,9 @@
+           }
+         }
+       }
++      dandelion_trace::Cache("post", rewriteStackTop.getOriginalTheoryId(),
++                            rewriteStackTop.d_original.getId(),
++                            rewriteStackTop.d_node.getId());
+       setPostRewriteCache(rewriteStackTop.getOriginalTheoryId(),
+                           rewriteStackTop.d_original,
+                           rewriteStackTop.d_node);
+--- a/src/parser/commands.h
++++ b/src/parser/commands.h
+@@ -203,6 +203,7 @@
+   AssertCommand(const cvc5::Term& t);
+ 
+   cvc5::Term getTerm() const;
++  uint64_t getTermIdForDandelionTrace() const { return d_term.getId(); }
+ 
+   void invoke(cvc5::Solver* solver, parser::SymManager* sm) override;
+ 
+--- a/src/main/command_executor.cpp
++++ b/src/main/command_executor.cpp
+@@ -12,6 +12,8 @@
+ 
+ #include "main/command_executor.h"
+ 
++#include "expr/dandelion_trace.h"
++
+ #ifndef __WIN32__
+ #include <sys/resource.h>
+ #endif /* ! __WIN32__ */
+@@ -233,6 +235,11 @@
+       && dynamic_cast<DatatypeDeclarationCommand*>(cmd) == nullptr
+       && dynamic_cast<DefineFunctionRecCommand*>(cmd) == nullptr)
+   {
++    if (const auto* assertion = dynamic_cast<const AssertCommand*>(cmd))
++      internal::dandelion_trace::Root("input", assertion->getTermIdForDandelionTrace());
++    if (const auto* check = dynamic_cast<const CheckSatAssumingCommand*>(cmd))
++      for (const auto& assumption : check->getTerms())
++        internal::dandelion_trace::Root("input", assumption.getId());
+     return true;
+   }
+ 

@@ -1,0 +1,6 @@
+(set-logic QF_BV)
+(set-info :source |Dandelion capture test|)
+(declare-const a (_ BitVec 12))
+(assert (= ((_ extract 8 4) a) #b00001))
+(assert (bvult ((_ extract 8 4) a) #b00111))
+(check-sat)
