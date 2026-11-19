@@ -139,13 +139,17 @@ constexpr auto kSpecials =
     std::to_array<std::string_view>({"NaN", "+oo", "-oo", "+zero", "-zero"});
 }  // namespace
 
+SpellingId ClassifyOperator(std::string_view name) noexcept {
+  static constexpr auto kBuckets =
+      SpellingBuckets(kByName, std::mem_fn(&Operator::name));
+  return LookupSpelling(kByName, std::mem_fn(&Operator::name), kBuckets, name);
+}
+const Operator* GetOperator(SpellingId id) noexcept {
+  return id == kUnknownSpelling ? nullptr : &kByName[id - 1];
+}
 const Operator* FindOperator(std::string_view name, bool indexed) noexcept {
-  const auto found =
-      std::ranges::lower_bound(kByName, name, {}, &Operator::name);
-  if (found != kByName.end() && found->name == name &&
-      indexed == (found->indices != 0))
-    return &*found;
-  return nullptr;
+  const auto* op = GetOperator(ClassifyOperator(name));
+  return op && indexed == (op->indices != 0) ? op : nullptr;
 }
 const Operator& OperatorFor(Kind kind) noexcept {
   return *kByKind[std::to_underlying(kind)];

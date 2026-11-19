@@ -9,6 +9,12 @@ void HashCombine(std::size_t& value, std::size_t next) noexcept {
 }
 }  // namespace
 
+std::size_t RankHash::operator()(Rank rank) const noexcept {
+  auto hash = rank.size();
+  for (auto spelling : rank) HashCombine(hash, TextHash{}(spelling));
+  return hash;
+}
+
 std::size_t RecipeHash::operator()(const SortRecipe& recipe) const noexcept {
   auto hash = static_cast<std::size_t>(recipe.kind);
   HashCombine(hash, recipe.concrete.GetId());
@@ -28,6 +34,9 @@ Transaction::Transaction(SessionState& state) noexcept
       assertions_(query_.assertions_.size()),
       sorts_(query_.user_sorts_.size()),
       functions_(query_.functions_.size()),
+      function_runs_(signature_.function_runs.size()),
+      rank_blocks_(signature_.rank_pool.blocks.size()),
+      rank_remaining_(signature_.rank_pool.remaining),
       definitions_(query_.definitions_.size()),
       groups_(query_.datatype_groups_.size()) {}
 
@@ -35,18 +44,19 @@ Transaction::~Transaction() noexcept {
   if (committed_) return;
   for (auto sort : added_spellings_) signature_.sort_spellings.erase(sort);
   for (const auto& [space, name] : names_ | std::views::reverse) {
-    if (space == NameSpace::kTerm) {
-      const auto it = signature_.terms.find(name);
-      if (it != signature_.terms.end()) signature_.terms.erase(it);
-    } else {
-      const auto it = signature_.sorts.find(name);
-      if (it != signature_.sorts.end()) signature_.sorts.erase(it);
-    }
+    if (space == NameSpace::kTerm)
+      signature_.terms.EraseLast(name);
+    else
+      signature_.sorts.EraseLast(name);
   }
   for (const auto* recipe : added_recipes_ | std::views::reverse)
     if (recipe) signature_.recipes.erase(*recipe);
-  for (auto i = functions_; i < query_.functions_.size(); ++i)
-    signature_.function_index.erase(query_.functions_[i].decl.GetId());
+  signature_.function_runs.resize(function_runs_);
+  auto& pool = signature_.rank_pool;
+  if (!added_rank_.empty()) pool.ranks.erase(added_rank_);
+  pool.blocks.resize(rank_blocks_);
+  pool.remaining = rank_remaining_;
+  for (auto spelling : added_rank_strings_) pool.spellings.erase(spelling);
   for (auto i = definitions_; i < query_.definitions_.size(); ++i)
     signature_.definition_index.erase(query_.definitions_[i].decl.GetId());
   query_.functions_.resize(functions_);
@@ -59,14 +69,24 @@ Transaction::~Transaction() noexcept {
 }
 
 void Transaction::AddTerm(std::string_view name, TermBinding binding) {
-  names_.push_back({NameSpace::kTerm, name});
   state_.Checkpoint();
-  signature_.terms.emplace(std::string(name), std::move(binding));
+  names_.push_back({NameSpace::kTerm, name});
+  try {
+    signature_.terms.Insert(name, std::move(binding));
+  } catch (...) {
+    names_.pop_back();
+    throw;
+  }
 }
 void Transaction::AddSort(std::string_view name, SortBinding binding) {
-  names_.push_back({NameSpace::kSort, name});
   state_.Checkpoint();
-  signature_.sorts.emplace(std::string(name), std::move(binding));
+  names_.push_back({NameSpace::kSort, name});
+  try {
+    signature_.sorts.Insert(name, std::move(binding));
+  } catch (...) {
+    names_.pop_back();
+    throw;
+  }
 }
 void Transaction::RememberAlias(SortView sort, std::string_view name) {
   added_spellings_.push_back(sort.GetId());
@@ -102,12 +122,42 @@ void Transaction::AddUserSort(UserSort sort) {
   state_.Checkpoint();
   query_.user_sorts_.push_back(std::move(sort));
 }
-void Transaction::AddFunction(UserFunction function) {
-  const auto index = query_.functions_.size();
-  const auto id = function.decl.GetId();
+void Transaction::AddFunction(Decl decl, bool quoted,
+                              std::span<std::string> spelling,
+                              SourceSpan where) {
   state_.Checkpoint();
-  query_.functions_.push_back(std::move(function));
-  signature_.function_index.emplace(id, index);
+  auto& pool = signature_.rank_pool;
+  std::vector<std::string_view> views;
+  views.reserve(spelling.size());
+  added_rank_strings_.reserve(spelling.size());
+  for (auto& sort : spelling) {
+    const auto [it, inserted] = pool.spellings.insert(std::move(sort));
+    views.emplace_back(*it);
+    if (inserted) added_rank_strings_.emplace_back(*it);
+  }
+  auto interned = pool.ranks.find(Rank(views));
+  if (interned == pool.ranks.end()) {
+    const auto size = views.size();
+    if (size > pool.remaining) {
+      const auto capacity = std::max(size, RankPool::kBlockSize);
+      pool.blocks.push_back(std::make_unique<std::string_view[]>(capacity));
+      pool.remaining = capacity;
+    }
+    // Fill backwards within each block so the remaining size is the cursor.
+    auto* start = pool.blocks.back().get() + pool.remaining - size;
+    std::ranges::copy(views, start);
+    const Rank rank(start, size);
+    interned = pool.ranks.insert(rank).first;
+    added_rank_ = rank;
+    pool.remaining -= size;
+  }
+  const auto ordinal = query_.functions_.size();
+  const auto id = decl.GetId();
+  if (ordinal == 0 || id - query_.functions_.back().decl.GetId() != 1)
+    signature_.function_runs.emplace_back(id, ordinal);
+  const SourceNameView name(decl.Borrow().GetNameHint(), quoted);
+  query_.functions_.push_back(
+      {std::move(decl), name, SourceRankView(*interned), where});
 }
 void Transaction::AddDefinition(DefinedFunction definition) {
   const auto index = query_.definitions_.size();

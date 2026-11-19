@@ -8,8 +8,8 @@ struct DatatypeSyntax {
   // NOLINTBEGIN(readability-identifier-naming): Struct fields, snake_case.
   ExprId name;
   std::uint64_t arity;
-  std::span<const ExprId> params;
-  std::span<const ExprId> ctors;
+  ChildRange params;
+  ChildRange ctors;
   // NOLINTEND(readability-identifier-naming)
 };
 DatatypeSyntax InspectDatatype(const Syntax& syntax, ExprId name, ExprId body,
@@ -17,8 +17,8 @@ DatatypeSyntax InspectDatatype(const Syntax& syntax, ExprId name, ExprId body,
   const auto body_parts = syntax.Children(body);
   const bool is_parametric =
       !body_parts.empty() && syntax.Is(body_parts[0], "par");
-  const auto params = is_parametric ? syntax.Children(body_parts[1])
-                                    : std::span<const ExprId>{};
+  const auto params =
+      is_parametric ? syntax.Children(body_parts[1]) : ChildRange{};
   const auto actual_arity = params.size();
   if (arity && *arity != actual_arity)
     Fail(DiagnosticCode::kInvalidInput, syntax.Span(body),
@@ -33,10 +33,8 @@ void DeclareDatatypes(SessionState& session, Transaction& txn,
   const auto where = syntax.header.where;
   const auto args = syntax.Children(0).subspan(1);
   const bool plural = syntax.header.kind == CommandKind::kDeclareDatatypes;
-  const auto written_headers =
-      plural ? syntax.Children(args[0]) : std::span<const ExprId>{};
-  const auto written_bodies =
-      plural ? syntax.Children(args[1]) : std::span<const ExprId>{};
+  const auto written_headers = plural ? syntax.Children(args[0]) : ChildRange{};
+  const auto written_bodies = plural ? syntax.Children(args[1]) : ChildRange{};
   if (written_headers.size() != written_bodies.size())
     Fail(DiagnosticCode::kInvalidInput, where,
          "Mismatched datatype headers and bodies");

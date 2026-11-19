@@ -38,6 +38,50 @@ repetitions, and JSON output through its command-line options; see the
 [upstream user guide](https://github.com/google/benchmark/blob/v1.10.0/docs/user_guide.md).
 Inspect benchmark errors and skips as well as process status.
 
+## Frontend parser benchmarks
+
+The [frontend workload design](frontend-workloads.md) specifies the planned
+parser suite, its six scenarios, inspection metrics, and local corpus policy.
+Once implemented, build and dry-run it from the repository root with locally
+available dependencies.
+
+```sh
+cmake -S . -B build/frontend-bench -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release -DDANDELION_BUILD_BENCHMARKS=ON \
+  -DDANDELION_BUILD_TESTS=OFF -DDANDELION_ENABLE_SANITIZERS=OFF \
+  -DDANDELION_DEPENDENCY_MODE=EXISTING
+cmake --build build/frontend-bench --target dandelion_frontend_benchmarks
+frontend_bench=build/frontend-bench/benchmarks/frontend/dandelion_frontend_benchmarks
+"$frontend_bench" --benchmark_dry_run
+"$frontend_bench" --input /path/to/staged/case.smt2 --inspect
+"$frontend_bench" --input /path/to/staged/case.smt2 --benchmark_dry_run
+```
+
+Generate a smoke suite and optionally stage an explicit corpus selection
+from a metadata-safe source. Use fresh output directories. Place relative
+SMT-LIB paths in `corpus_selection.txt` and supply the actual source evidence.
+
+```sh
+frontend_runs=/pub/netdisk2/zhangx/dandelion-frontend-bench
+python3 -B benchmarks/frontend_generate.py \
+  --tier smoke --seed 2025 --output "$frontend_runs/generated-smoke"
+python3 -B benchmarks/frontend_corpus.py \
+  --source /path/to/safe/non-incremental \
+  --selection "$frontend_runs/corpus_selection.txt" \
+  --snapshot benchmark-2025 --source-evidence 'Verified local copy' \
+  --output "$frontend_runs/corpus-small"
+python3 -B benchmarks/frontend_run.py --build-dir build/frontend-bench \
+  --manifest "$frontend_runs/generated-smoke/generated_manifest.json" \
+  --output "$frontend_runs/smoke-throughput" --mode throughput --jobs 8 \
+  --scenario text,reader_64k,reader_4k,reader_irregular,phases,teardown \
+  --samples 3 --timeout 30 --memory-mib 1024 --memory-budget-mib 8192
+```
+
+Pass `corpus-small/corpus_manifest.json` under the same staging directory as
+another `--manifest` to include the staged corpus. Use `--mode isolated` and
+a fresh output directory for one pinned child at a time. The runner keeps
+inspection JSON, timings, RSS evidence, and failure records.
+
 ## Capture and measure a trace-derived workload
 
 Use the [capture and replay design](node-workloads.md) for the supported

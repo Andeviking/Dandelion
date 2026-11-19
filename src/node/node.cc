@@ -203,6 +203,24 @@ Result<void> NodeManager::ReleaseRoots(std::span<Node> roots) {
     ReleaseRootBatch(state, roots);
   });
 }
+Result<void> NodeManager::ReleaseRoots(
+    const ManagerRef& manager, std::span<const RootRange> ranges) noexcept {
+  auto* state = Access::State(manager);
+  if (!state) return std::unexpected(NodeError{ErrorCode::kNullObject});
+  for (const auto& range : ranges) {
+    if (range.count != 0 && !range.at)
+      return std::unexpected(NodeError{ErrorCode::kInvalidParameter});
+  }
+  for (const auto& range : ranges) {
+    for (std::size_t i = 0; i < range.count; ++i) {
+      const auto* node = Access::Data(range.at(range.context, i)->Borrow());
+      if (node && node->state != state)
+        return std::unexpected(NodeError{ErrorCode::kForeignManager});
+    }
+  }
+  ReleaseRootBatch(state, ranges);
+  return {};
+}
 Result<Sort> NodeManager::RetainSort(SortView sort) {
   return Guard<Sort>([&] { return Retained(CheckedState(*this), sort); });
 }

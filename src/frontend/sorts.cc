@@ -3,6 +3,13 @@ import :internal;
 import std;
 
 namespace dandelion::frontend::detail {
+std::size_t SortKey::Slot() const noexcept {
+  auto hash = TextHash{}(name) ^ static_cast<std::size_t>(indexed);
+  for (std::size_t i = 0; i < count; ++i)
+    hash ^= std::hash<std::uint64_t>{}(arguments[i]) + std::size_t{0x9e3779b9} +
+            (hash << 6) + (hash >> 2);
+  return (hash ^ (hash >> 8)) & (kCacheSlots - 1);
+}
 namespace {
 struct StandardFormat {
   // NOLINTBEGIN(readability-identifier-naming): Struct fields, snake_case.
@@ -36,6 +43,32 @@ class ConcreteSorts {
   ConcreteSorts(NodeManager& manager, Transaction* txn)
       : manager_(manager), txn_(txn) {}
   Value Concrete(SortView sort, SourceSpan) const noexcept { return sort; }
+  template <class Factory>
+  Value Cached(SessionState& session, const SortKey& key, Factory factory) {
+    const auto slot = key.Slot();
+    if (session.sort_cache) {
+      const auto& entry = (*session.sort_cache)[slot];
+      if (!entry.sort.IsNull() && entry.key == key) {
+        session.Count(&FrontendStats::sort_cache_hits);
+        return entry.sort;
+      }
+    }
+    const auto sort = factory();
+    if (!session.sort_cache) {
+      session.Checkpoint();
+      session.sort_cache = std::make_unique<SortCache>();
+    }
+    (*session.sort_cache)[slot] = {key, sort};
+    return sort;
+  }
+  template <class Factory>
+  Value CachedNamed(SessionState& session, std::string_view stable_name,
+                    std::span<const Value> args, Factory factory) {
+    SortKey key{stable_name, {}, args.size()};
+    if (args.size() > key.arguments.size()) return factory();
+    std::ranges::transform(args, key.arguments.begin(), &SortView::GetId);
+    return Cached(session, key, factory);
+  }
   void RememberAlias(SortView sort, std::string_view name) {
     if (txn_) txn_->RememberAlias(sort, name);
   }
@@ -195,31 +228,31 @@ auto SortResolver<Target>::Resolve(ExprId root) -> Value {
     // NOLINTBEGIN(readability-identifier-naming): Struct fields, snake_case.
     ExprId expr;
     Identifier head;
-    std::span<const ExprId> args;
+    ChildRange args;
     std::size_t value_base;
     std::size_t next = 0;
     // NOLINTEND(readability-identifier-naming)
   };
-  std::vector<Frame> stack;
-  std::vector<Value> values;
-  const auto push = [&](ExprId id) {
+  const auto frame = [&](ExprId id, std::size_t base) -> Frame {
     const auto parts = syntax_.Children(id);
     const bool application = !parts.empty() && !syntax_.Is(parts[0], "_");
     const auto head = GetIdentifier(syntax_, application ? parts[0] : id);
-    const auto args =
-        application ? parts.subspan(1) : std::span<const ExprId>{};
+    const auto args = application ? parts.subspan(1) : ChildRange{};
     if (head.indices.empty() && syntax_.Name(head.name) == "Array" &&
         !(parameters_ && parameters_->contains("Array")) &&
         !signature_.sorts.contains("Array"))
       CheckArity(args.size(), 2, syntax_.Span(id));
-    stack.push_back({id, head, args, values.size()});
+    return {id, head, args, base};
   };
-  push(root);
+  const auto first = frame(root, 0);
+  if (first.args.empty()) return Construct(root, first.head, {});
+  std::vector<Frame> stack{first};
+  std::vector<Value> values;
   while (!stack.empty()) {
     auto& top = stack.back();
     if (top.next < top.args.size()) {
       const auto child = top.args[top.next++];
-      push(child);
+      stack.push_back(frame(child, values.size()));
       continue;
     }
     const auto arguments =
@@ -250,32 +283,38 @@ auto SortResolver<Target>::Construct(ExprId expr, Identifier id,
     }
   }
   const auto bound = signature_.sorts.find(name);
-  if (bound == signature_.sorts.end()) return ConstructBuiltin(expr, id, args);
+  if (!bound) return ConstructBuiltin(expr, id, args);
 
   const auto& binding = bound->second;
-  if (const auto* alias = std::get_if<Alias>(&binding)) {
-    CheckArity(args.size(), alias->arity, where);
-    const auto sort = Expand(target_, alias->root, args, where);
-    if constexpr (std::is_same_v<Target, ConcreteSorts>) {
-      if (alias->root->kind != RecipeKind::kParameter)
-        target_.RememberAlias(sort, bound->first);
+  const auto build = [&]() -> Value {
+    if (const auto* alias = std::get_if<Alias>(&binding)) {
+      CheckArity(args.size(), alias->arity, where);
+      return Expand(target_, alias->root, args, where);
     }
+    if (const auto* datatype = std::get_if<DatatypeSort>(&binding)) {
+      CheckArity(args.size(), datatype->arity, where);
+      if constexpr (std::is_same_v<Target, FieldSorts>) {
+        if (target_.InGroup(*datatype))
+          return target_.Recursive(datatype->slot, args, where);
+      }
+      const auto group =
+          session_.Prefix().GetDatatypeGroups()[datatype->group].Borrow();
+      return target_.Apply(
+          Take(group.GetSortConstructor(datatype->slot), where), args, where);
+    }
+    const auto constructor = std::get<SortConstructorView>(binding);
+    CheckArity(args.size(), constructor.GetArity(), where);
+    return target_.Apply(constructor, args, where);
+  };
+  if constexpr (std::is_same_v<Target, ConcreteSorts>) {
+    const auto sort = target_.CachedNamed(session_, bound->first, args, build);
+    if (const auto* alias = std::get_if<Alias>(&binding);
+        alias && alias->root->kind != RecipeKind::kParameter)
+      target_.RememberAlias(sort, bound->first);
     return sort;
+  } else {
+    return build();
   }
-  if (const auto* datatype = std::get_if<DatatypeSort>(&binding)) {
-    CheckArity(args.size(), datatype->arity, where);
-    if constexpr (std::is_same_v<Target, FieldSorts>) {
-      if (target_.InGroup(*datatype))
-        return target_.Recursive(datatype->slot, args, where);
-    }
-    const auto group =
-        session_.Prefix().GetDatatypeGroups()[datatype->group].Borrow();
-    return target_.Apply(Take(group.GetSortConstructor(datatype->slot), where),
-                         args, where);
-  }
-  const auto constructor = std::get<SortConstructorView>(binding);
-  CheckArity(args.size(), constructor.GetArity(), where);
-  return target_.Apply(constructor, args, where);
 }
 
 template <class Target>
@@ -289,19 +328,39 @@ auto SortResolver<Target>::ConstructBuiltin(ExprId expr, Identifier id,
     const auto sort = Take(std::move(result), where);
     return target_.Concrete(sort.Borrow(), where);
   };
+  const auto cached = [&](std::string_view stable_name, auto build) {
+    if constexpr (std::is_same_v<Target, ConcreteSorts>)
+      return target_.CachedNamed(session_, stable_name, args, build);
+    else
+      return build();
+  };
   if (name == "BitVec" || name == "FloatingPoint") {
     CheckArity(args.size(), 0, where);
     const bool is_bv = name == "BitVec";
     const auto indices = NumericIndices(syntax_, id, is_bv ? 1 : 2, where);
     CheckMinimumIndex(syntax_, id, indices, 0, is_bv ? 1 : 2);
-    if (is_bv) {
+    if (is_bv)
       RequireTheory(profile_.Has(kBitVectors) || profile_.Has(kFloats), where);
-      return concrete(manager.MakeBvSort(indices[0].Borrow()));
+    else {
+      CheckMinimumIndex(syntax_, id, indices, 1, 2);
+      RequireTheory(profile_.Has(kFloats), where);
     }
-    CheckMinimumIndex(syntax_, id, indices, 1, 2);
-    RequireTheory(profile_.Has(kFloats), where);
-    return concrete(
-        manager.MakeFpSort(indices[0].Borrow(), indices[1].Borrow()));
+    const auto build = [&] {
+      return is_bv ? concrete(manager.MakeBvSort(indices[0].Borrow()))
+                   : concrete(manager.MakeFpSort(indices[0].Borrow(),
+                                                 indices[1].Borrow()));
+    };
+    if constexpr (std::is_same_v<Target, ConcreteSorts>) {
+      SortKey key{is_bv ? "BitVec" : "FloatingPoint", {}, indices.size(), true};
+      for (std::size_t i = 0; i < indices.size(); ++i) {
+        const auto index = indices[i].Borrow().TryUint64();
+        if (!index) return build();
+        key.arguments[i] = *index;
+      }
+      return target_.Cached(session_, key, build);
+    } else {
+      return build();
+    }
   }
   if (name == "Real" || name == "String" || name == "RegLan" || name == "->")
     Fail(DiagnosticCode::kUnsupported, where,
@@ -310,28 +369,31 @@ auto SortResolver<Target>::ConstructBuiltin(ExprId expr, Identifier id,
     Fail(DiagnosticCode::kInvalidInput, where, "Unknown indexed sort");
   if (name == "Array") {
     RequireTheory(profile_.Has(kArrays), where);
-    return target_.Array(args, where);
+    return cached("Array", [&] { return target_.Array(args, where); });
   }
   if (name == "Bool") {
     CheckArity(args.size(), 0, where);
-    return concrete(manager.BoolSort());
+    return cached("Bool", [&] { return concrete(manager.BoolSort()); });
   }
   if (name == "Int") {
     CheckArity(args.size(), 0, where);
     RequireTheory(profile_.Has(kIntegers) || profile_.Has(kRestrictedIntegers),
                   where);
-    return concrete(manager.IntSort());
+    return cached("Int", [&] { return concrete(manager.IntSort()); });
   }
   if (name == "RoundingMode") {
     CheckArity(args.size(), 0, where);
     RequireTheory(profile_.Has(kFloats), where);
-    return concrete(manager.RoundingModeSort());
+    return cached("RoundingMode",
+                  [&] { return concrete(manager.RoundingModeSort()); });
   }
   if (const auto* format = FindFormat(name)) {
     CheckArity(args.size(), 0, where);
     RequireTheory(profile_.Has(kFloats), where);
-    return concrete(manager.MakeFpSort(IntegerView(format->exponent),
-                                       IntegerView(format->significand)));
+    return cached(format->name, [&] {
+      return concrete(manager.MakeFpSort(IntegerView(format->exponent),
+                                         IntegerView(format->significand)));
+    });
   }
   Fail(DiagnosticCode::kInvalidInput, syntax_.Span(id.name), "Unknown sort");
 }

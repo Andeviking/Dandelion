@@ -277,6 +277,53 @@ instrumentation remains outside the Release timings.
   a replacement index after retirement and require equivalent cleanup via
   in-place erasure, including final state destruction and successful reinterning.
 
+### Multi-range batch root release
+
+The Phase A1 test design covers `RootRange` and the static
+`NodeManager::ReleaseRoots(const ManagerRef&, std::span<const RootRange>)`
+overload. These cases require the Phase B API before they can compile.
+
+- **N-RANGE-01** checks that `RootRange::From` is `noexcept` and projects
+  exactly the selected `Node` member at each index. Use two records of each
+  type, `EntryA` with `term` and `EntryB` with `tag` followed by `body`.
+  Check the descriptor's context and count and compare callback results
+  with the actual member addresses. Check that the static release overload
+  is `noexcept`.
+- **N-RANGE-02** checks validation before any handle is consumed. Require
+  `kNullObject` for a default `ManagerRef`, with both an empty batch and a
+  live root. Require `kInvalidParameter` when a nonempty descriptor with a
+  null callback follows a valid range. Require `kForeignManager` when a
+  foreign handle follows a local handle in the second range, even if the
+  foreign node has the same numeric ID as a local node. Check that the
+  supplied IDs and reference counts are unchanged after rejection.
+- **N-RANGE-03** covers an empty batch, a default zero-count descriptor,
+  a descriptor from an empty record span, and null node handles. A live
+  node outside those ranges keeps its identity, and reclamation and
+  allocation counts stay unchanged.
+- **N-RANGE-04** distributes owning handles to one parent across both
+  record types. That parent has two edges to a leaf, and a second parent
+  has one edge to the same leaf. Include a null handle in each range, the
+  leaf's only direct owner, and a copy of the second parent's external
+  owner. Place a zero-count descriptor between the two populated ranges.
+  All submitted handles clear and scalar tags are preserved. Only the
+  first parent retires. The remaining parent keeps the leaf alive through
+  its single edge, and interning the retired parent yields a new ID.
+- **N-RANGE-05** splits all owners of a grown table across two ranges.
+  The first range alone would leave a small set of survivors eligible for
+  a rebuild. With only a `ManagerRef` and the node owners held at the call,
+  require all handles to clear, one reclamation per node, zero table
+  capacity, and no allocation attempt. The last two checks distinguish
+  full detachment from a rebuild between ranges. Recreate a retired key
+  after reattaching a facade and require a new ID.
+- **N-RANGE-06** forces a wrapped collision cluster of 256 distinct integer
+  nodes. Keep four spaced owners external and put the other 252 in two
+  ranges. Expect one replacement allocation and a smaller table. Repeat
+  with `NodeTestPeer::FailAllocationAfter(manager, 0)` to inject
+  `std::bad_alloc` at the replacement attempt. Expect success and the old
+  capacity after in-place erasure. In both runs every submitted handle
+  clears, 252 nodes retire, all four survivors keep their references and
+  identity, and retired keys from both ranges can be interned with new IDs.
+
 ### Construction cost and sparse declaration domains
 
 - Force collisions among payload-free, indexed, and qualified builtin keys.

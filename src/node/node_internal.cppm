@@ -627,6 +627,8 @@ inline std::size_t TableCapacity(const ManagerState* state) noexcept {
 void RetainNodeData(NodeData* node);
 void ReleaseNodeData(NodeData* node) noexcept;
 void ReleaseRootBatch(ManagerState* state, std::span<Node> roots) noexcept;
+void ReleaseRootBatch(ManagerState* state,
+                      std::span<const RootRange> ranges) noexcept;
 
 class StateLease {
  public:

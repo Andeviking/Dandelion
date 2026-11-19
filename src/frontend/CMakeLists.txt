@@ -2,7 +2,7 @@ set(frontend_interfaces frontend.cppm)
 set(frontend_private_interfaces frontend_internal.cppm)
 set(frontend_sources
   syntax.cc grammar.cc session.cc transaction.cc sorts.cc datatypes.cc
-  operators.cc terms.cc elaboration.cc
+  operators.cc terms.cc elaboration.cc canonicalize.cc
   driver.cc model.cc printing.cc
 )
 add_library(dandelion_frontend STATIC)

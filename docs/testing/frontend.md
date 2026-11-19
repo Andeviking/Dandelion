@@ -645,6 +645,32 @@ scripts.
   Verify every recovered use binds to its fresh definition. The deterministic
   test oracle needs only the small Boolean or BV fragment in these fixtures.
 
+## Frontend overhaul test design
+
+`tests/frontend/overhaul_test.cc` is registered with the frontend CTest suite.
+It exercises the [overhaul contracts](../frontend/design.md) through the
+public session API and the test-only frontend and Node inspection hooks.
+The cases precede implementation of the new interfaces and counters.
+
+| Case | Fixtures and independent expectations |
+| --- | --- |
+| FE-OVERHAUL-01 | Read a script through the text adapter, through a forced split at every interior byte, and in 1-byte, irregular, 4 KiB and 64 KiB chunks. Exact command, metadata, declaration, assertion and value-request spans come from known source substrings and a byte-coordinate oracle. CRLF is one newline, UTF-8 columns count bytes, and normalized rendering preserves quoted spelling and doubled quotes. |
+| FE-OVERHAUL-02 | Shift CRLF, UTF-8 and doubled quotes across the 64 KiB boundary and render a quoted token longer than two reader windows. Inject a reader error at each byte boundary of a command after a committed prefix. Check exact failure position, error code, committed metadata and termination. Compare an incomplete UTF-8 token across splits. Deliver a separate unread malformed suffix after `exit` and assert the reader is never called for it, including when some suffix bytes were already buffered. |
+| FE-OVERHAUL-03 | Compare wide and deep value lists on text and reader paths, with and without forced widening. Verify exact rendering and spans, every ordered child of a wide node, and the full deep chain. Normal growth allocates multiple pages and reports zero copies and promotions. A low threshold reports promoted pages while preserving all observed results. |
+| FE-OVERHAUL-04 | A named `let` with an unused RHS referencing an outer binder is closed. Check shadowing and simultaneous outer resolution on used RHSs, and reject an unused but ill-typed RHS. An open reference still fails when it resolves to the same node as a closed occurrence. A first-match-unreachable branch still produces valid annotation events and still fails if it has an external dependency. Failed commands publish no names, annotations or assertions, and a later command can reuse the spellings. A nested named chain publishes innermost first and visits one operand occurrence per annotation. |
+| FE-OVERHAUL-05 | Check quoted function spellings and ordered rank views after reader backing and the session are destroyed. Exercise the existing string and vector comparisons, indexing, size, back and iteration. Reject an owning `std::vector<std::string>` rank member at compile time. Look up free declarations on either side of gaps due to definitions, formals, a failed command and datatype publication. Reject nonfree, null and foreign declarations. Force structural node-table collisions and verify complete declaration and literal identity, including equal BV values with multiple spellings and unequal widths. |
+| FE-OVERHAUL-06 | Observe a cold miss, small-key hit, oversized bypass and eviction with exact integer readback. Concrete BV and FP sort occurrences reuse resolved sorts while differing keys keep their correct widths or formats. Access each of 8,192 distinct short keys twice in succession and verify one hit per key. Replay every key once after the same warm-up in a fresh session and require some replay misses. This observes eviction without picking which keys should survive. Repeat a 16,384-digit integer as the oversized-key fixture. |
+| FE-OVERHAUL-07 | Sweep apply-time allocation checkpoints in a declaration with repeated sorts and an assertion with repeated literals. Preserve the original function, assertion and name records on every injected resource failure. Apply a repeated command in the same session and check its typed and rendered contents and published counts. |
+| FE-OVERHAUL-08 | Drop the last query owner after the session ends. Duplicate owners of one term occur in assertions, a definition body, named terms and annotations. With a separately retained root or child, check exact survivors, identities and table shrinkage. With neither, check reclamation and full table detachment through the retained manager. |
+| FE-OVERHAUL-09 | Verify every permitted operator family at its applicable arity and ordered controls in both enabled parsing and standalone normalization. Compare child identities against explicit source operands or independently sorted eligible positions. Keep FP rounding and FMA addend positions fixed, and preserve the order of signed zeros in `fp.min` and `fp.max`. Unlisted controls include ordered comparisons, subtraction, concatenation, implication, ordered UF arguments, `ite`, select and store. |
+| FE-OVERHAUL-10 | Legacy and explicit default options preserve ordered sums. Enabled parsing and the standalone batch and single-root overloads merge equivalent `ite`, `and` and UF parents after a child is reordered. Verify original standalone roots, repeated operands, nested operator boundaries, query publication, and original source rendering. Attribute a type error to its written operand with normalization enabled. A 512-operand permutation checks exact sorted child IDs and stable node IDs across independent text and reader sessions. |
+
+The cache pressure and oversized-key sizes are finite fixture choices for
+observing the bounded paths. The tests do not use timing or allocator
+residency as evidence. Hash collision injection uses the existing Node
+test peer. Frontend spelling checks use distinct exact keys and dequoted
+duplicates through the public API.
+
 ## Oracles and differential checks
 
 For unit tests, inspect the frontend's observable typed structure or other

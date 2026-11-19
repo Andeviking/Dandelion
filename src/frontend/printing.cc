@@ -111,7 +111,7 @@ class SortPrinter {
 };
 
 void SortPrinter::IndexAliases() {
-  for (const auto& [name, binding] : signature_.sorts) {
+  for (const auto& [name, binding] : signature_.sorts.Entries()) {
     const auto* alias = std::get_if<Alias>(&binding);
     // A parameter root would need the sort itself as a printed argument.
     if (alias && alias->root->kind != RecipeKind::kParameter)
@@ -468,7 +468,7 @@ class ModelPrinter {
   std::unordered_map<DeclId, bool> qualifiers_;
   std::unordered_map<DeclId, std::string> formals_;
   std::unordered_map<DeclId, ValueRef> export_proxies_;
-  std::unordered_set<DeclId> written_;
+  std::vector<bool> written_;
   std::unordered_map<NodeId, std::uint8_t> references_;
   std::unordered_map<NodeId, std::string> shared_;
   std::size_t ordinal_ = 0;
@@ -624,7 +624,9 @@ void ModelPrinter::Validate(NodeView node) {
           Bad("Model body uses an unbound formal");
         break;
       case DeclKind::kFunction:
-        if (!written_.contains(decl.GetId()))
+        if (const auto ordinal =
+                Signature::FunctionOrdinal(*state_.query, decl);
+            !ordinal || !written_[*ordinal])
           Bad("Model body refers to a function not yet defined");
         break;
       case DeclKind::kInternalFunction:
@@ -792,7 +794,11 @@ std::string ModelPrinter::Function(const ExportedFunction& record,
   if (body.IsNull() || body.GetSort() != decl.GetRange() ||
       record.formals.size() != domain.size())
     Bad("Model definition does not have the original rank");
-  auto out = "(define-fun " + original.source_name + " (";
+  std::string out = "(define-fun ";
+  if (original.source_name.IsQuoted()) out.push_back('|');
+  out.append(original.source_name.Canonical());
+  if (original.source_name.IsQuoted()) out.push_back('|');
+  out.append(" (");
   for (std::size_t i = 0; i < domain.size(); ++i) {
     const auto formal = record.formals[i].Borrow();
     if (formal.IsNull() || formal.GetKind() != DeclKind::kFormal ||
@@ -850,18 +856,20 @@ void ModelPrinter::Model(Response& response) {
     if (!export_proxies_.emplace(decl.GetId(), proxy.GetValue()).second)
       Bad("Model export contains a repeated proxy declaration");
   }
+  written_.resize(originals.size());
+  bool first = true;
   for (const auto& entry : model.functions) {
-    const auto decl = entry.declaration.Borrow();
-    if (decl.IsNull() || !state_.query->HasFunction(decl) ||
-        written_.contains(decl.GetId()))
+    const auto ordinal =
+        Signature::FunctionOrdinal(*state_.query, entry.declaration.Borrow());
+    if (!ordinal || written_[*ordinal])
       Bad("Model export repeats or introduces a user symbol");
-    auto text =
-        Function(entry, originals[signature_.function_index.at(decl.GetId())]);
-    text.insert(0, written_.empty() ? "(" : " ");
-    written_.insert(decl.GetId());
+    auto text = Function(entry, originals[*ordinal]);
+    text.insert(0, first ? "(" : " ");
+    written_[*ordinal] = true;
     response.Write(text, where_);
+    first = false;
   }
-  Finish(response, where_, written_.empty() ? "()\n" : ")\n");
+  Finish(response, where_, first ? "()\n" : ")\n");
 }
 void ModelPrinter::Finish(Response& response, SourceSpan where,
                           std::string_view closing) {

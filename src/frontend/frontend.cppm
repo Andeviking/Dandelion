@@ -83,6 +83,9 @@ struct CommandHeader {
   CommandKind kind;
   SourceSpan where;
 };
+struct ParseOptions {
+  bool canonicalize_commutative = false;
+};
 struct SessionOptions {
   bool print_success = false;
   bool produce_models = false;
@@ -112,11 +115,57 @@ struct UserSort {
   std::string source_name;
   SourceSpan where;
 };
+// Both views borrow spelling storage owned by the containing query.
+class SourceNameView {
+ public:
+  SourceNameView() noexcept = default;
+  std::string_view Canonical() const noexcept { return {data_, size_ >> 1}; }
+  bool IsQuoted() const noexcept { return (size_ & 1) != 0; }
+  friend bool operator==(SourceNameView name,
+                         std::string_view spelling) noexcept {
+    if (!name.IsQuoted()) return name.Canonical() == spelling;
+    return spelling.size() >= 2 && spelling.front() == '|' &&
+           spelling.back() == '|' &&
+           name.Canonical() == spelling.substr(1, spelling.size() - 2);
+  }
+
+ private:
+  friend class detail::Transaction;
+  SourceNameView(std::string_view name, bool quoted) noexcept
+      : data_(name.data()), size_((name.size() << 1) | std::size_t{quoted}) {}
+  const char* data_ = nullptr;
+  std::size_t size_ = 0;
+};
+class SourceRankView {
+ public:
+  SourceRankView() noexcept = default;
+  // NOLINTNEXTLINE(readability-identifier-naming): Standard range interface.
+  std::size_t size() const noexcept { return rank_.size(); }
+  std::string_view operator[](std::size_t index) const noexcept {
+    return rank_[index];
+  }
+  // NOLINTNEXTLINE(readability-identifier-naming): Standard range interface.
+  std::string_view back() const noexcept { return rank_.back(); }
+  // NOLINTNEXTLINE(readability-identifier-naming): Standard range interface.
+  auto begin() const noexcept { return rank_.begin(); }
+  // NOLINTNEXTLINE(readability-identifier-naming): Standard range interface.
+  auto end() const noexcept { return rank_.end(); }
+  friend bool operator==(SourceRankView rank,
+                         const std::vector<std::string>& spelling) noexcept {
+    return std::ranges::equal(rank.rank_, spelling);
+  }
+
+ private:
+  friend class detail::Transaction;
+  explicit SourceRankView(std::span<const std::string_view> rank) noexcept
+      : rank_(rank) {}
+  std::span<const std::string_view> rank_;
+};
 struct UserFunction {
   Decl decl;
-  std::string source_name;
+  SourceNameView source_name;
   // Domain sorts in declaration order followed by the result sort.
-  std::vector<std::string> source_rank;
+  SourceRankView source_rank;
   SourceSpan where;
 };
 struct DefinedFunction {
@@ -133,7 +182,17 @@ struct FrontendStats {
   std::size_t recipe_pairs = 0;
   std::size_t sort_recipe_pairs = 0;
   std::size_t closure_visits = 0;
+  std::size_t syntax_page_allocations = 0;
+  std::size_t syntax_page_copies = 0;
+  std::size_t syntax_promoted_pages = 0;
+  std::size_t literal_cache_hits = 0;
+  std::size_t sort_cache_hits = 0;
+  std::size_t commutative_canonicalizations = 0;
 };
+
+Outcome<std::vector<Node>> CanonicalizeCommutative(const ManagerRef& manager,
+                                                   std::span<const Node> roots);
+Outcome<Node> CanonicalizeCommutative(const ManagerRef& manager, NodeView root);
 
 class QueryContext {
  public:
@@ -326,6 +385,10 @@ class Session {
   static Outcome<Session> FromText(std::string_view text,
                                    std::uint32_t source = 0);
   static Outcome<Session> FromReader(Reader reader, std::uint32_t source = 0);
+  static Outcome<Session> FromText(std::string_view text, ParseOptions options,
+                                   std::uint32_t source = 0);
+  static Outcome<Session> FromReader(Reader reader, ParseOptions options,
+                                     std::uint32_t source = 0);
   static Outcome<Session> ForModelText(std::shared_ptr<ModelOwner> model,
                                        std::string_view text,
                                        std::uint32_t source = 0);
@@ -346,6 +409,7 @@ class Session {
   const QueryContext& GetPrefix() const noexcept;
 #ifdef DANDELION_FRONTEND_TESTING
   FrontendStats GetStats() const noexcept;
+  void ForceSyntaxPromotionThreshold(std::uint64_t threshold) noexcept;
   void FailAllocationAfter(std::size_t checkpoints) noexcept;
 #endif
 

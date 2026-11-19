@@ -585,6 +585,27 @@ struct NodeHash {
   std::size_t operator()(const Node& node) const noexcept;
 };
 
+// Borrows mutable root slots. The accessor must only locate the same live
+// Node object at each index throughout the release call.
+struct RootRange {
+  // NOLINTBEGIN(readability-identifier-naming): Struct fields, snake_case.
+  void* context = nullptr;
+  std::size_t count = 0;
+  Node* (*at)(void* context, std::size_t index) noexcept = nullptr;
+  // NOLINTEND(readability-identifier-naming)
+
+  template <auto Member, class Record>
+  static RootRange From(std::span<Record> records) noexcept {
+    return {
+        records.data(),
+        records.size(),
+        [](void* base, std::size_t index) noexcept -> Node* {
+          return &(static_cast<Record*>(base)[index].*Member);
+        },
+    };
+  }
+};
+
 struct BuiltinOpView {
   // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
   Kind kind;
@@ -686,6 +707,10 @@ class NodeManager {
   // Consumes these handles together. Null handles are allowed. A foreign
   // handle rejects the entire batch before any handle is consumed.
   Result<void> ReleaseRoots(std::span<Node> roots);
+  // Validates every range and its handles before consuming the whole batch.
+  // The manager reference keeps the state alive throughout the release.
+  static Result<void> ReleaseRoots(const ManagerRef& manager,
+                                   std::span<const RootRange> ranges) noexcept;
   Result<Sort> RetainSort(SortView sort);
   Result<SortConstructor> RetainSortConstructor(
       SortConstructorView constructor);

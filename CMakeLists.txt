@@ -42,6 +42,7 @@ if(DANDELION_BUILD_BENCHMARKS)
 endif()
 if(DANDELION_BUILD_TESTS OR DANDELION_BUILD_BENCHMARKS)
   add_subdirectory(benchmarks/node)
+  add_subdirectory(benchmarks/frontend)
 endif()
 
 if(DANDELION_BUILD_TESTS)

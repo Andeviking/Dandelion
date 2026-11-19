@@ -55,7 +55,7 @@ constexpr auto kProfiles = std::to_array<Profile>({
      kFunctions},
 });
 
-Attribute ReadInfo(const Syntax& syntax, std::span<const ExprId> args) {
+Attribute ReadInfo(const Syntax& syntax, ChildRange args) {
   const auto key = syntax.Raw(args.front());
   const auto value = args.size() == 2 ? args[1] : kNoExpr;
   const auto raw = value != kNoExpr ? syntax.Raw(value) : std::string_view{};
@@ -88,9 +88,11 @@ Attribute ReadInfo(const Syntax& syntax, std::span<const ExprId> args) {
          "Invalid benchmark status");
   }
 
+  auto attribute_span = syntax.Span(args.front());
+  if (value != kNoExpr) attribute_span.end = where.end;
   return {std::string(key),
           value != kNoExpr ? std::optional(syntax.Render(value)) : std::nullopt,
-          syntax.header.where};
+          attribute_span};
 }
 
 std::string_view ReadOption(std::string_view name, SessionOptions options) {
@@ -111,8 +113,7 @@ std::string_view ReadOption(std::string_view name, SessionOptions options) {
 }
 
 SessionOptions ChangeOption(SessionOptions options, SessionPhase phase,
-                            const Syntax& syntax,
-                            std::span<const ExprId> args) {
+                            const Syntax& syntax, ChildRange args) {
   const auto* option = FindOption(syntax.Raw(args[0]));
   const auto where = syntax.Span(args[0]);
   if (!option || option->id == OptionId::kUnsupported)
@@ -204,10 +205,15 @@ void NodeFailure(NodeError error, SourceSpan where) {
   throw Failure{{code, where, message, error}};
 }
 
-SessionState::SessionState(Scanner input)
+SessionState::SessionState(Scanner input, ParseOptions parse)
     : scanner(std::move(input)),
       manager(Take(NodeManager::Create(), scanner.Here())),
-      building(new QueryContext(Take(manager.RetainState(), scanner.Here()))) {}
+      building(new QueryContext(Take(manager.RetainState(), scanner.Here()))),
+      parse_options(parse) {
+#ifdef DANDELION_FRONTEND_TESTING
+  scanner.Pool().stats = &stats;
+#endif
+}
 const QueryContext& SessionState::Prefix() const noexcept {
   return sealed ? *sealed : *building;
 }
@@ -339,7 +345,14 @@ bool operator==(const SourceSpan& left, const SourceSpan& right) noexcept {
 QueryContext::QueryContext(ManagerRef manager)
     : manager_(std::move(manager)),
       signature_(std::make_unique<detail::Signature>()) {}
-QueryContext::~QueryContext() = default;
+QueryContext::~QueryContext() {
+  const std::array ranges{
+      RootRange::From<&Assertion::term>(std::span(assertions_)),
+      RootRange::From<&DefinedFunction::body>(std::span(definitions_)),
+      RootRange::From<&NamedTerm::term>(std::span(named_terms_)),
+      RootRange::From<&Annotation::term>(std::span(annotations_))};
+  static_cast<void>(NodeManager::ReleaseRoots(manager_, ranges));
+}
 const DefinedFunction* QueryContext::FindDefinition(DeclId id) const noexcept {
   const auto found = signature_->definition_index.find(id);
   return found == signature_->definition_index.end()
@@ -351,10 +364,24 @@ const DefinedFunction* QueryContext::FindDefinition(
   const auto* definition = FindDefinition(decl.GetId());
   return definition && definition->decl.Borrow() == decl ? definition : nullptr;
 }
+std::optional<std::size_t> detail::Signature::FunctionOrdinal(
+    const QueryContext& query, DeclView decl) noexcept {
+  const auto& runs = Of(query).function_runs;
+  const auto id = decl.GetId();
+  const auto next = std::ranges::upper_bound(
+      runs, id, {}, &std::pair<DeclId, std::size_t>::first);
+  if (next == runs.begin()) return std::nullopt;
+  const auto [first, start] = *std::prev(next);
+  const auto delta = id - first;
+  const auto end = next == runs.end() ? query.functions_.size() : next->second;
+  if (delta >= end - start) return std::nullopt;
+  const auto ordinal = start + static_cast<std::size_t>(delta);
+  return query.functions_[ordinal].decl.Borrow() == decl
+             ? std::optional(ordinal)
+             : std::nullopt;
+}
 bool QueryContext::HasFunction(DeclView decl) const noexcept {
-  const auto found = signature_->function_index.find(decl.GetId());
-  return found != signature_->function_index.end() &&
-         functions_[found->second].decl.Borrow() == decl;
+  return detail::Signature::FunctionOrdinal(*this, decl).has_value();
 }
 
 Session::Session(std::unique_ptr<detail::SessionState> state) noexcept
@@ -364,15 +391,23 @@ Session& Session::operator=(Session&&) noexcept = default;
 Session::~Session() = default;
 Outcome<Session> Session::FromText(std::string_view text,
                                    std::uint32_t source) {
-  return detail::Guard({source, {}, {}}, [&] {
-    return Session(
-        std::make_unique<detail::SessionState>(detail::Scanner(text, source)));
-  });
+  return FromText(text, ParseOptions{}, source);
 }
 Outcome<Session> Session::FromReader(Reader reader, std::uint32_t source) {
+  return FromReader(std::move(reader), ParseOptions{}, source);
+}
+Outcome<Session> Session::FromText(std::string_view text, ParseOptions options,
+                                   std::uint32_t source) {
   return detail::Guard({source, {}, {}}, [&] {
     return Session(std::make_unique<detail::SessionState>(
-        detail::Scanner(std::move(reader), source)));
+        detail::Scanner(text, source), options));
+  });
+}
+Outcome<Session> Session::FromReader(Reader reader, ParseOptions options,
+                                     std::uint32_t source) {
+  return detail::Guard({source, {}, {}}, [&] {
+    return Session(std::make_unique<detail::SessionState>(
+        detail::Scanner(std::move(reader), source), options));
   });
 }
 Outcome<std::optional<CommandHeader>> Session::NextSyntax() {
@@ -382,13 +417,13 @@ Outcome<std::optional<CommandHeader>> Session::NextSyntax() {
                                       state_->pending->header.where,
                                       "A parsed command is already pending"});
   auto next = detail::Guard(state_->scanner.Here(),
-                            [&] { return state_->scanner.Next(); });
-  if (!next || !*next) {
+                            [&] { state_->scanner.Next(state_->pending); });
+  if (!next || !state_->pending) {
+    state_->pending.reset();
     state_->phase = SessionPhase::kTerminated;
     if (!next) return std::unexpected(next.error());
     return std::nullopt;
   }
-  state_->pending = std::move(**next);
   return state_->pending->header;
 }
 Outcome<TypedCommand> Session::Apply(const ModelOwner* model) {
@@ -396,15 +431,16 @@ Outcome<TypedCommand> Session::Apply(const ModelOwner* model) {
     return std::unexpected(Diagnostic{DiagnosticCode::kInvalidState,
                                       state_->scanner.Here(),
                                       "No parsed command is pending"});
-  auto syntax = std::move(*state_->pending);
-  state_->pending.reset();
-  return detail::Guard(syntax.header.where, [&] {
+  auto& syntax = *state_->pending;
+  auto result = detail::Guard(syntax.header.where, [&] {
     const auto* bound = state_->inspection_model.get();
     if (bound && model && model != bound)
       detail::Fail(DiagnosticCode::kModelFailure, syntax.header.where,
                    "Inspection session belongs to a different model");
     return state_->Apply(syntax, bound ? bound : model);
   });
+  state_->pending.reset();
+  return result;
 }
 SessionPhase Session::GetPhase() const noexcept { return state_->phase; }
 const SessionOptions& Session::GetOptions() const noexcept {
@@ -418,6 +454,9 @@ const QueryContext& Session::GetPrefix() const noexcept {
 }
 #ifdef DANDELION_FRONTEND_TESTING
 FrontendStats Session::GetStats() const noexcept { return state_->stats; }
+void Session::ForceSyntaxPromotionThreshold(std::uint64_t threshold) noexcept {
+  state_->scanner.Pool().threshold = threshold;
+}
 void Session::FailAllocationAfter(std::size_t checkpoints) noexcept {
   state_->fail_after = checkpoints;
 }

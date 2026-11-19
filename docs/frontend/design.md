@@ -18,6 +18,10 @@ Theories and logic revisions are pinned independently in
 builders. It accepts a solver callback and a model provider interface.
 Production solving and model implementation remain separate work.
 
+The sections marked **overhaul contract** specify adopted changes awaiting
+implementation. Their test-first cases are in the
+[frontend overhaul test design](../testing/frontend.md#frontend-overhaul-test-design).
+
 ## Architecture and interfaces
 
 Parse, elaborate and execute **one command at a time**. A complete command is
@@ -218,9 +222,7 @@ fragment-specific path. See [frontend admission and solver selection](semantic-i
 The handwritten scanner handles normal input, line comments, quoted
 symbols and strings. It borrows contiguous input and uses a reusable
 64 KiB window for the reader. Tokens carry kind, raw byte range and a lexeme
-interval. Reader token bytes go into one geometrically growing per-command
-arena. A spelling is copied once as bytes arrive, including across refills.
-This keeps all token references independent of window movement.
+interval. Token references are independent of window movement.
 
 - Use UTF-8 with checked scalar decoding, ASCII simple symbols and ASCII
   SMT-LIB whitespace. Reject an initial BOM, NUL and invalid UTF-8. Within
@@ -258,6 +260,36 @@ This keeps all token references independent of window movement.
   work stacks even for nested attributes, alias expansion, match branches
   and failure cleanup. Grammar checking sees the complete command before
   semantic publication. After `exit`, do not tokenize or validate a tail.
+
+#### Paged compact syntax (overhaul contract)
+
+Append token records, expression records, ordered child references and owned
+reader spelling bytes to per-command paged storage. Existing pages stay in
+place during normal growth. Address records by logical index and spellings by
+logical byte range. Reader spellings can cross input windows and storage pages.
+The text adapter can refer directly to its borrowed byte range. Keep parser
+frame marks and child intervals valid across page boundaries and widening.
+Render from the token sequence using exact raw spellings and normalized
+inter-token spacing. Source spans use the raw offsets and byte coordinates
+from the scanner.
+
+Start with compact unsigned 32-bit page fields where possible. Widen to
+unsigned 64-bit fields when a token index, expression index or offset exceeds
+the compact representation. Preserve logical addresses, half-open spans and
+ordered child ranges across widening. Check overflow before storing fields
+and report an actual allocation or representation failure through the existing
+resource boundary. The command owns this storage through parsing and apply.
+Copy any spelling needed by a published command or query into its owning
+storage before releasing syntax pages.
+
+Under `DANDELION_FRONTEND_TESTING`, `Session::ForceSyntaxPromotionThreshold`
+accepts a `std::uint64_t` threshold and is `noexcept`. Crossing it exercises
+the widening path on small input. The `std::size_t` statistics
+`syntax_page_allocations`, `syntax_page_copies` and `syntax_promoted_pages`
+count page allocation, full-buffer or widening copies, and widened pages,
+respectively. Appending ordinary pages records zero page copies.
+The paging, cache and canonicalization counters in `FrontendStats` each
+start at zero.
 
 ### Environments, commands, and binding
 
@@ -373,6 +405,21 @@ All source RHSs and branches are independently resolved and typed,
 including those skipped by the closure walk. [SMT-LIB §§3.6.2, 4.1.6](https://smt-lib.org/papers/smt-lib-reference-v2.7-r2026-09-09.pdf),
 [topic 4](topic-research.md#4-symbols-scopes-definitions-and-annotations)
 
+#### Frame-local elaboration (overhaul contract)
+
+Keep transient term owners, resolved operands and scope marks in the active
+elaboration frames. A parent collects its completed children in source order.
+Release a finished frame's storage after its parent and pending publication
+records have acquired the needed results. Keep the source dependency records
+needed for a pending closedness check across frame exits, including lexical
+binder identities and the outer-resolution links of used `let` RHSs. Reuse
+the closedness result of an already checked nested annotation by occurrence.
+The annotation visit count for a chain of `n` named annotations on a leaf
+remains `n`. Unused RHSs and branches made unreachable by first-match
+semantics still participate in typing, annotation checks and transactional
+publication. A later failure discards all pending names and occurrences from
+that command and restores the earlier lexical visibility.
+
 ### Sorts, ranks and node construction
 
 Use the operator document as the typed schema inventory. The frontend's
@@ -429,7 +476,7 @@ constructing a node. A general SMT type constraint solver is unnecessary.
    `SortRecipeView::GetId` supplies that group-scoped identity.
    [Node design](../node/design.md#9-implemented-query-details)
 4. Assert Bool at the assertion boundary. BV1 and Bool remain distinct.
-   Preserve ordered children and high-level operator kind, including
+   By default preserve ordered children and high-level operator kind, including
    `fp.eq` versus Core equality, adjacent chains, n-ary `distinct`,
    and `fp` or `to_fp` even with constant bit operands. No frontend
    rewrite changes symbol meaning or substitutes a value for an underspecified
@@ -438,6 +485,83 @@ constructing a node. A general SMT type constraint solver is unnecessary.
    declarations through their respective identity tables, never as free UF.
    [Node operator map](../node/operators.md),
    [SMT-LIB §3.6.3 and Figure 5.3](https://smt-lib.org/papers/smt-lib-reference-v2.7-r2026-09-09.pdf)
+
+#### Pooled declarations and concrete sorts (overhaul contract)
+
+Keep a compact user function record with its declaration identity, provenance,
+name reference and rank range. Pool the published source spelling and the
+rendered rank spellings in query-owned storage. The declaration record has
+no per-declaration `std::vector<std::string>` and shares spelling storage
+wherever the same bytes suffice. Preserve the raw quoted spelling for public
+readback and the dequoted spelling for lookup. Views remain valid for the
+lifetime of the query that owns the records. `UserFunction::source_name`
+supports equality with `std::string_view` and `std::string`.
+`UserFunction::source_rank` supports equality with
+`std::vector<std::string>`, `.size()`, indexing, `.back()` and range
+iteration. Domain spellings are in declaration order, followed by the result
+spelling. Maintain full spelling equality on hash collisions. Publish the
+record, spellings and lookup entries as one transaction. `HasFunction` uses
+the same-manager declaration identity and tolerates gaps occupied by
+definitions, formals, datatype declarations or IDs consumed by failed
+commands.
+
+Cache resolved concrete sort forms such as `(_ BitVec 32)` and
+`(_ FloatingPoint 8 24)` in bounded frontend storage. Include all data
+required to resolve the sort in the current signature. A hit must preserve the
+sort identity and keep the current occurrence's spelling and span. Keep local
+parameters, unresolved recipes and failed resolutions out of the concrete
+cache. Eviction permits ordinary resolution on a later miss. Under
+`DANDELION_FRONTEND_TESTING`, `sort_cache_hits` counts successful reuse.
+
+#### Commutative canonicalization (overhaul contract)
+
+The module exports the following options type.
+
+```cpp
+struct ParseOptions {
+  // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
+  bool canonicalize_commutative = false;
+};
+```
+
+Both `Session::FromText` and `Session::FromReader` retain the existing
+overload with an optional source ID. Each also accepts `ParseOptions`
+before the optional `std::uint32_t` source ID. Enabling the option
+canonicalizes typed terms before publication,
+including assertions, definition bodies, named and annotated terms, and value
+requests. Source order governs elaboration, diagnostics, annotation events
+and rendering in both modes.
+
+The standalone pass takes an owning manager reference and returns owning
+results for the same manager, in input root order. It visits children before
+parents and reuses the result for shared subgraphs. Rebuild changed ancestors
+through the checked node factories with the original kind, payload and
+declaration identity. This permits parent merges even when the parent itself
+has no commutative positions. Keep the input handles and their DAG valid.
+
+```cpp
+Outcome<std::vector<Node>> CanonicalizeCommutative(
+    const ManagerRef& manager, std::span<const Node> roots);
+Outcome<Node> CanonicalizeCommutative(const ManagerRef& manager, NodeView root);
+```
+
+Order the following positions by ascending `NodeId` using the already
+canonicalized operands.
+
+| Positions | Node kinds |
+| --- | --- |
+| All children at every valid arity | `kAnd`, `kOr`, `kXor`, `kEqual`, `kDistinct`, `kIntAdd`, `kIntMul`, `kBvAnd`, `kBvOr`, `kBvXor`, `kBvAdd`, `kBvMul`, `kFpEq` |
+| Both children of a binary node | `kBvNand`, `kBvNor`, `kBvXnor`, `kBvComp`, `kBvUaddo`, `kBvSaddo`, `kBvUmulo`, `kBvSmulo` |
+| Children `[1]` and `[2]` only | `kFpAdd`, `kFpMul`, `kFpFma` |
+
+Preserve arity, repeated operands, nested operator boundaries and every
+unlisted child position. FP rounding mode stays at `[0]` and the FMA addend
+at `[3]`. `kFpMin` and `kFpMax` keep source order because the opposite-zero
+result is underspecified. Other unlisted kinds keep their exact operand
+order, including UF and datatype applications, `ite`, implication, ordered
+comparisons, subtraction, concatenation and array operations. Under
+`DANDELION_FRONTEND_TESTING`, `commutative_canonicalizations` observes actual
+operand reorderings by a session.
 
 ### Datatype publication and match
 
@@ -567,6 +691,21 @@ process and is not made recoverable by an expected-like return type.
 [numeric contracts](../util/design.md#common-api-and-failure-policy),
 [GMP allocator contract](https://gmplib.org/manual/Custom-Allocation).
 
+#### Literal cache (overhaul contract)
+
+Reuse previously decoded exact literals through a bounded cache. Include
+all interpretation-relevant data in the cache key, including the literal form,
+radix or width when needed. Compare full keys on collisions. Cache only
+successful values and retain each use's source occurrence independently.
+An oversized literal takes the ordinary exact path and bypasses admission.
+On eviction, a later use takes the ordinary path. The entry and key-size
+bounds govern cache admission and retention. The input language still accepts
+every mathematically valid representable literal. Under
+`DANDELION_FRONTEND_TESTING`, `literal_cache_hits` counts successful reuse.
+Allocation failures in caching or publication follow the existing resource
+diagnostic and command rollback rules. A later command may retry the same
+input successfully.
+
 ### Resources and representation
 
 There are no project-imposed defaults or configurable quotas for source or
@@ -596,6 +735,18 @@ range up to the applicable machine and container limits.
 These representation limits do not authorize separate input,
 work or memory quotas, and they must be stated when describing supported
 inputs rather than claiming every mathematically valid width is representable.
+
+#### Query teardown (overhaul contract)
+
+When the final owner drops a query, batch-release the owning term handles
+from assertions, definitions, named terms and annotations through
+`NodeManager::ReleaseRoots` while the manager reference is live. Repeated
+handles are separate references and each is consumed once. The batch must
+respect any independently retained root or child. With no surviving nodes,
+the manager can detach the grown unique table while a separate manager
+reference remains available. Query destruction must remain nonthrowing. If
+batch preparation cannot allocate, ordinary handle destruction still
+releases the query's references.
 
 ## Cross-topic decisions
 

@@ -679,17 +679,21 @@ void ReleaseNodeData(NodeData* node) noexcept {
   if (state->references == 0) delete state;
 }
 
-void ReleaseRootBatch(ManagerState* state, std::span<Node> roots) noexcept {
+namespace {
+template <class ForEachRoot>
+void ReleaseRootBatchImpl(ManagerState* state,
+                          ForEachRoot for_each_root) noexcept {
   NodeData* pending = nullptr;
-  const auto drop = [&](NodeData* node) {
+  const auto drop = [&](NodeData* node) noexcept {
     if (node->ref_count == 0) std::terminate();
     if (--node->ref_count != 0) return;
     node->kind_code |= NodeData::kRetiring;
     node->reclaim_next = pending;
     pending = node;
   };
-  for (auto& root : roots)
+  for_each_root([&](Node& root) noexcept {
     if (auto* node = Access::TakeNode(root)) drop(node);
+  });
   if (!pending) return;
 
   NodeData* retired = nullptr;
@@ -715,5 +719,22 @@ void ReleaseRootBatch(ManagerState* state, std::span<Node> roots) noexcept {
 #ifdef DANDELION_NODE_TESTING
   state->reclamations += count;
 #endif
+}
+}  // namespace
+
+void ReleaseRootBatch(ManagerState* state, std::span<Node> roots) noexcept {
+  ReleaseRootBatchImpl(state, [&](auto consume) noexcept {
+    for (auto& root : roots) consume(root);
+  });
+}
+
+void ReleaseRootBatch(ManagerState* state,
+                      std::span<const RootRange> ranges) noexcept {
+  ReleaseRootBatchImpl(state, [&](auto consume) noexcept {
+    for (const auto& range : ranges) {
+      for (std::size_t i = 0; i < range.count; ++i)
+        consume(*range.at(range.context, i));
+    }
+  });
 }
 }  // namespace dandelion::detail

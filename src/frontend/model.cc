@@ -43,7 +43,11 @@ SessionState::SessionState(Scanner input, std::shared_ptr<ModelOwner> model)
       inspection_model(std::move(model)),
       metadata(sealed->GetMetadata().begin(), sealed->GetMetadata().end()),
       options(sealed->GetOptions()),
-      phase(SessionPhase::kAfterCheck) {}
+      phase(SessionPhase::kAfterCheck) {
+#ifdef DANDELION_FRONTEND_TESTING
+  scanner.Pool().stats = &stats;
+#endif
+}
 
 std::pair<Node, std::string> ResolveModelReference(
     const ModelOwner& model, const QueryContext& query, std::string_view name,
@@ -107,7 +111,7 @@ void ModelScope::CheckSort(SortView root, SourceSpan where) {
       case SortKind::kDatatype: {
         const auto ctor = *sort.GetSortConstructor();
         const auto entry = signature_.sorts.find(ctor.GetNameHint());
-        require(entry != signature_.sorts.end());
+        require(entry != nullptr);
         const auto& binding = entry->second;
         if (const auto* free = std::get_if<SortConstructorView>(&binding)) {
           require(ctor == *free);

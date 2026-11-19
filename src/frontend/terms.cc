@@ -7,16 +7,14 @@ namespace {
 
 enum class Action {
   kEnter,
-  kFinishCall,
-  kRationalArgument,
-  kFinishAnnotation,
-  kBindLet,
-  kFinishLet,
-  kStartMatch,
-  kNextBranch,
-  kFinishBranch,
+  kCall,
+  kAnnotation,
+  kLetBindings,
+  kLetBody,
+  kMatchStart,
+  kMatchNext,
+  kMatchBody
 };
-enum class Closure { kLeaf, kLocal, kApplication, kLet, kMatch, kAnnotation };
 enum class HeadKind {
   kOperator,
   kLocal,
@@ -32,7 +30,7 @@ struct Call {
   // NOLINTBEGIN(readability-identifier-naming): Struct fields, snake_case.
   HeadKind kind = HeadKind::kOperator;
   ExprId head;
-  std::span<const ExprId> args;
+  ChildRange args;
   std::optional<SortView> qualifier;
   std::vector<Integer> indices;
   const Operator* op = nullptr;
@@ -47,7 +45,7 @@ struct Local {
   // NOLINTBEGIN(readability-identifier-naming): Struct fields, snake_case.
   std::string_view name;
   ExprId scope;
-  ExprId rhs;
+  ExprId escape;
   ExprId previous;
   Node value;
   DeclView selector;
@@ -55,27 +53,29 @@ struct Local {
   // NOLINTEND(readability-identifier-naming)
 };
 
-struct Task {
+struct Frame {
   // NOLINTBEGIN(readability-identifier-naming): Struct fields, snake_case.
   ExprId expr;
+  std::size_t base;
   Action action = Action::kEnter;
-  std::size_t index = 0;
+  std::size_t next = 0;
+  std::size_t mark = 0;
   // NOLINTEND(readability-identifier-naming)
 };
 
-struct Occurrence {
+// The first enclosing binder still needed by this source operand, or kNoExpr.
+// Preorder puts every lexical ancestor before the subtree that refers to it.
+struct Resolved {
   // NOLINTBEGIN(readability-identifier-naming): Struct fields, snake_case.
   Node term;
-  Closure closure = Closure::kLeaf;
-  ExprId local = kNoExpr;
-  bool checked_closed = false;
+  ExprId escape = kNoExpr;
   // NOLINTEND(readability-identifier-naming)
 };
 
 struct MatchBranch {
   // NOLINTBEGIN(readability-identifier-naming): Struct fields, snake_case.
   std::optional<DatatypeMember> member;
-  ExprId body;
+  Node body;
   // NOLINTEND(readability-identifier-naming)
 };
 
@@ -86,6 +86,8 @@ struct MatchState {
   std::unordered_set<std::uint64_t> seen;
   std::vector<MatchBranch> effective;
   SortView result;
+  std::optional<DatatypeMember> member;
+  ExprId escape;
   std::uint64_t constructor_count = 0;
   std::size_t mark = 0;
   bool fallback = false;
@@ -177,16 +179,18 @@ class Elaborator {
   void ReserveName(std::string_view name) noexcept { reserved_ = name; }
 
  private:
-  void Enter(ExprId expr);
-  Call Prepare(ExprId expr, ExprId head, std::span<const ExprId> args,
-               bool application);
-  Node FinishCall(ExprId expr, Call& call);
+  void Enter(Frame& frame);
+  void Push(ExprId expr);
+  void Complete(Resolved result);
+  Call Prepare(ExprId expr, ExprId head, ChildRange args, bool application);
+  Resolved FinishCall(ExprId expr, Call& call,
+                      std::span<const Resolved> operands);
   Node TakeApplication(Result<Node> result, const Call& call, SourceSpan where);
   [[noreturn]] void ApplicationFailure(NodeError error, const Call& call,
                                        SourceSpan where);
   Node ApplyOrdinaryLiteral(ExprId expr);
   Node ApplyLiteral(const Call& call, SourceSpan where);
-  Node ApplyOperator(ExprId expr, Call& call, std::span<const NodeView> nodes);
+  Node ApplyOperator(ExprId expr, Call& call, std::span<NodeView> nodes);
   std::optional<Rational> RationalArgument(ExprId root);
   Node ApplyGlobal(const TermBinding& binding, const Call& call,
                    std::span<const NodeView> nodes, SourceSpan where);
@@ -201,18 +205,17 @@ class Elaborator {
   std::optional<DatatypeMember> Constructor(
       std::string_view name) const noexcept;
 
-  void PushLocal(ExprId name, ExprId scope, ExprId rhs, Node node,
+  void PushLocal(ExprId name, ExprId scope, ExprId escape, Node node,
                  DeclView selector = {}, NodeView scrutinee = {});
   Node LocalValue(std::size_t binding);
   void Restore(std::size_t mark) noexcept;
-  void UniqueBinders(std::span<const ExprId> slots);
-  void BindLet(ExprId expr);
-  void FinishAnnotation(ExprId expr);
-  bool Closed(ExprId root);
+  void UniqueBinders(ChildRange slots);
+  void BindLet(ExprId expr, std::span<Resolved> values);
+  void FinishAnnotation(ExprId expr, Resolved& result);
 
-  void StartMatch(ExprId expr);
-  void NextBranch(ExprId expr, std::size_t index);
-  void FinishBranch(ExprId expr, std::size_t index);
+  void StartMatch(ExprId expr, const Resolved& scrutinee);
+  ExprId BeginBranch(ExprId expr, ExprId branch);
+  void FinishBranch(ExprId expr, ExprId field, Resolved result);
   Node FinishMatch(MatchState& match, SourceSpan where);
 
   SessionState& session_;
@@ -224,14 +227,12 @@ class Elaborator {
   TypedCommand& command_;
   const ModelOwner* model_;
   std::optional<std::string_view> reserved_;
-  std::vector<Occurrence> occurrences_;
-  std::vector<Task> tasks_;
+  std::vector<Resolved> values_;
+  std::vector<Frame> frames_;
   std::vector<Call> calls_;
   std::vector<Local> locals_;
-  std::vector<std::size_t> active_locals_;
   std::unordered_map<std::string_view, std::size_t> heads_;
   std::vector<MatchState> matches_;
-  std::vector<std::optional<DatatypeMember>> branch_members_;
   std::vector<NodeView> arguments_;
   std::unordered_map<std::size_t, Replacement> replacements_;
   const bool value_mode_;
@@ -248,37 +249,40 @@ Elaborator::Elaborator(SessionState& session, const Syntax& syntax,
       txn_(txn),
       command_(command),
       model_(model),
-      occurrences_(syntax.expressions.size()),
       value_mode_(command.header.kind == CommandKind::kGetValue) {}
 
-void Elaborator::Enter(ExprId expr) {
-  const auto children = syntax_.Children(expr);
+void Elaborator::Push(ExprId expr) {
+  frames_.push_back({expr, values_.size()});
+}
+void Elaborator::Complete(Resolved result) {
+  values_.resize(frames_.back().base);
+  frames_.pop_back();
+  values_.push_back(std::move(result));
+}
+void Elaborator::Enter(Frame& frame) {
+  const auto expr = frame.expr;
   if (!syntax_.List(expr) && syntax_.Type(expr) >= TokenKind::kNumeral) {
-    occurrences_[expr].term = ApplyOrdinaryLiteral(expr);
+    Complete({ApplyOrdinaryLiteral(expr)});
     return;
   }
   auto head = expr;
-  std::span<const ExprId> args;
+  ChildRange args;
   bool application = false;
   if (syntax_.List(expr)) {
+    const auto children = syntax_.Children(expr);
     head = children.front();
     if (syntax_.Is(head, "let")) {
-      const auto bindings = syntax_.Children(children[1]);
-      tasks_.push_back({expr, Action::kFinishLet, active_locals_.size()});
-      tasks_.push_back({children[2]});
-      tasks_.push_back({expr, Action::kBindLet});
-      for (const auto binding : bindings | std::views::reverse)
-        tasks_.push_back({syntax_.Children(binding)[1]});
+      frame.action = Action::kLetBindings;
       return;
     }
     if (syntax_.Is(head, "match")) {
-      tasks_.push_back({expr, Action::kStartMatch});
-      tasks_.push_back({children[1]});
+      frame.action = Action::kMatchStart;
+      Push(children[1]);
       return;
     }
     if (syntax_.Is(head, "!")) {
-      tasks_.push_back({expr, Action::kFinishAnnotation});
-      tasks_.push_back({children[1]});
+      frame.action = Action::kAnnotation;
+      Push(children[1]);
       return;
     }
     if (syntax_.Is(head, "forall") || syntax_.Is(head, "exists") ||
@@ -294,27 +298,25 @@ void Elaborator::Enter(ExprId expr) {
   }
   auto call = Prepare(expr, head, args, application);
   if (args.empty()) {
-    occurrences_[expr].term = FinishCall(expr, call);
+    Complete(FinishCall(expr, call, {}));
     return;
   }
-  const auto rational_candidate =
-      call.op && call.op->kind == Kind::kFpFromBits && args.size() == 2;
   calls_.push_back(std::move(call));
-  tasks_.push_back({expr, Action::kFinishCall});
-  if (rational_candidate) {
-    tasks_.push_back({args[1], Action::kRationalArgument});
-    tasks_.push_back({args[0]});
-  } else {
-    for (auto arg : args | std::views::reverse) tasks_.push_back({arg});
-  }
+  frame.action = Action::kCall;
 }
 
-Call Elaborator::Prepare(ExprId expr, ExprId head, std::span<const ExprId> args,
+Call Elaborator::Prepare(ExprId expr, ExprId head, ChildRange args,
                          bool application) {
   const auto id = GetIdentifier(syntax_, head);
   const auto name = syntax_.Name(id.name);
   const auto where = syntax_.Span(head);
   const bool indexed = !id.indices.empty();
+  const auto* descriptor = syntax_.Type(id.name) == TokenKind::kQuoted
+                               ? GetOperator(ClassifyOperator(name))
+                               : GetOperator(syntax_.Spelling(id.name));
+  const auto* op = descriptor && indexed == (descriptor->indices != 0)
+                       ? descriptor
+                       : nullptr;
   const auto resolve_qualifier = [&]() -> std::optional<SortView> {
     if (id.qualifier == kNoExpr) return std::nullopt;
     const auto sort = ResolveSort(session_, syntax_, id.qualifier, txn_);
@@ -345,34 +347,41 @@ Call Elaborator::Prepare(ExprId expr, ExprId head, std::span<const ExprId> args,
     return call;
   }
   if (!indexed) {
-    if (const auto it = heads_.find(name); it != heads_.end()) {
-      CheckArity(args.size(), 0, where);
-      if (id.qualifier != kNoExpr)
-        Fail(DiagnosticCode::kInvalidInput, where,
-             "A lexical binding cannot be qualified");
-      call.kind = HeadKind::kLocal;
-      call.local = it->second;
-      return call;
-    }
-    if (const auto it = signature_.terms.find(name);
-        it != signature_.terms.end()) {
-      call.kind = HeadKind::kGlobal;
-      call.global = it->second;
-      if (const auto* ordinary = std::get_if<DeclInstanceView>(&call.global))
-        CheckArity(args.size(), ordinary->GetDomain().size(), where);
-      else if (std::holds_alternative<std::size_t>(call.global))
+    const bool active_operator =
+        op &&
+        (profile_.Has(op->features) ||
+         (profile_.Has(kRestrictedIntegers) && IsRestrictedInt(op->kind)));
+    const bool boolean = name == "true" || name == "false";
+    const auto rm = op ? std::nullopt : FindRoundingMode(name);
+    if (!active_operator && !boolean && !(rm && profile_.Has(kFloats))) {
+      if (const auto it = heads_.find(name); it != heads_.end()) {
         CheckArity(args.size(), 0, where);
-      call.qualifier = resolve_qualifier();
-      return call;
+        if (id.qualifier != kNoExpr)
+          Fail(DiagnosticCode::kInvalidInput, where,
+               "A lexical binding cannot be qualified");
+        call.kind = HeadKind::kLocal;
+        call.local = it->second;
+        return call;
+      }
+      if (const auto it = signature_.terms.find(name); it != nullptr) {
+        call.kind = HeadKind::kGlobal;
+        call.global = it->second;
+        if (const auto* ordinary = std::get_if<DeclInstanceView>(&call.global))
+          CheckArity(args.size(), ordinary->GetDomain().size(), where);
+        else if (std::holds_alternative<std::size_t>(call.global))
+          CheckArity(args.size(), 0, where);
+        call.qualifier = resolve_qualifier();
+        return call;
+      }
     }
-    if (name == "true" || name == "false") {
+    if (boolean) {
       CheckArity(args.size(), 0, where);
       call.kind = HeadKind::kLiteral;
       call.literal = name == "true";
       call.qualifier = resolve_qualifier();
       return call;
     }
-    if (auto rm = FindRoundingMode(name)) {
+    if (rm) {
       CheckArity(args.size(), 0, where);
       if (!profile_.Has(kFloats))
         Fail(DiagnosticCode::kUnsupported, where,
@@ -428,7 +437,7 @@ Call Elaborator::Prepare(ExprId expr, ExprId head, std::span<const ExprId> args,
     }
   }
 
-  if (const auto* op = FindOperator(name, indexed)) {
+  if (op) {
     call.op = op;
     call.indices = NumericIndices(syntax_, id, op->indices, where);
     if (const auto error = CheckOperatorIndices(op->kind, call.indices))
@@ -444,8 +453,8 @@ Call Elaborator::Prepare(ExprId expr, ExprId head, std::span<const ExprId> args,
         !(profile_.Has(kRestrictedIntegers) && IsRestrictedInt(op->kind)))
       Fail(DiagnosticCode::kUnsupported, where,
            "Operator is outside the active signature");
-  } else if (FindOperator(name, !indexed) || FindFpSpecial(name) ||
-             IsBvNumeral(name) || name == "is") {
+  } else if (descriptor || FindFpSpecial(name) || IsBvNumeral(name) ||
+             name == "is") {
     Fail(DiagnosticCode::kInvalidInput, where,
          "Wrong identifier form for this operator");
   } else if (IsKnownExcludedTerm(name)) {
@@ -474,8 +483,7 @@ Node Elaborator::ApplyOrdinaryLiteral(ExprId expr) {
     if (!profile_.Has(kIntegers) && !profile_.Has(kRestrictedIntegers))
       Fail(DiagnosticCode::kUnsupported, where,
            "Integer numeral outside the active signature");
-    const auto value = Take(Integer::ParseDecimal(raw), where);
-    return Take(manager_.MakeInt(value.Borrow()), where);
+    return session_.NumericLiteral(raw, 10, {}, where);
   }
   if (type == TokenKind::kBinary || type == TokenKind::kHexadecimal) {
     if (!profile_.Has(kBitVectors) && !profile_.Has(kFloats))
@@ -488,9 +496,8 @@ Node Elaborator::ApplyOrdinaryLiteral(ExprId expr) {
     const auto sort = Take(
         manager_.MakeBvSort(IntegerView::FromUnsigned(digits.size() * factor)),
         where);
-    const auto value =
-        Take(Integer::ParseRadix(digits, factor == 1 ? 2 : 16), where);
-    return Take(manager_.MakeBvValue(sort.Borrow(), value.Borrow()), where);
+    return session_.NumericLiteral(digits, factor == 1 ? 2 : 16, sort.Borrow(),
+                                   where);
   }
   Fail(DiagnosticCode::kUnsupported, where,
        "Real or String term is outside the input profile");
@@ -508,9 +515,8 @@ Node Elaborator::ApplyLiteral(const Call& call, SourceSpan where) {
     return Take(manager_.MakeFpSpecial(sort.Borrow(), *special), where);
   }
   const auto sort = Take(manager_.MakeBvSort(call.indices[0].Borrow()), where);
-  const auto value = Take(
-      Integer::ParseDecimal(std::get<std::string_view>(call.literal)), where);
-  return Take(manager_.MakeBvValue(sort.Borrow(), value.Borrow()), where);
+  return session_.NumericLiteral(std::get<std::string_view>(call.literal), 10,
+                                 sort.Borrow(), where);
 }
 
 std::optional<Rational> Elaborator::RationalArgument(ExprId root) {
@@ -564,7 +570,7 @@ std::optional<Rational> Elaborator::RationalArgument(ExprId root) {
 }
 
 Node Elaborator::ApplyOperator(ExprId expr, Call& call,
-                               std::span<const NodeView> nodes) {
+                               std::span<NodeView> nodes) {
   auto kind = call.op->kind;
   const auto where = syntax_.Span(expr);
   if ((kind == Kind::kAnd || kind == Kind::kOr) && nodes.size() <= 1) {
@@ -572,7 +578,7 @@ Node Elaborator::ApplyOperator(ExprId expr, Call& call,
       return Take(manager_.MakeBool(kind == Kind::kAnd), where);
     if (nodes[0].GetSort().GetKind() != SortKind::kBool)
       NodeFailure({ErrorCode::kSortMismatch}, syntax_.Span(call.args[0]));
-    return occurrences_[call.args[0]].term;
+    return Take(manager_.RetainNode(nodes[0]), where);
   }
   if (IsRestrictedInt(kind) && profile_.Has(kRestrictedIntegers) &&
       nodes.size() != 2) {
@@ -599,9 +605,21 @@ Node Elaborator::ApplyOperator(ExprId expr, Call& call,
       call.rational ? std::optional(call.rational->Borrow()) : std::nullopt;
   const auto qualifier =
       kind == Kind::kArrayConst ? call.qualifier : std::nullopt;
-  return TakeApplication(
-      manager_.MakeBuiltin({kind, call.indices, qualifier, rational}, nodes),
-      call, where);
+  const BuiltinOpView operation{kind, call.indices, qualifier, rational};
+  const auto operands = session_.parse_options.canonicalize_commutative
+                            ? CommutativeOperands(kind, nodes)
+                            : std::span<NodeView>{};
+  const bool reordered =
+      !std::ranges::is_sorted(operands, {}, &NodeView::GetId);
+  if (reordered) {
+    const auto checked = manager_.CheckBuiltin(operation, nodes);
+    if (!checked) ApplicationFailure(checked.error(), call, where);
+    OrderCommutative(operands);
+  }
+  auto term =
+      TakeApplication(manager_.MakeBuiltin(operation, nodes), call, where);
+  if (reordered) session_.Count(&FrontendStats::commutative_canonicalizations);
+  return term;
 }
 
 Node Elaborator::TakeApplication(Result<Node> result, const Call& call,
@@ -621,25 +639,23 @@ void Elaborator::ApplicationFailure(NodeError error, const Call& call,
   NodeFailure(error, where);
 }
 
-Node Elaborator::FinishCall(ExprId expr, Call& call) {
+Resolved Elaborator::FinishCall(ExprId expr, Call& call,
+                                std::span<const Resolved> operands) {
   const auto where = syntax_.Span(expr);
-  auto& occurrence = occurrences_[expr];
   if (call.kind == HeadKind::kLocal) {
-    occurrence.closure = Closure::kLocal;
-    occurrence.local = call.local;
-    return LocalValue(call.local);
+    const auto& local = locals_[call.local];
+    return {LocalValue(call.local), std::min(local.scope, local.escape)};
   }
   if (call.kind == HeadKind::kExcluded)
     Fail(DiagnosticCode::kUnsupported, where,
          "Operator is outside the input profile");
 
   arguments_.clear();
-  for (std::size_t i = 0; i < call.args.size() - static_cast<std::size_t>(
-                                                     call.rational.has_value());
-       ++i)
-    arguments_.push_back(occurrences_[call.args[i]].term.Borrow());
-  occurrence.closure =
-      arguments_.empty() ? Closure::kLeaf : Closure::kApplication;
+  auto escape = kNoExpr;
+  for (const auto& operand : operands) {
+    escape = std::min(escape, operand.escape);
+    arguments_.push_back(operand.term.Borrow());
+  }
   Node term;
   switch (call.kind) {
     case HeadKind::kOperator:
@@ -660,10 +676,10 @@ Node Elaborator::FinishCall(ExprId expr, Call& call) {
       auto bound =
           ResolveModelReference(*model_, session_.Prefix(),
                                 syntax_.Name(id.name), call.qualifier, where);
-      const auto& entry = syntax_.expressions[call.head];
+      const auto& entry = syntax_.GetExpression(call.head);
       replacements_.emplace(
           entry.token, Replacement{entry.last_token, std::move(bound.second)});
-      return std::move(bound.first);
+      return {std::move(bound.first), escape};
     }
     case HeadKind::kLocal:
     case HeadKind::kExcluded:
@@ -671,7 +687,7 @@ Node Elaborator::FinishCall(ExprId expr, Call& call) {
   }
   if (call.qualifier && (!call.op || call.op->kind != Kind::kArrayConst))
     CheckSort(term.Borrow().GetSort(), *call.qualifier, where);
-  return term;
+  return {std::move(term), escape};
 }
 
 DatatypeGroupView Elaborator::Group(DatatypeMember member) const noexcept {
@@ -680,7 +696,7 @@ DatatypeGroupView Elaborator::Group(DatatypeMember member) const noexcept {
 std::optional<DatatypeMember> Elaborator::Constructor(
     std::string_view name) const noexcept {
   const auto it = signature_.terms.find(name);
-  if (it != signature_.terms.end()) {
+  if (it != nullptr) {
     const auto* member = std::get_if<DatatypeMember>(&it->second);
     if (member && !member->field) return *member;
   }
@@ -817,20 +833,18 @@ Node Elaborator::ApplyGlobal(const TermBinding& binding, const Call& call,
   return session_.Prefix().GetNamedTerms()[std::get<std::size_t>(binding)].term;
 }
 
-void Elaborator::PushLocal(ExprId name, ExprId scope, ExprId rhs, Node node,
+void Elaborator::PushLocal(ExprId name, ExprId scope, ExprId escape, Node node,
                            DeclView selector, NodeView scrutinee) {
   const auto spelling = syntax_.Name(name);
   const auto it = heads_.find(spelling);
   const auto previous = it == heads_.end() ? kNoExpr : it->second;
   const auto binding = locals_.size();
-  locals_.push_back(
-      {spelling, scope, rhs, previous, std::move(node), selector, scrutinee});
+  locals_.push_back({spelling, scope, escape, previous, std::move(node),
+                     selector, scrutinee});
   heads_.insert_or_assign(spelling, binding);
-  active_locals_.push_back(binding);
 }
 Node Elaborator::LocalValue(std::size_t binding) {
   auto& local = locals_[binding];
-  if (local.rhs != kNoExpr) return occurrences_[local.rhs].term;
   if (local.value.Borrow().IsNull()) {
     const auto where = syntax_.Span(local.scope);
     const auto instance =
@@ -843,14 +857,14 @@ Node Elaborator::LocalValue(std::size_t binding) {
   return local.value;
 }
 void Elaborator::Restore(std::size_t mark) noexcept {
-  while (active_locals_.size() != mark) {
-    const auto& local = locals_[active_locals_.back()];
+  while (locals_.size() != mark) {
+    const auto& local = locals_.back();
     const auto it = heads_.find(local.name);
     if (local.previous == kNoExpr)
       heads_.erase(it);
     else
       it->second = local.previous;
-    active_locals_.pop_back();
+    locals_.pop_back();
   }
 }
 void Elaborator::Formal(ExprId name, Node node) {
@@ -860,7 +874,7 @@ void Elaborator::Formal(ExprId name, Node node) {
          "Duplicate function formal");
   PushLocal(name, 0, kNoExpr, std::move(node));
 }
-void Elaborator::UniqueBinders(std::span<const ExprId> slots) {
+void Elaborator::UniqueBinders(ChildRange slots) {
   std::unordered_set<std::string_view> names;
   for (const auto slot : slots) {
     if (syntax_.Is(slot, "_")) continue;
@@ -870,67 +884,27 @@ void Elaborator::UniqueBinders(std::span<const ExprId> slots) {
            "Duplicate local name");
   }
 }
-void Elaborator::BindLet(ExprId expr) {
+void Elaborator::BindLet(ExprId expr, std::span<Resolved> values) {
   const auto bindings = syntax_.Children(syntax_.Children(expr)[1]);
-  std::vector<ExprId> names;
-  names.reserve(bindings.size());
-  for (auto binding : bindings) names.push_back(syntax_.Children(binding)[0]);
-  UniqueBinders(names);
+  std::unordered_set<std::string_view> names;
   for (auto binding : bindings) {
-    const auto parts = syntax_.Children(binding);
-    PushLocal(parts[0], expr, parts[1], {});
+    const auto name = syntax_.Children(binding)[0];
+    CheckTermName(session_, syntax_, name, false);
+    if (!names.insert(syntax_.Name(name)).second)
+      Fail(DiagnosticCode::kInvalidInput, syntax_.Span(name),
+           "Duplicate local name");
+  }
+  std::size_t i = 0;
+  for (auto binding : bindings) {
+    auto& rhs = values[i++];
+    PushLocal(syntax_.Children(binding)[0], expr, rhs.escape,
+              std::move(rhs.term));
   }
 }
 
-bool Elaborator::Closed(ExprId root) {
-  const auto region = syntax_.Span(root);
-  std::vector<ExprId> stack{root};
-  std::unordered_set<ExprId> visited;
-  while (!stack.empty()) {
-    const auto expr = stack.back();
-    stack.pop_back();
-    if (!visited.insert(expr).second) continue;
-    session_.Count(&FrontendStats::closure_visits);
-    const auto& occurrence = occurrences_[expr];
-    if (occurrence.checked_closed) continue;
-    const auto children = syntax_.Children(expr);
-    switch (occurrence.closure) {
-      case Closure::kLeaf:
-        break;
-      case Closure::kLocal: {
-        const auto& binding = locals_[occurrence.local];
-        const auto scope = syntax_.Span(binding.scope);
-        if (scope.begin.offset < region.begin.offset ||
-            scope.end.offset > region.end.offset)
-          return false;
-        if (binding.rhs != kNoExpr) stack.push_back(binding.rhs);
-        break;
-      }
-      case Closure::kApplication:
-        for (auto arg : children.subspan(1) | std::views::reverse)
-          stack.push_back(arg);
-        break;
-      case Closure::kLet:
-        stack.push_back(children[2]);
-        break;
-      case Closure::kAnnotation:
-        stack.push_back(children[1]);
-        break;
-      case Closure::kMatch:
-        for (auto branch : syntax_.Children(children[2]) | std::views::reverse)
-          stack.push_back(syntax_.Children(branch)[1]);
-        stack.push_back(children[1]);
-        break;
-    }
-  }
-  return true;
-}
-void Elaborator::FinishAnnotation(ExprId expr) {
+void Elaborator::FinishAnnotation(ExprId expr, Resolved& result) {
   const auto fields = syntax_.Children(expr);
-  auto& occurrence = occurrences_[expr];
-  occurrence.term = occurrences_[fields[1]].term;
-  occurrence.closure = Closure::kAnnotation;
-  Annotation annotation{occurrence.term, {}, syntax_.Span(expr)};
+  Annotation annotation{result.term, {}, syntax_.Span(expr)};
   auto label = kNoExpr;
   for (std::size_t i = 2; i < fields.size(); ++i) {
     const auto key_id = fields[i];
@@ -963,11 +937,11 @@ void Elaborator::FinishAnnotation(ExprId expr) {
          where});
   }
   if (label != kNoExpr) {
-    if (!Closed(fields[1]))
+    session_.Count(&FrontendStats::closure_visits);
+    if (result.escape != kNoExpr)
       Fail(DiagnosticCode::kInvalidInput, syntax_.Span(fields[1]),
            "Named term has an external lexical dependency");
-    txn_->AddNamed(syntax_.Name(label), occurrence.term, syntax_.Span(label));
-    occurrence.checked_closed = true;
+    txn_->AddNamed(syntax_.Name(label), result.term, syntax_.Span(label));
   }
   if (txn_)
     txn_->AddAnnotation(std::move(annotation));
@@ -975,29 +949,21 @@ void Elaborator::FinishAnnotation(ExprId expr) {
     command_.annotations.push_back(std::move(annotation));
 }
 
-void Elaborator::StartMatch(ExprId expr) {
-  const auto fields = syntax_.Children(expr);
-  const auto scrutinee = occurrences_[fields[1]].term.Borrow();
+void Elaborator::StartMatch(ExprId expr, const Resolved& value) {
+  const auto scrutinee = value.term.Borrow();
   if (!profile_.Has(kDatatypes))
     Fail(DiagnosticCode::kUnsupported, syntax_.Span(expr),
          "Match outside the active signature");
   const auto sort = scrutinee.GetSort();
   if (!IsDatatype(sort))
-    Fail(DiagnosticCode::kInvalidInput, syntax_.Span(fields[1]),
+    Fail(DiagnosticCode::kInvalidInput, syntax_.Span(syntax_.Children(expr)[1]),
          "Match requires a datatype");
-  matches_.push_back({scrutinee, *sort.GetSortConstructor(), {}, {}, {}});
-  tasks_.push_back({expr, Action::kNextBranch, 0});
+  matches_.push_back(
+      {scrutinee, *sort.GetSortConstructor(), {}, {}, {}, {}, value.escape});
 }
-void Elaborator::NextBranch(ExprId expr, std::size_t index) {
+ExprId Elaborator::BeginBranch(ExprId expr, ExprId entry) {
   auto& match = matches_.back();
-  const auto branches = syntax_.Children(syntax_.Children(expr)[2]);
-  if (index == branches.size()) {
-    occurrences_[expr] = {FinishMatch(match, syntax_.Span(expr)),
-                          Closure::kMatch};
-    matches_.pop_back();
-    return;
-  }
-  const auto branch = syntax_.Children(branches[index]);
+  const auto branch = syntax_.Children(entry);
   const auto pattern = branch[0];
   const auto fields = syntax_.Children(pattern);
   const auto where = syntax_.Span(pattern);
@@ -1008,7 +974,7 @@ void Elaborator::NextBranch(ExprId expr, std::size_t index) {
                      where) != match.type)
     member.reset();
 
-  match.mark = active_locals_.size();
+  match.mark = locals_.size();
   if (member) {
     const auto group = Group(*member);
     const auto count =
@@ -1030,18 +996,15 @@ void Elaborator::NextBranch(ExprId expr, std::size_t index) {
     PushLocal(pattern, expr, kNoExpr,
               Take(manager_.RetainNode(match.scrutinee), where));
   }
-  branch_members_.push_back(member);
-  tasks_.push_back({expr, Action::kFinishBranch, index});
-  tasks_.push_back({branch[1]});
+  match.member = member;
+  return branch[1];
 }
-void Elaborator::FinishBranch(ExprId expr, std::size_t index) {
+void Elaborator::FinishBranch(ExprId expr, ExprId field, Resolved result) {
   auto& match = matches_.back();
-  const auto field =
-      syntax_.Children(syntax_.Children(syntax_.Children(expr)[2])[index])[1];
   Restore(match.mark);
-  const auto member = branch_members_.back();
-  branch_members_.pop_back();
-  const auto sort = occurrences_[field].term.Borrow().GetSort();
+  const auto member = match.member;
+  match.escape = std::min(match.escape, result.escape);
+  const auto sort = result.term.Borrow().GetSort();
   if (match.result.IsNull())
     match.result = sort;
   else
@@ -1055,69 +1018,113 @@ void Elaborator::FinishBranch(ExprId expr, std::size_t index) {
             Take(Group(*member).GetConstructorCount(member->datatype),
                  syntax_.Span(expr));
       if (match.seen.insert(member->ctor).second)
-        match.effective.push_back({member, field});
+        match.effective.push_back({member, std::move(result.term)});
     } else {
       match.fallback = true;
-      match.effective.push_back({member, field});
+      match.effective.push_back({member, std::move(result.term)});
     }
   }
-  tasks_.push_back({expr, Action::kNextBranch, index + 1});
 }
 Node Elaborator::FinishMatch(MatchState& match, SourceSpan where) {
   if (!match.fallback && match.seen.size() != match.constructor_count)
     Fail(DiagnosticCode::kInvalidInput, where, "Nonexhaustive match");
-  auto result = occurrences_[match.effective.back().body].term;
+  auto result = std::move(match.effective.back().body);
   for (std::size_t i = match.effective.size() - 1; i > 0; --i) {
     const auto& branch = match.effective[i - 1];
     const auto test = ApplyTester(*branch.member, match.scrutinee, where);
-    const std::array args{test.Borrow(),
-                          occurrences_[branch.body].term.Borrow(),
-                          result.Borrow()};
+    const std::array args{test.Borrow(), branch.body.Borrow(), result.Borrow()};
     result = Take(manager_.MakeBuiltin({Kind::kIte, {}, {}, {}}, args), where);
   }
   return result;
 }
 
 Node Elaborator::Resolve(ExprId root) {
-  tasks_.push_back({root});
-  while (!tasks_.empty()) {
-    const auto [expr, action, index] = tasks_.back();
-    tasks_.pop_back();
-    switch (action) {
+  Push(root);
+  while (!frames_.empty()) {
+    auto& frame = frames_.back();
+    const auto expr = frame.expr;
+    switch (frame.action) {
       case Action::kEnter:
-        Enter(expr);
+        Enter(frame);
         break;
-      case Action::kFinishCall:
-        occurrences_[expr].term = FinishCall(expr, calls_.back());
-        calls_.pop_back();
+      case Action::kCall: {
+        auto& call = calls_.back();
+        if (frame.next == call.args.size()) {
+          auto result =
+              FinishCall(expr, call, std::span(values_).subspan(frame.base));
+          calls_.pop_back();
+          Complete(std::move(result));
+          break;
+        }
+        const auto index = frame.next++;
+        const auto arg = call.args[index];
+        if (index == 1 && call.op && call.op->kind == Kind::kFpFromBits &&
+            call.args.size() == 2) {
+          call.rational = RationalArgument(arg);
+          if (call.rational) break;
+        }
+        Push(arg);
         break;
-      case Action::kRationalArgument:
-        calls_.back().rational = RationalArgument(expr);
-        if (!calls_.back().rational) tasks_.push_back({expr});
+      }
+      case Action::kAnnotation: {
+        auto result = std::move(values_.back());
+        FinishAnnotation(expr, result);
+        Complete(std::move(result));
         break;
-      case Action::kFinishAnnotation:
-        FinishAnnotation(expr);
+      }
+      case Action::kLetBindings: {
+        const auto fields = syntax_.Children(expr);
+        const auto bindings = syntax_.Children(fields[1]);
+        if (frame.next < bindings.size()) {
+          Push(syntax_.Children(bindings[frame.next++])[1]);
+          break;
+        }
+        frame.mark = locals_.size();
+        BindLet(expr, std::span(values_).subspan(frame.base));
+        values_.resize(frame.base);
+        frame.action = Action::kLetBody;
+        Push(fields[2]);
         break;
-      case Action::kBindLet:
-        BindLet(expr);
+      }
+      case Action::kLetBody: {
+        auto result = std::move(values_.back());
+        Restore(frame.mark);
+        if (result.escape >= expr) result.escape = kNoExpr;
+        Complete(std::move(result));
         break;
-      case Action::kFinishLet:
-        Restore(index);
-        occurrences_[expr] = {occurrences_[syntax_.Children(expr)[2]].term,
-                              Closure::kLet};
+      }
+      case Action::kMatchStart:
+        StartMatch(expr, values_.back());
+        frame.action = Action::kMatchNext;
         break;
-      case Action::kStartMatch:
-        StartMatch(expr);
+      case Action::kMatchNext: {
+        const auto branches = syntax_.Children(syntax_.Children(expr)[2]);
+        if (frame.next < branches.size()) {
+          const auto branch = branches[frame.next++];
+          frame.action = Action::kMatchBody;
+          Push(BeginBranch(expr, branch));
+          break;
+        }
+        auto& match = matches_.back();
+        const auto escape = match.escape < expr ? match.escape : kNoExpr;
+        auto term = FinishMatch(match, syntax_.Span(expr));
+        matches_.pop_back();
+        Complete({std::move(term), escape});
         break;
-      case Action::kNextBranch:
-        NextBranch(expr, index);
+      }
+      case Action::kMatchBody: {
+        const auto branches = syntax_.Children(syntax_.Children(expr)[2]);
+        const auto field = syntax_.Children(branches[frame.next - 1])[1];
+        FinishBranch(expr, field, std::move(values_.back()));
+        values_.pop_back();
+        frame.action = Action::kMatchNext;
         break;
-      case Action::kFinishBranch:
-        FinishBranch(expr, index);
-        break;
+      }
     }
   }
-  return occurrences_[root].term;
+  auto result = std::move(values_.back().term);
+  values_.pop_back();
+  return result;
 }
 
 void DeclareOrDefine(SessionState& session, Transaction& txn,
@@ -1131,7 +1138,7 @@ void DeclareOrDefine(SessionState& session, Transaction& txn,
   const auto domain =
       kind == CommandKind::kDeclareFun || kind == CommandKind::kDefineFun
           ? syntax.Children(args[1])
-          : std::span<const ExprId>{};
+          : ChildRange{};
   const auto return_expr =
       kind == CommandKind::kDeclareFun || kind == CommandKind::kDefineFun
           ? args[2]
@@ -1160,8 +1167,8 @@ void DeclareOrDefine(SessionState& session, Transaction& txn,
     const auto instance =
         Take(session.manager.InstantiateDeclaration(decl.Borrow(), {}), where);
     txn.AddTerm(name, instance.Borrow());
-    txn.AddFunction({std::move(decl), std::string(syntax.Raw(args[0])),
-                     std::move(source_rank), where});
+    txn.AddFunction(std::move(decl), syntax.Type(args[0]) == TokenKind::kQuoted,
+                    source_rank, where);
     return;
   }
 
@@ -1192,6 +1199,64 @@ void DeclareOrDefine(SessionState& session, Transaction& txn,
                      std::move(body), std::string(syntax.Raw(args[0])), where});
 }
 }  // namespace
+
+Node SessionState::NumericLiteral(std::string_view digits, int radix,
+                                  SortView sort, SourceSpan where) {
+  constexpr std::size_t kMaxKeySize = 4 * 1024;
+  constexpr std::size_t kMaxKeyBytes = 256 * 1024;
+  const auto width = sort.IsNull() ? 0u : *sort.GetWidth();
+  const auto make = [&](IntegerView value) {
+    return Take(sort.IsNull() ? manager.MakeInt(value)
+                              : manager.MakeBvValue(sort, value),
+                where);
+  };
+  const bool eligible = digits.size() <= kMaxKeySize;
+  const auto hash = eligible ? TextHash{}(digits) : 0;
+  const auto slot = (hash ^ (hash >> 8) ^ static_cast<std::size_t>(width) ^
+                     static_cast<std::size_t>(radix)) &
+                    (kCacheSlots - 1);
+  if (eligible && literal_cache) {
+    const auto& entry = literal_cache->entries[slot];
+    if (entry.radix == radix && entry.width == width &&
+        entry.digits == digits) {
+      auto result = make(entry.value);
+      Count(&FrontendStats::literal_cache_hits);
+      return result;
+    }
+  }
+  auto integer = Take(radix == 10 ? Integer::ParseDecimal(digits)
+                                  : Integer::ParseRadix(digits, radix),
+                      where);
+  auto result = make(integer.Borrow());
+  if (!eligible) return result;
+  if (!literal_cache) {
+    Checkpoint();
+    literal_cache = std::make_unique<LiteralCache>();
+  }
+  auto& cache = *literal_cache;
+  std::string key(digits);
+  const auto evict = [&](std::size_t index) {
+    auto& entry = cache.entries[index];
+    cache.key_bytes -= entry.digits.size();
+    entry = LiteralCache::Entry{};
+    cache.backing[index] = Integer{};
+  };
+  evict(slot);
+  while (key.size() > kMaxKeyBytes - cache.key_bytes) {
+    evict(cache.eviction);
+    cache.eviction = (cache.eviction + 1) & (kCacheSlots - 1);
+  }
+  cache.key_bytes += key.size();
+  if (const auto word = integer.Borrow().TryUint64()) {
+    cache.entries[slot] = {std::move(key), IntegerView::FromUnsigned(*word),
+                           width, radix};
+  } else {
+    cache.backing[slot] = std::move(integer);
+    cache.entries[slot] = {std::move(key), cache.backing[slot].Borrow(), width,
+                           radix};
+  }
+  return result;
+}
 
 void ApplyTerms(SessionState& state, const Syntax& syntax,
                 TypedCommand& command, Transaction& txn) {

@@ -5,6 +5,18 @@ namespace {
 
 class Lifetime : public NodeTest {};
 
+struct EntryA {
+  // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
+  Node term;
+};
+
+struct EntryB {
+  // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
+  int tag;
+  // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
+  Node body;
+};
+
 template <class Handle>
 void CheckHandleSpecialMembers(const Handle& original) {
   const auto id = original.GetId();
@@ -151,6 +163,216 @@ TEST_F(Lifetime, BatchReleaseMatchesSequentialReleaseWithMostlyLiveNodes) {
     return NodeTestPeer::GetStats(manager).node_reclamations;
   };
   EXPECT_EQ(exercise(true), exercise(false));
+}
+
+TEST(RootRangeTest, FromProjectsNodeMembersInHeterogeneousRecords) {
+  std::array<EntryA, 2> terms{};
+  std::array bodies = {EntryB{11, {}}, EntryB{22, {}}};
+  const std::span<EntryA> term_records = terms;
+  const std::span<EntryB> body_records = bodies;
+  static_assert(noexcept(RootRange::From<&EntryA::term>(term_records)));
+  static_assert(noexcept(RootRange::From<&EntryB::body>(body_records)));
+  static_assert(
+      requires(const ManagerRef& state, std::span<const RootRange> ranges) {
+        {
+          NodeManager::ReleaseRoots(state, ranges)
+        } noexcept -> std::same_as<Result<void>>;
+      });
+
+  const auto first = RootRange::From<&EntryA::term>(term_records);
+  const auto second = RootRange::From<&EntryB::body>(body_records);
+  EXPECT_EQ(first.context, terms.data());
+  EXPECT_EQ(second.context, bodies.data());
+  EXPECT_EQ(first.count, terms.size());
+  EXPECT_EQ(second.count, bodies.size());
+  ASSERT_NE(first.at, nullptr);
+  ASSERT_NE(second.at, nullptr);
+  for (std::size_t i = 0; i < terms.size(); ++i) {
+    EXPECT_EQ(first.at(first.context, i), &terms[i].term);
+  }
+  for (std::size_t i = 0; i < bodies.size(); ++i) {
+    EXPECT_EQ(second.at(second.context, i), &bodies[i].body);
+  }
+}
+
+TEST_F(Lifetime, MultiRangeReleaseRejectsNullManager) {
+  const ManagerRef state;
+  std::array terms = {EntryA{Int(1)}};
+  const auto id = terms[0].term.GetId();
+  const std::array ranges = {
+      RootRange::From<&EntryA::term>(std::span<EntryA>{terms})};
+
+  Error(NodeManager::ReleaseRoots(state, {}), ErrorCode::kNullObject);
+  Error(NodeManager::ReleaseRoots(state, ranges), ErrorCode::kNullObject);
+  ASSERT_EQ(terms[0].term.GetId(), id);
+  EXPECT_EQ(NodeTestPeer::RefCount(terms[0].term), 1);
+}
+
+TEST_F(Lifetime, MultiRangeReleaseRejectsMissingCallbackBeforeConsuming) {
+  const auto state = Take(manager_.RetainState());
+  std::array terms = {EntryA{Int(1)}};
+  const auto id = terms[0].term.GetId();
+  const std::array ranges = {
+      RootRange::From<&EntryA::term>(std::span<EntryA>{terms}),
+      RootRange{terms.data(), 1, nullptr}};
+
+  Error(NodeManager::ReleaseRoots(state, ranges), ErrorCode::kInvalidParameter);
+  ASSERT_EQ(terms[0].term.GetId(), id);
+  EXPECT_EQ(NodeTestPeer::RefCount(terms[0].term), 1);
+}
+
+TEST_F(Lifetime, MultiRangeReleaseRejectsForeignRootBeforeConsuming) {
+  const auto state = Take(manager_.RetainState());
+  auto other = Take(NodeManager::Create());
+  std::array terms = {EntryA{Int(1)}, EntryA{}};
+  std::array bodies = {EntryB{11, Int(2)},
+                       EntryB{22, Take(other.MakeInt(IntegerView(1)))}};
+  const auto first_id = terms[0].term.GetId();
+  const auto second_id = bodies[0].body.GetId();
+  const auto foreign_id = bodies[1].body.GetId();
+  ASSERT_EQ(foreign_id, first_id);
+  const std::array ranges = {
+      RootRange::From<&EntryA::term>(std::span<EntryA>{terms}),
+      RootRange::From<&EntryB::body>(std::span<EntryB>{bodies})};
+
+  Error(NodeManager::ReleaseRoots(state, ranges), ErrorCode::kForeignManager);
+  ASSERT_EQ(terms[0].term.GetId(), first_id);
+  EXPECT_EQ(terms[1].term.GetId(), 0);
+  ASSERT_EQ(bodies[0].body.GetId(), second_id);
+  ASSERT_EQ(bodies[1].body.GetId(), foreign_id);
+  EXPECT_EQ(NodeTestPeer::RefCount(terms[0].term), 1);
+  EXPECT_EQ(NodeTestPeer::RefCount(bodies[0].body), 1);
+  EXPECT_EQ(NodeTestPeer::RefCount(bodies[1].body), 1);
+}
+
+TEST_F(Lifetime, MultiRangeReleaseAcceptsEmptyRangesAndNullHandles) {
+  const auto state = Take(manager_.RetainState());
+  const auto untouched = Int(1);
+  std::array bodies = {EntryB{11, {}}};
+  const std::array ranges = {
+      RootRange{}, RootRange::From<&EntryA::term>(std::span<EntryA>{}),
+      RootRange::From<&EntryB::body>(std::span<EntryB>{bodies})};
+  const auto before = NodeTestPeer::GetStats(manager_);
+
+  Take(NodeManager::ReleaseRoots(state, {}));
+  Take(NodeManager::ReleaseRoots(state, ranges));
+  const auto after = NodeTestPeer::GetStats(manager_);
+  EXPECT_EQ(after.live_nodes, before.live_nodes);
+  EXPECT_EQ(after.node_reclamations, before.node_reclamations);
+  EXPECT_EQ(after.allocation_attempts, before.allocation_attempts);
+  EXPECT_EQ(bodies[0].body.GetId(), 0);
+  EXPECT_EQ(bodies[0].tag, 11);
+  EXPECT_EQ(Int(1), untouched);
+}
+
+TEST_F(Lifetime, MultiRangeReleasePreservesExternalOwnerAndSharedChild) {
+  const auto state = Take(manager_.RetainState());
+  auto leaf = Take(manager_.MakeBool(true));
+  auto retiring = Op(Kind::kAnd, {leaf.Borrow(), leaf.Borrow()});
+  const auto survivor = Op(Kind::kNot, {leaf.Borrow()});
+  const auto leaf_id = leaf.GetId();
+  const auto retiring_id = retiring.GetId();
+  std::array terms = {EntryA{std::move(leaf)}, EntryA{retiring}, EntryA{}};
+  std::array bodies = {EntryB{11, std::move(retiring)}, EntryB{22, survivor},
+                       EntryB{33, {}}};
+  const std::array ranges = {
+      RootRange::From<&EntryA::term>(std::span<EntryA>{terms}), RootRange{},
+      RootRange::From<&EntryB::body>(std::span<EntryB>{bodies})};
+
+  Take(NodeManager::ReleaseRoots(state, ranges));
+  for (const auto& entry : terms) EXPECT_EQ(entry.term.GetId(), 0);
+  for (const auto& entry : bodies) EXPECT_EQ(entry.body.GetId(), 0);
+  EXPECT_EQ(bodies[0].tag, 11);
+  EXPECT_EQ(bodies[1].tag, 22);
+  EXPECT_EQ(bodies[2].tag, 33);
+  const auto after = NodeTestPeer::GetStats(manager_);
+  ASSERT_EQ(after.live_nodes, 2);
+  EXPECT_EQ(after.node_reclamations, 1);
+  EXPECT_EQ(NodeTestPeer::RefCount(survivor), 1);
+  const auto retained_leaf = Take(survivor.Child(0));
+  EXPECT_EQ(retained_leaf.GetId(), leaf_id);
+  // The surviving edge and the handle returned by Child each own a reference.
+  EXPECT_EQ(NodeTestPeer::RefCount(retained_leaf), 2);
+  EXPECT_EQ(Take(manager_.MakeBool(true)), retained_leaf);
+  const auto recreated =
+      Op(Kind::kAnd, {retained_leaf.Borrow(), retained_leaf.Borrow()});
+  EXPECT_GT(recreated.GetId(), retiring_id);
+}
+
+TEST_F(Lifetime, MultiRangeReleaseDetachesGrownTableWhenAllNodesRetire) {
+  const auto state = Take(manager_.RetainState());
+  std::array<EntryA, 128> terms;
+  std::int64_t value = 0;
+  for (auto& entry : terms) entry.term = Int(value++);
+  std::array bodies = {EntryB{11, Int(value)}};
+  const auto last_id = bodies[0].body.GetId();
+  const auto before = NodeTestPeer::GetStats(manager_);
+  const std::array ranges = {
+      RootRange::From<&EntryA::term>(std::span<EntryA>{terms}),
+      RootRange::From<&EntryB::body>(std::span<EntryB>{bodies})};
+  manager_ = NodeManager{};
+
+  Take(NodeManager::ReleaseRoots(state, ranges));
+  for (const auto& entry : terms) EXPECT_EQ(entry.term.GetId(), 0);
+  EXPECT_EQ(bodies[0].body.GetId(), 0);
+  auto attached = Take(NodeManager::Attach(state));
+  const auto after = NodeTestPeer::GetStats(attached);
+  EXPECT_EQ(after.live_nodes, 0);
+  EXPECT_EQ(after.node_reclamations, terms.size() + bodies.size());
+  EXPECT_EQ(after.table_capacity, 0);
+  EXPECT_EQ(after.allocation_attempts, before.allocation_attempts);
+  EXPECT_EQ(NodeTestPeer::StateRefCount(attached), 2);
+  EXPECT_GT(Take(attached.MakeInt(IntegerView(value))).GetId(), last_id);
+}
+
+TEST_F(Lifetime, MultiRangeReleaseRebuildsWithAllocationFailureFallback) {
+  for (const bool fail_allocation : {false, true}) {
+    SCOPED_TRACE(fail_allocation);
+    auto local = Take(NodeManager::Create());
+    NodeTestPeer::ForceCollisions(local, UINT64_MAX);
+    const auto state = Take(local.RetainState());
+    std::vector<EntryA> terms;
+    std::vector<EntryB> bodies;
+    std::vector<std::pair<std::int64_t, Node>> survivors;
+    for (std::int64_t value = 0; value < 256; ++value) {
+      auto node = Take(local.MakeInt(IntegerView(value)));
+      if (value % 64 == 32) {
+        survivors.emplace_back(value, std::move(node));
+      } else if (value < 128) {
+        terms.push_back({std::move(node)});
+      } else {
+        bodies.push_back({11, std::move(node)});
+      }
+    }
+    const auto first_id = terms.front().term.GetId();
+    const auto last_id = bodies.back().body.GetId();
+    const std::array ranges = {
+        RootRange::From<&EntryA::term>(std::span<EntryA>{terms}),
+        RootRange::From<&EntryB::body>(std::span<EntryB>{bodies})};
+    const auto before = NodeTestPeer::GetStats(local);
+    if (fail_allocation) NodeTestPeer::FailAllocationAfter(local, 0);
+
+    const auto result = NodeManager::ReleaseRoots(state, ranges);
+    NodeTestPeer::ClearFailures(local);
+    Take(result);
+    for (const auto& entry : terms) EXPECT_EQ(entry.term.GetId(), 0);
+    for (const auto& entry : bodies) EXPECT_EQ(entry.body.GetId(), 0);
+    const auto after = NodeTestPeer::GetStats(local);
+    ASSERT_EQ(after.live_nodes, 4);
+    EXPECT_EQ(after.node_reclamations, 252);
+    EXPECT_EQ(after.allocation_attempts, before.allocation_attempts + 1);
+    if (fail_allocation) {
+      EXPECT_EQ(after.table_capacity, before.table_capacity);
+    } else {
+      EXPECT_LT(after.table_capacity, before.table_capacity);
+    }
+    for (const auto& [value, owner] : survivors) {
+      EXPECT_EQ(NodeTestPeer::RefCount(owner), 1);
+      EXPECT_EQ(Take(local.MakeInt(IntegerView(value))), owner);
+    }
+    EXPECT_GT(Take(local.MakeInt(IntegerView(0))).GetId(), first_id);
+    EXPECT_GT(Take(local.MakeInt(IntegerView(255))).GetId(), last_id);
+  }
 }
 
 TEST_F(Lifetime, DeepTwentyThousandChainWalkAndReleaseAreIterative) {

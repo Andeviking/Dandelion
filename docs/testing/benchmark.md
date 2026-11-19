@@ -174,3 +174,113 @@ file limit must leave the capture failed without a measurable manifest.
 The fixture with a ground definition also checks that the actual cvc5
 assertion list can include the definition equation. Count that root and both
 occurrences of the repeated user assertion.
+
+## Frontend parser benchmarks
+
+Write the following GoogleTest cases before implementing the
+[frontend workload design](../benchmarks/frontend-workloads.md). Register
+them with CTest. Exercise the workload module directly in a tests-enabled
+build. Enable the benchmark target for CLI integration cases, including a
+real pinned Google Benchmark dry run. Invoke the Python CLIs as subprocesses
+from GoogleTest with bounded synthetic files in temporary directories. Use
+controlled measurement children and host topology data for deterministic
+scheduler tests. Keep timing and RSS magnitude out of pass criteria.
+
+| Boundary | Fixture and independent checks |
+| --- | --- |
+| Build and built-in dry run | With benchmarks disabled, build the workload library in the tests-enabled configuration and verify that the executable and the Google Benchmark dependency are absent. With benchmarks enabled, list and dry-run the executable without `--input`. Require exactly `frontend/smoke/builtin` in the result JSON, one iteration and no error or skip. The built-in text has 45 bytes, 11 tokens, three commands, one assertion, no definitions, an 18-byte largest command, and one Bool leaf. |
+| Loaded dry run and CLI | Dry-run a temporary SMT-LIB file at a path containing spaces. Require the six `frontend/parse/` cases `text`, `reader_64k`, `reader_4k`, `reader_irregular`, `phases`, and `teardown` when the filter is absent. Check one iteration and successful result records for each, and require all three phase counters to be present and finite in `phases`. Select a pair with the scenario CSV, then select one through a Google Benchmark filter. Reject missing option values, empty, duplicate, or unknown scenario names, and invalid `--inspect` combinations with nonzero exit and a usage diagnostic. |
+| Inspect JSON | Run `--inspect` on each fixture below. Require one escaped JSON object on stdout, `schema_version` 1, `ok`, the exact declared logic, an empty diagnostic message and null code/span. Verify exact syntax counts, committed query counts, and the four graph fields. Compare each of the seven storage fields with `GetStorageStats()` on the corresponding live workload manager. Require live node and edge counts to cover the reachable graph. Exercise a large exact literal to check that `numeric_backing_bytes` accounts for its backing storage. Verify the typed invariants through the workload API alongside JSON counts. |
+| Graph order and repeated slots | Inspect `(set-logic QF_SAT)`, `(declare-const a Bool)`, `(assert (not a))`, `(assert (and (not a) (not a)))`, and `(check-sat)`. The first root reaches the shared `not` before the longer path through the second root. Expect two root occurrences and `(nodes, edges, depth, max_fanout) = (3, 3, 3, 2)`. A control with only `set-logic` and `check-sat` has zero roots and all four graph fields zero. |
+| Reader split equivalence | Build three byte fixtures with controlled offsets. Put a UTF-8 lead byte at offset 4,095 in a comment or quoted string, put `\r` at offset 65,535 followed by `\n`, and put a quoted `set-info` value longer than 8 KiB across more than one refill with a doubled quote and `;` inside it. Use a separate offset variant whose UTF-8 or CRLF pair straddles the irregular boundary after bytes `1 + 7 + 31`. Independently check offsets before parsing. Run text and all three readers, with one valid assertion and `check-sat` per fixture. Require equal committed metadata, typed assertion and source spans, all syntax/query/graph counts other than calls, and `reader_calls = 0` for text. With EOF consumed, fixed modes give the ceiling of bytes divided by chunk size plus one. Enumerate the irregular schedule to derive its callback count. A companion malformed UTF-8 or unfinished quoted token has the same code and source span for all adapters. |
+| Structured failures | Use a missing file (`input_io`), an unclosed assertion (`syntax`, `kSyntax`), a well-formed `(push 1)` (`unsupported`, `kUnsupported`), EOF without a check (`invalid_input`), and a second `check-sat` (`invalid_input`, `kInvalidState`). Enable `:produce-models`, check, and request a model for a `model_dependent` result. Verify nonzero inspect exit, exact failure class, message and applicable span, syntax versus successful Apply counts, and absence of a solver reply. Include a diagnostic with embedded quotes and controls passed to `InspectToJson` to check exact round-trip of its string. A positive `exit` control stops at its closing delimiter even with malformed bytes after it. Dry-run a failing input and require the benchmark error record even when the benchmark framework returns zero. |
+| `:named` rollback | Apply `(set-logic QF_LIA)`, `(assert (! true :named good))`, `(assert (and (! true :named first) (! false :named second) 9))`, and `(check-sat)` on separate LF-terminated lines. Expect `invalid_input`, `kInvalidInput`, and `Incompatible operand or result sort` at `9` (offsets `[108, 109)`, line 3, columns `[60, 61)`). Inspect reports three complete commands, two successful applies, one assertion, one annotation and one named term in the committed prefix, and zero checks. Through `ParsedQuery::session`, verify the sole name and annotation are `good`. In a direct test, append a valid command reusing `first` and `second` before the check and continue the session after the failed Apply. Both names can then commit, proving that the original failure left them available. |
+| RSS lifecycle | For a deterministic memory sample with 2,048 input bytes, feed baseline 100, peak 150, retained 130, and post-teardown 120 KiB. Require transient 20 KiB, `Peak/Input = 75`, and `Retained/Input = 65`. Check a missing or malformed proc value, zero-byte input, and a retained sample above the kernel's reported high-water mark. Unavailable dependent values serialize as null, and a negative difference clamps to zero. On Linux, run the real sampling path and require positive values for available fields, consistent derived ratios, and a released session and query after teardown. Allow allocator retention and variation between OS sources. |
+| Deterministic generation | Run `frontend_generate.py` twice with the same seed and `smoke` into different directories. Require byte-identical manifests, the same ordered IDs and paths, and files that match the recorded byte sizes and independently computed SHA-256. Require every matrix label and shape. Inspect each case for one check, the declared logic and its documented query structure. Check representative typed operations by family. Compare the skewed and balanced pair for equal leaf and operation counts and distinct depths, and the command-partition pair for different command counts and the expected extra conjunction node. Check that trivia padding preserves typed structure and moves the intended reader split. |
+| Corpus staging and provenance | Stage two selected regular files from a temporary source in deliberately nonalphabetic order, with comments and blank lines in the selection. Require the original selection bytes, the same ordered relative source paths and content under `inputs/`, the snapshot/source evidence and independently checked selection and input hashes. For indexed selection, include a repeated path, an out-of-range file, and a valid unindexed file. Require deterministic selection within the requested count and size bounds per logic. Verify source bytes, names, timestamps and modes are preserved under the protected-source policy. Exercise absolute paths, traversal, duplicates in a selection file, symlinks in an intermediate directory and at a leaf, a nonregular file, missing selections, and a destination resolving into a protected-root stand-in. Simulate a denied or ineffective metadata-safe open and require an unavailable diagnostic with no unsafe retry. Require no published manifest on any staging failure. |
+| Throughput and isolated scheduling | With a controlled topology of two NUMA nodes and SMT siblings, restrict the eligible CPU mask and use a barrier child to demonstrate actual overlap in `throughput`. Require the expected round-robin CPU order, one eligible logical CPU per physical core, the `--jobs` cap, and each child's observed affinity. With the same inputs, `isolated` launches at most one child at a time on a fixed CPU. Require one inspect invocation per case, a fresh timed child for each scenario/sample, and recorded mode, affinity, requested and effective concurrency. Check the single-slot fallback for missing physical topology and the classification of failed affinity setup. |
+| Memory ledger and child failures | Request three cores with a budget that fits two per-child allowances. Hold two children at a barrier and require the third to wait. Check ordered reservation/release events, the high-water sum, the child's address-space limit, and prompt slot reuse after success, launch error, child error, timeout, and signal termination. Exercise cancellation with children in flight and verify group cleanup and zero outstanding reservations. Reject a per-child request larger than the total budget before launch. |
+| Runner RSS and results | Run a small Linux sample through real GNU `time` and check the runner records positive child-peak KiB separately from inspect `VmHWM`. Use controlled child artifacts for exact parsing of `%M`, missing/malformed RSS, unsupported input, an error/skip in Google Benchmark JSON with exit 0, and malformed JSON. Supply fixed successful wall times and graph/byte/token counts and independently calculate medians and rates. Verify distinct outcome counts and nonzero run status for incomplete measurement, omit parse rates for teardown, and require a manifest hash mismatch to prevent case launch. |
+
+### Exact inspect fixtures
+
+Each fixture uses the literal lines shown, one LF after every line. In the
+table, the syntax tuple is `(bytes, tokens, commands, max_command_bytes)`.
+Every fixture has one applied check, every command applies successfully, and
+text reports zero reader callbacks. Query counts give `(assertions,
+definitions, user_functions, datatype_groups, named_terms, annotations,
+roots)`. `user_sorts` and `metadata` are zero in all six. The graph tuple is
+`(nodes, edges, depth, max_fanout)`.
+
+| Fixture | Syntax | Query | Graph | Typed invariant |
+| --- | --- | --- | --- | --- |
+| Diamond `let` | `(126, 53, 4, 71)` | `(1, 0, 1, 0, 0, 0, 1)` | `(5, 7, 4, 2)` | Both parents use the same `not a` node and the same declared `a`. The root is equality over those parents. |
+| Preserved `define-fun` | `(191, 71, 7, 41)` | `(1, 3, 1, 0, 0, 0, 4)` | `(10, 7, 3, 2)` | The assertion calls `f2` with `a`. The `f1` and `f2` bodies each contain two nested calls to their predecessor around their own formal. `f0`'s body is its distinct formal. Check each call's declaration against the retained definition table. |
+| Parametric datatype `match` | `(174, 64, 5, 67)` | `(1, 0, 1, 1, 0, 0, 1)` | `(5, 5, 3, 3)` | The Bool `ite` has a `box` tester on the concrete `Box Bool`, a Bool selector application to the same `b`, and `false` fallback. Both tester and selector resolve to the declared group. |
+| `:named` | `(95, 28, 5, 29)` | `(2, 0, 1, 0, 1, 1, 4)` | `(2, 1, 2, 1)` | Both assertions, the `n` entry and its annotation point to the same `not a` node. The annotation retains the source `:named n` attribute. |
+| `QF_FP` exact rational | `(122, 51, 3, 91)` | `(1, 0, 0, 0, 0, 0, 1)` | `(3, 3, 3, 2)` | `(-5/4)/(5/2)` and `3/(-6)` both yield normalized `-1/2`. The two `fp.eq` slots share a `kFpFromRational` node of FP format `(8, 24)` whose sole child is `RNE`. |
+| Nested `Array` | `(165, 52, 4, 83)` | `(1, 0, 1, 0, 0, 0, 1)` | `(9, 10, 6, 3)` | The constant row has sort `Array Bool Int`. The store preserves `Array Int (Array Bool Int)`. The ordered selections return the row sort and then Int. The two index occurrences of `0` share, as do the row value and comparison operand `1`. |
+
+**Diamond `let`**
+
+```smt2
+(set-logic QF_SAT)
+(declare-const a Bool)
+(assert (let ((x (not a))) (let ((y (and x a)) (z (or x a))) (= y z))))
+(check-sat)
+```
+
+**Preserved `define-fun`**
+
+```smt2
+(set-logic QF_LIA)
+(declare-const a Int)
+(define-fun f0 ((x Int)) Int x)
+(define-fun f1 ((x Int)) Int (f0 (f0 x)))
+(define-fun f2 ((x Int)) Int (f1 (f1 x)))
+(assert (= (f2 a) a))
+(check-sat)
+```
+
+**Parametric datatype `match`**
+
+```smt2
+(set-logic QF_DT)
+(declare-datatypes ((Box 1)) ((par (T) ((empty) (box (value T))))))
+(declare-const b (Box Bool))
+(assert (match b (((box x) x) (empty false))))
+(check-sat)
+```
+
+**`:named`**
+
+```smt2
+(set-logic QF_SAT)
+(declare-const a Bool)
+(assert (! (not a) :named n))
+(assert n)
+(check-sat)
+```
+
+**`QF_FP` exact rational**
+
+```smt2
+(set-logic QF_FP)
+(assert (fp.eq ((_ to_fp 8 24) RNE (/ (- 1.25) (/ 5 2))) ((_ to_fp 8 24) RNE (/ 3 (- 6)))))
+(check-sat)
+```
+
+**Nested `Array`**
+
+```smt2
+(set-logic QF_AUFLIA)
+(declare-const a (Array Int (Array Bool Int)))
+(assert (= (select (select (store a 0 ((as const (Array Bool Int)) 1)) 0) true) 1))
+(check-sat)
+```
+
+Run the workload and integration tests with GCC and Clang where available,
+alongside the existing `frontend` and `benchmark-infrastructure` CTest
+cases. Check Linux `/proc`, GNU `time`, and affinity paths on a Linux host.
+Report unavailable platform checks with the cause. Routine verification uses
+the bounded synthetic fixtures and leaves the protected corpus untouched.

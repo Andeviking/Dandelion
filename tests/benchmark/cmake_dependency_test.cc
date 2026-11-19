@@ -389,4 +389,61 @@ TEST_F(BenchmarkIntegrationTest, RealNodeWorkloadsPassDryRun) {
 }
 #endif
 
+#ifdef DANDELION_FRONTEND_BENCHMARK_EXECUTABLE
+TEST_F(BenchmarkIntegrationTest, RealFrontendWorkloadsPassDryRun) {
+  const auto report = directory_ / "frontend smoke.json";
+  const auto result = Run(
+      {DANDELION_FRONTEND_BENCHMARK_EXECUTABLE, "--benchmark_dry_run",
+       "--benchmark_filter=^frontend/smoke/",
+       "--benchmark_out=" + report.string(), "--benchmark_out_format=json"});
+  ASSERT_EQ(result.exit_code, 0) << result.output;
+  ASSERT_TRUE(fs::exists(report)) << result.output;
+  const auto json = ReadFile(report);
+  EXPECT_NE(json.find("frontend/smoke/builtin"), std::string::npos) << json;
+  EXPECT_EQ(json.find("\"error_occurred\": true"), std::string::npos) << json;
+  EXPECT_EQ(json.find("\"skipped\": true"), std::string::npos) << json;
+}
+
+TEST_F(BenchmarkIntegrationTest, LoadedSmt2PassesAllFrontendScenarios) {
+  const auto input = directory_ / "frontend fixture.smt2";
+  const auto report = directory_ / "frontend results.json";
+  WriteFile(input,
+            "(set-logic QF_SAT)\n(declare-const p Bool)\n"
+            "(define-fun negate ((x Bool)) Bool (not x))\n"
+            "(assert (negate p))\n(check-sat)\n");
+  const auto result =
+      Run({DANDELION_FRONTEND_BENCHMARK_EXECUTABLE, "--input", input.string(),
+           "--benchmark_min_time=1x", "--benchmark_out=" + report.string(),
+           "--benchmark_out_format=json"});
+  ASSERT_EQ(result.exit_code, 0) << result.output;
+  ASSERT_TRUE(fs::exists(report)) << result.output;
+  const auto json = ReadFile(report);
+  for (const auto* scenario : {"text", "reader_64k", "reader_4k",
+                               "reader_irregular", "phases", "teardown"}) {
+    EXPECT_NE(json.find(std::string("\"frontend/parse/") + scenario),
+              std::string::npos)
+        << scenario << "\n"
+        << json;
+  }
+  EXPECT_EQ(json.find("\"error_occurred\": true"), std::string::npos) << json;
+  EXPECT_EQ(json.find("\"skipped\": true"), std::string::npos) << json;
+}
+
+TEST_F(BenchmarkIntegrationTest, InvalidFrontendInputReportsSkipWithError) {
+  const auto input = directory_ / "invalid.smt2";
+  const auto report = directory_ / "frontend error.json";
+  WriteFile(input, "(set-logic QF_SAT)\n(assert true\n");
+  const auto result = Run(
+      {DANDELION_FRONTEND_BENCHMARK_EXECUTABLE, "--input", input.string(),
+       "--scenario", "text", "--benchmark_min_time=1x",
+       "--benchmark_out=" + report.string(), "--benchmark_out_format=json"});
+  ASSERT_EQ(result.exit_code, 0) << result.output;
+  ASSERT_TRUE(fs::exists(report)) << result.output;
+  const auto json = ReadFile(report);
+  EXPECT_NE(json.find("\"frontend/parse/text"), std::string::npos) << json;
+  EXPECT_NE(json.find("\"error_occurred\": true"), std::string::npos) << json;
+  EXPECT_NE(json.find("\"error_message\":"), std::string::npos) << json;
+}
+#endif
+
 }  // namespace
