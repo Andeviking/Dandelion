@@ -91,7 +91,7 @@ metadata-safe input copy and provide its case, family and provenance. All
 output directories must be new paths outside the protected dataset. The
 collector runs one explicitly selected input.
 
-Apply [the reference adapter](../../benchmarks/reference/cvc5-282d5e0c.patch)
+Apply the reference adapter in `benchmarks/reference/cvc5-282d5e0c.patch`
 to a private archive of the pinned local cvc5 source. Configure against an
 existing local dependency prefix.
 

@@ -164,7 +164,8 @@ load. Random reads of declaration name, kind, and range improved on these
 large fixtures. The code comparison found identical instructions in the
 measured node accessors across rounds. Each read scenario verified matching
 checksums. The synthetic cases establish the access-pattern sensitivity at
-the component level. [Domain access implementation](../../src/node/node_internal.cppm)
+the component level. The domain access implementation is in
+`src/node/node_internal.cppm`.
 
 ## Phase 3 · Declaration ranks, symbol lookup, table slots, and allocation
 

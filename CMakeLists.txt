@@ -10,6 +10,7 @@ option(DANDELION_BUILD_TESTS "Build development and toolchain tests"
 option(DANDELION_BUILD_TOOLING_TESTS "Build developer-tool regression tests"
        ${PROJECT_IS_TOP_LEVEL})
 option(DANDELION_BUILD_BENCHMARKS "Build component benchmarks" OFF)
+option(DANDELION_BUILD_DOCS "Enable the Doxygen documentation target" OFF)
 option(DANDELION_WARNINGS_AS_ERRORS "Treat project target warnings as errors" OFF)
 set(DANDELION_DEPENDENCY_MODE "EXISTING" CACHE STRING
     "Dependency acquisition: EXISTING or FETCH")
@@ -36,6 +37,35 @@ dandelion_resolve_gmp()
 add_subdirectory(src/util)
 add_subdirectory(src/node)
 add_subdirectory(src/frontend)
+
+if(DANDELION_BUILD_DOCS)
+  find_package(Doxygen 1.17.0 REQUIRED OPTIONAL_COMPONENTS dot)
+
+  set(dandelion_doc_modules)
+  foreach(target IN ITEMS dandelion_util dandelion_node dandelion_frontend)
+    get_target_property(module_files ${target} CXX_MODULE_SET)
+    list(APPEND dandelion_doc_modules ${module_files})
+  endforeach()
+  # The template quotes the first and last paths in Doxygen's INPUT list.
+  list(JOIN dandelion_doc_modules "\" \"" dandelion_doxygen_module_input)
+
+  set(dandelion_doxygen_have_dot NO)
+  set(dandelion_doxygen_dot_path "")
+  if(TARGET Doxygen::dot)
+    set(dandelion_doxygen_have_dot YES)
+    get_target_property(dot_executable Doxygen::dot IMPORTED_LOCATION)
+    get_filename_component(dandelion_doxygen_dot_path "${dot_executable}" DIRECTORY)
+  endif()
+
+  configure_file(cmake/Doxyfile.in Doxyfile @ONLY)
+  add_custom_target(dandelion_docs
+    COMMAND Doxygen::doxygen "${CMAKE_CURRENT_BINARY_DIR}/Doxyfile"
+    BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/docs/html/index.html"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    COMMENT "Generating Dandelion documentation"
+    VERBATIM
+  )
+endif()
 
 if(DANDELION_BUILD_BENCHMARKS)
   include(cmake/DandelionBenchmark.cmake)

@@ -120,9 +120,9 @@ constant folding workloads (Phase 5B). Phase 6 uses these workloads to
 measure arithmetic (Phase 6A) and Node interning (Phase 6B) optimizations.
 The historical dry runs and Release samples are under `dandelion-phase5-util`,
 `dandelion-phase5-node`, `dandelion-phase6a-util`, and
-`dandelion-phase6b-node` in the experiment output directory.
-[Standalone workload guide](../../benchmarks/util/README.md),
-[Node acceptance](node-acceptance.md#phases-4b-5-and-6)
+`dandelion-phase6b-node` in the experiment output directory. The standalone
+workload guide is in `benchmarks/util/README.md`. See
+[Node acceptance](node-acceptance.md#phases-4b-5-and-6).
 
 The cases below specify test coverage using deterministic fixtures and
 independent expectations. Benchmark preflights verify their fixtures before
@@ -187,7 +187,7 @@ GoogleTest suite.
 test verifies the fixture and each folded root, including the rebuilt
 symbolic parents and preserved unresolved operations. It also checks
 resource failure cleanup and that releasing folded results restores the
-input storage totals. [Node workload tests](../../tests/benchmark/node_workload_test.cc)
+input storage totals. The test is in `tests/benchmark/node_workload_test.cc`.
 
 Construct typed DAGs with Node factories before timing. Preflight verifies
 that the input still has its intended operator kinds, ordered children,

@@ -14,7 +14,7 @@ are proposals unless explicitly identified as implemented.
 
 - For the current setup and its constraints, see [goals and initial decisions](#1-goals-and-initial-decisions), [project and build directories](#2-project-and-build-directories), and the [build and runtime commands](cpp-style.md#build-and-runtime-checks).
 - For CMake changes, see [target-based standards](#3-target-based-cmake-standards) and [C++ modules and `import std`](#4-c-modules-and-import-std).
-- For dependency and test integration, see [external dependencies and SAT backends](#5-external-dependencies-and-sat-backends) and [GoogleTest and CTest](#6-googletest-and-ctest).
+- For dependency, documentation, and test integration, see [external dependencies and SAT backends](#5-external-dependencies-and-sat-backends), [Doxygen](#doxygen), and [GoogleTest and CTest](#6-googletest-and-ctest).
 - For build performance or future design choices, see [build speed and resource use](#7-build-speed-and-resource-use), [measurement and acceptance](#8-measurement-and-acceptance), and [open decisions](#9-open-decisions).
 
 Sections contain both implemented behavior and future proposals; apply the
@@ -188,13 +188,14 @@ Build success and runtime library discovery are separate checks. In a local non-
 
 Dependency selection and the SAT abstraction belong to solver architecture decisions. CMake is responsible for providing reproducible and replaceable ways to build the selected dependencies.
 
-The scaffold implements the development, GMP, GoogleTest, and Google Benchmark options below. SAT backend and IPO options remain proposals.
+The scaffold implements the development, documentation, GMP, GoogleTest, and Google Benchmark options below. SAT backend and IPO options remain proposals.
 
 | Option | Status, meaning, and default |
 | --- | --- |
 | `DANDELION_BUILD_TESTS` | Implemented: ON for top-level development, OFF as a subproject; the caller may override it. |
 | `DANDELION_BUILD_TOOLING_TESTS` | Implemented: ON at the top level, OFF as a subproject; effective only when tests are enabled. Tooling tests require POSIX, Python 3.8+, clang-format 23.1.5, and clang-tidy 23.1.5. |
 | `DANDELION_BUILD_BENCHMARKS` | Implemented: OFF by default; enable component benchmark targets and their Google Benchmark dependency. |
+| `DANDELION_BUILD_DOCS` | OFF by default. Enable the `dandelion_docs` target with Doxygen 1.17.0 or newer and optional Graphviz `dot`. |
 | `DANDELION_WARNINGS_AS_ERRORS` | Implemented: OFF by default; only explicitly listed owned sources receive `-Werror`. |
 | `DANDELION_ENABLE_SANITIZERS` | Implemented: ON by default for newly configured top-level single-configuration GCC Debug builds, OFF otherwise. The `debug` and `gcc-asan-ubsan` presets enable ASan+UBSan; `release`, `relwithdebinfo`, and `clang-debug` disable them. Users may override the option. |
 | `DANDELION_DEPENDENCY_MODE` | Implemented for GMP, GoogleTest, and Google Benchmark: `EXISTING` or `FETCH`, default `EXISTING`. Existing dependencies are preferred in either mode; `FETCH` permits acquisition when needed. The cache retains the choice until changed. |
@@ -220,7 +221,7 @@ CMake recommends mechanisms such as `find_package()`, `FetchContent`, and depend
 
 #### GMP
 
-GMP **6.3.0 or newer is required**, including when project tests are disabled. [DandelionGMP.cmake](../cmake/DandelionGMP.cmake) provides `GMP::GMP` for consumers. It uses a parent-provided target first, then explicitly supplied clean source or a local archive, explicit installed paths, an installed `pkg-config` package, other discoverable installed paths, and finally a project-managed source. An invalid explicit selection fails instead of silently replacing it. A non-imported parent-provided `GMP::GMP` target must declare `GMP_VERSION` of at least 6.3.0; its actual headers are checked when the GMP smoke test is compiled.
+GMP **6.3.0 or newer is required**, including when project tests are disabled. `cmake/DandelionGMP.cmake` provides `GMP::GMP` for consumers. It uses a parent-provided target first, then explicitly supplied clean source or a local archive, explicit installed paths, an installed `pkg-config` package, other discoverable installed paths, and finally a project-managed source. An invalid explicit selection fails instead of silently replacing it. A non-imported parent-provided `GMP::GMP` target must declare `GMP_VERSION` of at least 6.3.0; its actual headers are checked when the GMP smoke test is compiled.
 
 For an installed library, CMake checks the header version and compiles and links a public API introduced in GMP 6.3.0; native configurations also execute a check of the loaded runtime version. Cross-compilation skips that runtime check, so it must be validated on the target. Header, library, ABI, and runtime search paths must refer to compatible builds. If no compatible GMP exists, `EXISTING` fails with instructions; `FETCH` may retrieve the official 6.3.0 archive. The archive SHA-256 is pinned in the helper. A provided archive is verified with the same hash and works offline; a clean source directory may provide a newer version. GMP source trees configured in place are rejected rather than modified.
 
@@ -244,7 +245,7 @@ GMP 6.3.0 is available under LGPL 3.0-or-later or GPL 2.0-or-later; distribution
 
 #### GoogleTest
 
-When tests are enabled, [DandelionGoogleTest.cmake](../cmake/DandelionGoogleTest.cmake) resolves GoogleTest in this order: a parent-provided `GTest::gtest` or `GTest::gtest_main` target; an explicitly supplied source tree; an installed package found with `find_package(GTest)`; the project-managed source; and, when available, the standard `/usr/src/googletest` source tree. `GTest_ROOT`, `GTest_DIR`, and `CMAKE_PREFIX_PATH` can guide package discovery. Installed packages must be compatible with the selected compiler, standard library, and ABI. A parent-provided target is not replaced. Explicit source paths must point to a standalone GoogleTest source root; LLVM's modified internal copy is not such a root.
+When tests are enabled, `cmake/DandelionGoogleTest.cmake` resolves GoogleTest in this order: a parent-provided `GTest::gtest` or `GTest::gtest_main` target; an explicitly supplied source tree; an installed package found with `find_package(GTest)`; the project-managed source; and, when available, the standard `/usr/src/googletest` source tree. `GTest_ROOT`, `GTest_DIR`, and `CMAKE_PREFIX_PATH` can guide package discovery. Installed packages must be compatible with the selected compiler, standard library, and ABI. A parent-provided target is not replaced. Explicit source paths must point to a standalone GoogleTest source root; LLVM's modified internal copy is not such a root.
 
 When no usable source or package is found, `EXISTING` fails with instructions. `FETCH` downloads GoogleTest 1.18.0 from the official repository, pinned to commit `063de7e9578f82b369302001269680b4b1553359` and checked against the SHA-256 in the helper. It stages and publishes sources under `DANDELION_SUBPROJECTS_DIR`, using a lock for concurrent configurations; a completed managed copy is reused offline. An unexpected existing directory or provenance marker is reported rather than overwritten. Each CMake build tree compiles its own dependency objects. The integration disables upstream GoogleMock, tests, and installation for the embedded copy without forcing parent cache options. No `cmake --install` into user or system locations is performed. GoogleTest 1.18.0 is distributed under the BSD 3-Clause License; check the actual selected dependency when distributing a build.
 
@@ -261,7 +262,7 @@ To return that build tree to the offline policy, reconfigure with `-DDANDELION_D
 #### Google Benchmark
 
 Google Benchmark is required only when `DANDELION_BUILD_BENCHMARKS=ON`.
-[DandelionBenchmark.cmake](../cmake/DandelionBenchmark.cmake) first uses a
+`cmake/DandelionBenchmark.cmake` first uses a
 parent-provided `benchmark::benchmark` target, then an explicit
 `DANDELION_BENCHMARK_SOURCE_DIR`, an installed CMake package of version 1.10.0
 or newer, and finally a project-managed source with a matching provenance marker. User-provided targets
@@ -283,6 +284,31 @@ The Node replay library also builds with project tests enabled and has
 no Google Benchmark dependency. Corpus capture and performance measurements
 are explicit commands. See [component benchmark usage](benchmarks/README.md)
 for the tests-off Release build, workload selection, and diagnostic checks.
+
+#### Doxygen
+
+With `DANDELION_BUILD_DOCS=ON`, CMake requires Doxygen 1.17.0 or newer and
+enables diagrams if it finds Graphviz `dot`. Make the tools available on
+`PATH` before configuring. The `dandelion_docs` target runs on explicit
+request and generates HTML from the public C++ module file sets of
+`dandelion_util`, `dandelion_node`, and `dandelion_frontend`, the Markdown
+under `docs/`, and `AGENTS.md`, which those pages reference. It uses
+the [solver architecture](architecture.md) as the landing page. See the
+[API documentation convention](cpp-style.md#api-documentation) for public
+module comments.
+
+```sh
+cmake -S . -B build/docs -G Ninja -DDANDELION_BUILD_DOCS=ON \
+  -DDANDELION_BUILD_TESTS=OFF -DDANDELION_ENABLE_SANITIZERS=OFF
+cmake --build build/docs --target dandelion_docs
+test -f build/docs/docs/html/index.html
+```
+
+The documentation acceptance check requires this build to exit successfully
+with zero Doxygen warnings. The target applies `WARN_AS_ERROR = FAIL_ON_WARNINGS`
+and regenerates the pages on each invocation without compiling the libraries.
+Verify that a default configuration works without Doxygen and that the
+documentation build succeeds with or without `dot`.
 
 ### 5.2 How CaDiCaL and Kissat Are Built
 

@@ -649,9 +649,9 @@ Deferred group recipes and touched instances fit the current manager.
 Bare name and arity checks alone lose declaration identity at a mixed UF/DT
 boundary. Constructor-name overloading for convenience can be found in
 reference implementations. It adds collision and typing rules and should
-not be inferred from node declaration name hints.
-[cvc5 datatype declaration parsing](https://github.com/cvc5/cvc5/blob/282d5e0c84baf49c780704c532f87ba66d8b513d/src/parser/smt2/smt2_term_parser.cpp#L1097),
-[Dandelion implementation](../../src/node/datatype_builder.cc)
+not be inferred from node declaration name hints. Dandelion's builder is in
+`src/node/datatype_builder.cc`.
+[cvc5 datatype declaration parsing](https://github.com/cvc5/cvc5/blob/282d5e0c84baf49c780704c532f87ba66d8b513d/src/parser/smt2/smt2_term_parser.cpp#L1097)
 
 ### Pattern typing and lowering
 
@@ -755,8 +755,8 @@ resolved operator is Int unary minus applied directly to a numeral,
 it may be represented by a canonical negative Int literal. Retain
 the source shape when needed for logic checks, such as a LIA coefficient.
 Keep other unary minus applications as operations. No unary plus or
-C-style signed numeral token is implied by the numeric API.
-[Numeric implementation](../../src/node/numeric.cc),
+C-style signed numeral token is implied by the numeric API. The integer
+implementation is in `src/util/integer.cc`.
 [Integer contract](../util/integer.md),
 [SMT-LIB 2.7 §3.1 and Ints](https://smt-lib.org/theories-Ints.shtml)
 
@@ -849,7 +849,7 @@ before allocation, charge exact arithmetic work separately, and use
 iterative stacks. A skewed tree of rational divisions can repeatedly
 visit growing operands even when the final result is small.
 [Dandelion rational API and proposed arithmetic](../util/rational.md),
-[Numeric API](../../src/node/numeric.cppm)
+[Numeric module layout](../util/implementation.md#build-and-module-layout)
 
 cvc5 and Z accepted P23, which has nested signed rationals and symbolic
 rounding. B rejected it at unary minus. For P24, C and Z accepted the
@@ -901,7 +901,7 @@ separate FP and Int contracts.
 
 The [frontend test design](../testing/frontend.md) specifies solver-independent
 observations, a feature inventory, independent expectations, and intentionally
-bounded corpus checks. The [node boundary tests](../../tests/node/frontend_boundary_test.cc)
+bounded corpus checks. The tests in `tests/node/frontend_boundary_test.cc`
 can check factory behavior and selected lowered shapes. They exercise no
 text parser. Use GoogleTest with CTest and extend the scoped test design and
 cases before implementing each feature. Every row below is planned research

@@ -445,9 +445,10 @@ cover the corresponding frontend mechanisms. This evidence concerns input
 meaning and frontend protocol behavior. Full-corpus acceptance and
 production model correctness require their own validation.
 
-Run the opt-in regression with the Release probe described above and all
-applicable reference solvers. The runner records executable versions,
-arguments, SHA-256, stdout, stderr and comparisons in its new output directory.
+Run the opt-in regression in `tests/frontend/benchmark_regression.py` with
+the Release probe described above and all applicable reference solvers.
+The runner records executable versions, arguments, SHA-256, stdout, stderr
+and comparisons in its new output directory.
 `report.json` contains each check's status and the disposition counts.
 Exit 0 requires complete evidence, including successful sample XOR
 comparisons and oracle controls. A failed check returns 1. Unavailable,
@@ -455,7 +456,6 @@ unsupported, timed-out, crashed or inconclusive checks return 2 when no
 check failed. Reference checks outside their applicable profile are skipped.
 External runs use a 5 s wall timeout, 3 s soft and 4 s hard CPU bounds,
 768 MiB address space and 1 MiB output-file limits.
-[Regression runner](../../tests/frontend/benchmark_regression.py)
 
 ```sh
 cmake --build build/release --target dandelion_frontend_probe

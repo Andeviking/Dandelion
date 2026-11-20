@@ -475,7 +475,8 @@ The transfer path targets per-edge retain traffic on construction misses
 while preserving prompt reclamation and the owning public handle. Keeping
 borrowed construction for shared input views avoids requiring new temporary
 owners from callers that already have a live root.
-[Node architecture review](/pub/netdisk2/zhangx/dandelion-frontend-bench/qf_bv_compare/review_philosophy_node.md)
+The local Node architecture review is at
+`/pub/netdisk2/zhangx/dandelion-frontend-bench/qf_bv_compare/review_philosophy_node.md`.
 
 1. Probe for the same canonical parent as the borrowed path. Check
    and acquire the result retain on a hit, including the unchanged

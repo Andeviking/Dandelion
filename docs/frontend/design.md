@@ -633,8 +633,8 @@ fixed point marks exactly those members with finite constructor
 witnesses, by induction on the height of a witness. Concrete instance
 resolution visits finite recipes when used. Even a recursive declaration
 whose parameter changes along an edge requires no eager transitive
-enumeration of sorts. [Node design §4](../node/design.md#4-datatype-group-transactions),
-[builder validation and commit](../../src/node/datatype_builder.cc),
+enumeration of sorts. Builder validation and commit are implemented in
+`src/node/datatype_builder.cc`. [Node design §4](../node/design.md#4-datatype-group-transactions),
 [SMT-LIB §4.2.3](https://smt-lib.org/papers/smt-lib-reference-v2.7-r2026-09-09.pdf)
 
 For `match`, resolve the scrutinee to a concrete datatype instance.
@@ -713,7 +713,7 @@ C++ allocation and checked representation failures follow the relevant
 factory contract. GMP's default limb-allocation failure may terminate the
 process and is not made recoverable by an expected-like return type.
 [Node exact values](../node/design.md#5-exact-values),
-[numeric contracts](../util/design.md#common-api-and-failure-policy),
+[numeric error contracts](../util/design.md#checked-errors),
 [GMP allocator contract](https://gmplib.org/manual/Custom-Allocation).
 
 #### Literal cache (overhaul contract)
@@ -754,10 +754,10 @@ and significand widths, and their sum. Thus the maximum representable width or
 FP total is `2^32 - 1`; a mathematically valid larger request reports the
 existing `kResourceLimit`/`kSize`. The structural representation target
 uses 64-bit IDs, indices and counts for nodes, edges and declarations,
-including arities. Use the structural types from the
-[NodeManager interface](../../src/node/node.cppm) across the frontend
-boundary. Frontend arity and count conversion must preserve their full
-range up to the applicable machine and container limits.
+including arities. Use the structural types from the `NodeManager` interface
+in `src/node/node.cppm` across the frontend boundary. Frontend arity and
+count conversion must preserve their full range up to the applicable machine
+and container limits.
 These representation limits do not authorize separate input,
 work or memory quotas, and they must be stated when describing supported
 inputs rather than claiming every mathematically valid width is representable.
@@ -796,7 +796,8 @@ buffer and frame-specific uncommon state to avoid a large work record
 per operand. Online coordinates preserve locations when window bytes
 expire. Keeping pre-close bindings private also makes publication safe
 for Dandelion's user-supplied Reader callbacks.
-[Frontend architecture review](/pub/netdisk2/zhangx/dandelion-frontend-bench/qf_bv_compare/review_philosophy_frontend.md)
+The local frontend architecture review is at
+`/pub/netdisk2/zhangx/dandelion-frontend-bench/qf_bv_compare/review_philosophy_frontend.md`.
 
 ```text
 Reader -> lexer -> grammar frames and semantic reductions -> NodeManager
@@ -1401,8 +1402,8 @@ the same kind. Mark each planned until it has a linked passing case.
 | FE-OP-FP, §6 | Use FP8,24 terms `u,v,w`, RM `rm`, and FP5,11 term `f`. Instantiate each unary op, RM arithmetic, FMA, min/max/rem, chainable comparator and predicate with the ordered operands in its schema. Use `fp #b0 #x00` with a 23-bit zero fraction. Cover each `to_fp` rank individually with BV32 bits, `rm f`, `rm #x80`, `rm (/ 1 2)`, then `to_fp_unsigned` with `rm #x80`, and both FP-to-BV kinds with index 7. Assert exact FP8,24 or BV7 result and child order or rational payload, and Bool for comparisons and tests. Remove required operands without reaching another valid rank, use Bool in the value or RM slot, and exercise matching-format and bit-width constraints where specified. Preserve Core equality separately, including signed-zero operands. |
 | FE-OP-ARRAY-DT, §7 | Use `a : Array<Int,BV8>`, `select a 2`, `store a 2 #xff`, and `((as const (Array Int (_ BitVec 8))) #xff)`. Check element/array sorts, order and full qualifier, and replace one index, value or qualifier with a wrong sort. For each distinct declaration category test W3 constructors, selectors and symbolic testers, observing the concrete declaration and ordered arguments. `(hd (as nil (Trees (_ BitVec 8))))` has sort `Tree<BV8>`. Test wrong argument count/sort, symbolic-vs-numeric tester index and unintended constructor membership. |
 
-The operator tables were checked against the current
-[`Kind` enum](../../src/node/node.cppm). Their union contains all 108
+The operator tables were checked against the `Kind` enum in
+`src/node/node.cppm`. Their union contains all 108
 publishable kinds and excludes `kInvalid`. Expand every grouped
 row in the test review. Distinct numeral forms, RM symbols, BV/Int legacy
 aliases and the short Core compatibility ranks are extra source cases.
@@ -1666,10 +1667,10 @@ filesystem/cache conditions and raw phases, and compare equivalent output
 ownership. Measure peak process RSS separately. It includes allocator
 retention, input/scratch pages, nodes, GMP and library memory. Phase
 counters supplement it and cannot attribute all RSS to individual phases.
-The local review and audit describe baseline measurements motivating both
-changes. They establish neither Phase 1 nor Phase 2 performance.
-[Frontend review](/pub/netdisk2/zhangx/dandelion-frontend-bench/qf_bv_compare/review_philosophy_frontend.md)
-[Contract audit](/pub/netdisk2/zhangx/dandelion-frontend-bench/qf_bv_compare/audit_frontend_contracts.md)
+The local frontend review and contract audit describe baseline measurements
+motivating both changes. They establish neither Phase 1 nor Phase 2 performance.
+Both files are in `/pub/netdisk2/zhangx/dandelion-frontend-bench/qf_bv_compare/`
+as `review_philosophy_frontend.md` and `audit_frontend_contracts.md`.
 
 ## Acceptance scope
 

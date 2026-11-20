@@ -44,9 +44,19 @@ Automatic constants may use ordinary variable names or `k` names when their
 values are fixed across calls. A runtime-dependent local `const` is not made a
 program-wide constant just by its type.
 
+## API documentation
+
+For public declarations in C++ module interfaces, place Doxygen comments
+directly above the declaration. Start with `/// @brief` and a concise
+description of the declaration's purpose. Use a blank `///` line before
+details about preconditions, ownership, lifetime, or errors when callers
+need them. Use `@param` and `@return` when they clarify the contract. Use
+ordinary `//` comments for implementation details. Build the documentation
+with the [Doxygen target](cmake.md#doxygen).
+
 ## Formatting
 
-[.clang-format](../.clang-format) starts from Google, with C++23 parsing. The
+`.clang-format` starts from Google, with C++23 parsing. The
 reproducible baseline is **clang-format 23.1.5**. The entry script rejects other
 versions; a tool path can be supplied with `--clang-format`.
 
@@ -75,7 +85,7 @@ the meaning of an edit.
 
 ## Naming checks and their limits
 
-[.clang-tidy](../.clang-tidy) enables only `readability-identifier-naming` and
+`.clang-tidy` enables only `readability-identifier-naming` and
 treats its diagnostics as errors. It does not enable `modernize-*`,
 `readability-*`, or `cppcoreguidelines-*` as groups. Compiler parse errors also
 fail a check. Clang-tidy, its Clang compilation database, and the compiler used
@@ -157,7 +167,7 @@ claim that clang-tidy fully checks Google style.
 
 ## Source ownership and check scope
 
-[scripts/check_cpp.py](../scripts/check_cpp.py) discovers C++ files under `src/`,
+`scripts/check_cpp.py` discovers C++ files under `src/`,
 `include/`, `tests/`, `tools/`, and `benchmarks/`. Add new owned source roots to
 that list when needed. It recognizes `.cc`, `.cpp`, `.cxx`, `.c++`, `.C`, `.cppm`, `.ixx`,
 `.mpp`, `.h`, `.hh`, `.hpp`, `.hxx`, `.inc`, `.ipp`, and `.tpp` (header suffixes
