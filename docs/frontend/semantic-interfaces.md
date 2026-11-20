@@ -726,4 +726,3 @@ every abstract-value sort.
 [Frontend tests](../testing/frontend.md) exercise these interfaces with
 controlled providers and independent finite oracles. A production provider
 must establish its model semantics and correctness for the original query.
-

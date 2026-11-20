@@ -268,4 +268,3 @@ the associated tester declaration instance. Array constants are an accepted
 extension, not a claim that ArraysEx itself declares them. General array
 models need total interpretations and are not represented solely by these
 syntax constructors. [ArraysEx](https://smt-lib.org/theories-ArraysEx.shtml)
-

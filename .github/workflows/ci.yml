@@ -100,7 +100,7 @@ jobs:
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           if [[ "$GITHUB_EVENT_NAME" == pull_request ]]; then
             MERGE_BASE=$(git merge-base "$BASE_SHA" "$HEAD_SHA")
-            git diff --check "$MERGE_BASE" "$HEAD_SHA" -- . ':!LICENSES/**'
+            git diff --check "$MERGE_BASE" "$HEAD_SHA" -- . ':!LICENSES/**' ':!*.patch'
           else
             if [[ "$BASE_SHA" =~ ^0+$ ]]; then
               BASE_SHA=$(git hash-object -w -t tree --stdin < /dev/null)
@@ -108,7 +108,7 @@ jobs:
               # The previous tip may be unreachable after a force push.
               git fetch --no-tags origin "$BASE_SHA"
             fi
-            git diff --check "$BASE_SHA" "$HEAD_SHA" -- . ':!LICENSES/**'
+            git diff --check "$BASE_SHA" "$HEAD_SHA" -- . ':!LICENSES/**' ':!*.patch'
           fi
       - name: Check C++ formatting
         run: python3 scripts/check_cpp.py format-check

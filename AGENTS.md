@@ -27,6 +27,7 @@
 - Design from first principles and fix underlying causes. Validate inputs at the responsible boundary, rely on established invariants internally, and avoid redundant checks for impossible states.
 - External SAT solvers such as CaDiCaL and Kissat may be integrated as dependencies when appropriate.
 - Keep documentation aligned with the actual repository. Clearly distinguish implemented behavior from plans and proposals.
+- Before pushing changes, run the CI `Quality` checks locally across the PR range (for example, `MERGE_BASE=$(git merge-base origin/main HEAD) && git diff --check "$MERGE_BASE" HEAD -- . ':!LICENSES/**' ':!*.patch'` and `python3 scripts/check_cpp.py format-check`), as well as `git diff --check` for uncommitted edits.
 
 ## Project Documentation
 

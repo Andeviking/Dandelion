@@ -27,4 +27,3 @@ gtest_discover_tests(dandelion_frontend_tests
   DISCOVERY_MODE PRE_TEST
   PROPERTIES LABELS frontend
 )
-
