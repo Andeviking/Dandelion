@@ -1,0 +1,24 @@
+PROJECT_NAME           = "@PROJECT_NAME@"
+OUTPUT_DIRECTORY       = "@CMAKE_CURRENT_BINARY_DIR@/docs"
+
+INPUT                  = "@dandelion_doxygen_module_input@" docs AGENTS.md
+FILE_PATTERNS          = *.cppm *.md
+RECURSIVE              = YES
+MARKDOWN_ID_STYLE      = GITHUB
+IMPLICIT_DIR_DOCS      = NO
+USE_MDFILE_AS_MAINPAGE = docs/architecture.md
+
+EXTRACT_ALL            = YES
+# Doxygen can list members of private anonymous unions as standalone symbols.
+EXCLUDE_SYMBOLS        = word_ limbs_ signed_word_ unsigned_word_ big_ numerator_
+
+QUIET                  = YES
+WARNINGS               = YES
+WARN_IF_DOC_ERROR      = YES
+WARN_AS_ERROR          = FAIL_ON_WARNINGS
+
+GENERATE_HTML          = YES
+HTML_OUTPUT            = html
+GENERATE_LATEX         = NO
+HAVE_DOT               = @dandelion_doxygen_have_dot@
+DOT_PATH               = "@dandelion_doxygen_dot_path@"

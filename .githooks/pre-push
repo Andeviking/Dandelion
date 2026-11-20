@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+
+set -eu
+
+fail() {
+    printf 'pre-push: %s\n' "$*" >&2
+    exit 1
+}
+
+check_format() (
+    local_oid=$1
+    scratch_dir=$(mktemp -d "${TMPDIR:-/tmp}/dandelion-pre-push.XXXXXXXX")
+    snapshot=$scratch_dir/checkout
+
+    cleanup() {
+        if [[ -f "$snapshot/.git" ]]; then
+            git worktree remove --force "$snapshot" ||
+                fail "Remove the temporary checkout with git worktree remove --force '$snapshot'."
+        fi
+        rmdir "$scratch_dir"
+    }
+
+    trap cleanup EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    git -c core.hooksPath=/dev/null -c core.sparseCheckout=false \
+        worktree add --detach --quiet "$snapshot" "$local_oid" </dev/null ||
+        fail "Could not check out $local_oid for the C++ format check."
+
+    printf 'pre-push: checking C++ formatting for %s\n' "$local_oid"
+    git_environment=$(git rev-parse --local-env-vars)
+    (
+        # Git exports checkout-specific variables when it invokes a hook.
+        mapfile -t git_variables <<< "$git_environment"
+        unset "${git_variables[@]}"
+        cd "$snapshot" && python3 scripts/check_cpp.py format-check
+    ) ||
+        fail "C++ format check failed for $local_oid. See the diagnostics above."
+)
+
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+declare -A format_commits=()
+
+# Each destination needs its own whitespace check, even when tips are shared.
+while read -r _local_ref local_oid remote_ref remote_oid; do
+    if [[ "$local_oid" =~ ^0+$ || "$remote_ref" == refs/tags/* ]]; then
+        continue
+    fi
+
+    if [[ "$remote_ref" == refs/heads/main ]]; then
+        if [[ "$remote_oid" =~ ^0+$ ]]; then
+            base_oid=$(git hash-object -w -t tree --stdin </dev/null)
+        else
+            base_oid=$remote_oid
+            git cat-file -e "${base_oid}^{commit}" 2>/dev/null ||
+                fail "Previous tip $base_oid of $remote_ref is missing locally." \
+                    "Run git fetch <remote> $base_oid with the push remote and retry."
+        fi
+    else
+        main_oid=$(git rev-parse --verify --quiet 'refs/remotes/origin/main^{commit}') ||
+            fail "origin/main is missing locally. Run git fetch origin main and retry."
+        base_oid=$(git merge-base "$main_oid" "$local_oid") ||
+            fail "No merge base between origin/main and $local_oid for $remote_ref." \
+                "Fetch the branch history and retry."
+    fi
+
+    git diff --check "$base_oid" "$local_oid" -- . ':!LICENSES/**' ':!*.patch' ||
+        fail "Whitespace check failed for $remote_ref ($local_oid)."
+    format_commits[$local_oid]=1
+done
+
+if (( ${#format_commits[@]} == 0 )); then
+    exit 0
+fi
+
+command -v python3 >/dev/null ||
+    fail "Install Python 3.8 or newer and make python3 available on PATH."
+command -v clang-format >/dev/null ||
+    fail "Install clang-format 23.1.5 and make clang-format available on PATH."
+
+for local_oid in "${!format_commits[@]}"; do
+    check_format "$local_oid"
+done
