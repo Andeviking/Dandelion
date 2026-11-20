@@ -25,5 +25,6 @@ if(DANDELION_ENABLE_SANITIZERS)
   )
 endif()
 dandelion_configure_target(dandelion_frontend
+  FUZZ
   SOURCES ${frontend_interfaces} ${frontend_private_interfaces} ${frontend_sources}
 )

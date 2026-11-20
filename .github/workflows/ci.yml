@@ -80,6 +80,21 @@ jobs:
       - name: Check C++ naming
         if: matrix.name == 'clang-debug'
         run: python3 scripts/check_cpp.py tidy --build-dir build/clang-debug
+      - name: Smoke-test the frontend fuzzer
+        if: matrix.name == 'clang-debug'
+        timeout-minutes: 10
+        run: |
+          cmake --preset clang-fuzz \
+            -DDANDELION_DEPENDENCY_MODE="$DANDELION_DEPENDENCY_MODE" \
+            -DDANDELION_WARNINGS_AS_ERRORS="$DANDELION_WARNINGS_AS_ERRORS" \
+            -DDANDELION_SUBPROJECTS_DIR="$DANDELION_SUBPROJECTS_DIR"
+          cmake --build --preset clang-fuzz
+          clang-tidy -p build/clang-fuzz tests/fuzz/frontend_session_fuzzer.cc
+          corpus=$(mktemp -d build/clang-fuzz/corpus.XXXXXX)
+          cp tests/benchmark/fixtures/capture{,_theories}.smt2 "$corpus/"
+          build/clang-fuzz/tests/fuzz/dandelion_frontend_session_fuzzer \
+            -seed=1 -runs=256 -max_len=4096 -timeout=5 \
+            -artifact_prefix=build/clang-fuzz/ "$corpus"
 
   quality:
     name: Quality

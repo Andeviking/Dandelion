@@ -20,6 +20,11 @@ if(DANDELION_ENABLE_SANITIZERS)
     -fsanitize=address,undefined -fno-sanitize-recover=undefined
   )
 endif()
+if(DANDELION_BUILD_FUZZERS)
+  # Supply sanitizer coverage callbacks to ordinary executable consumers.
+  target_link_options(dandelion_util INTERFACE -fsanitize=fuzzer-no-link)
+endif()
 dandelion_configure_target(dandelion_util
+  FUZZ
   SOURCES ${util_interfaces} ${util_private_interfaces} ${util_sources}
 )

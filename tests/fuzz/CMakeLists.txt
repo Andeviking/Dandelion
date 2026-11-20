@@ -1,0 +1,6 @@
+add_executable(dandelion_frontend_session_fuzzer frontend_session_fuzzer.cc)
+target_link_libraries(dandelion_frontend_session_fuzzer PRIVATE dandelion_frontend)
+target_link_options(dandelion_frontend_session_fuzzer PRIVATE -fsanitize=fuzzer)
+dandelion_configure_target(dandelion_frontend_session_fuzzer
+  FUZZ SOURCES frontend_session_fuzzer.cc
+)

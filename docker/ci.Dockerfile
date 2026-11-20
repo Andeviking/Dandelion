@@ -68,12 +68,18 @@ cmake --version | grep -Fx 'cmake version 4.5.0'
 test "$(ninja --version)" = 1.13.2
 test "$(gcc -dumpfullversion)" = 16.2.0
 test "$(g++ -dumpfullversion)" = 16.2.0
-for tool in clang clang++ clang-scan-deps clang-format clang-tidy; do
+for tool in clang clang++ clang-scan-deps clang-format clang-tidy llvm-profdata llvm-cov; do
     "$tool" --version | grep -E 'version 23\.1\.5($|[[:space:]])'
 done
 metadata=$(g++ -print-file-name=libstdc++.modules.json)
 test -f "$metadata"
 test "$metadata" -ef "$(clang++ -print-file-name=libstdc++.modules.json)"
+probe=$(mktemp -d)
+trap 'rm -rf "$probe"' EXIT
+printf '%s\n' 'extern "C" int LLVMFuzzerTestOneInput(const unsigned char*, __SIZE_TYPE__) { return 0; }' \
+    | clang++ -x c++ - -fsanitize=fuzzer -o "$probe/fuzz"
+printf '%s\n' 'int main() { return 0; }' \
+    | clang++ -x c++ - -fprofile-instr-generate -fcoverage-mapping -o "$probe/coverage"
 test "$(pkg-config --modversion gmp)" = 6.3.0
 doxygen --version | grep -E '^1\.17\.0([[:space:]]|$)'
 dot -V

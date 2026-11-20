@@ -37,6 +37,21 @@
       "cacheVariables": { "DANDELION_ENABLE_SANITIZERS": false }
     },
     {
+      "name": "clang-fuzz",
+      "displayName": "Clang Debug with libFuzzer (set CXX=clang++ on first configure)",
+      "inherits": "clang-debug",
+      "cacheVariables": {
+        "DANDELION_BUILD_FUZZERS": true,
+        "DANDELION_BUILD_TESTS": false
+      }
+    },
+    {
+      "name": "clang-coverage",
+      "displayName": "Clang Debug with source coverage (set CXX=clang++ on first configure)",
+      "inherits": "clang-debug",
+      "cacheVariables": { "DANDELION_ENABLE_COVERAGE": true }
+    },
+    {
       "name": "gcc-asan-ubsan",
       "displayName": "GCC ASan + UBSan (set CXX=g++ on first configure)",
       "inherits": "debug",
@@ -48,6 +63,8 @@
     { "name": "release", "configurePreset": "release" },
     { "name": "relwithdebinfo", "configurePreset": "relwithdebinfo" },
     { "name": "clang-debug", "configurePreset": "clang-debug" },
+    { "name": "clang-fuzz", "configurePreset": "clang-fuzz" },
+    { "name": "clang-coverage", "configurePreset": "clang-coverage" },
     { "name": "gcc-asan-ubsan", "configurePreset": "gcc-asan-ubsan" }
   ],
   "testPresets": [
@@ -55,6 +72,7 @@
     { "name": "release", "configurePreset": "release", "output": { "outputOnFailure": true }, "execution": { "noTestsAction": "error" } },
     { "name": "relwithdebinfo", "configurePreset": "relwithdebinfo", "output": { "outputOnFailure": true }, "execution": { "noTestsAction": "error" } },
     { "name": "clang-debug", "configurePreset": "clang-debug", "output": { "outputOnFailure": true }, "execution": { "noTestsAction": "error" } },
+    { "name": "clang-coverage", "configurePreset": "clang-coverage", "output": { "outputOnFailure": true }, "execution": { "noTestsAction": "error" } },
     { "name": "gcc-asan-ubsan", "configurePreset": "gcc-asan-ubsan", "output": { "outputOnFailure": true }, "execution": { "noTestsAction": "error" } }
   ]
 }

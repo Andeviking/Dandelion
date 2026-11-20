@@ -10,6 +10,7 @@ option(DANDELION_BUILD_TESTS "Build development and toolchain tests"
 option(DANDELION_BUILD_TOOLING_TESTS "Build developer-tool regression tests"
        ${PROJECT_IS_TOP_LEVEL})
 option(DANDELION_BUILD_BENCHMARKS "Build component benchmarks" OFF)
+option(DANDELION_BUILD_FUZZERS "Build libFuzzer targets" OFF)
 option(DANDELION_BUILD_DOCS "Enable the Doxygen documentation target" OFF)
 option(DANDELION_WARNINGS_AS_ERRORS "Treat project target warnings as errors" OFF)
 set(DANDELION_DEPENDENCY_MODE "EXISTING" CACHE STRING
@@ -37,6 +38,10 @@ dandelion_resolve_gmp()
 add_subdirectory(src/util)
 add_subdirectory(src/node)
 add_subdirectory(src/frontend)
+
+if(DANDELION_BUILD_FUZZERS)
+  add_subdirectory(tests/fuzz)
+endif()
 
 if(DANDELION_BUILD_DOCS)
   find_package(Doxygen 1.17.0 REQUIRED OPTIONAL_COMPONENTS dot)

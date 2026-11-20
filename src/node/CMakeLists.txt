@@ -24,5 +24,6 @@ if(DANDELION_ENABLE_SANITIZERS)
   )
 endif()
 dandelion_configure_target(dandelion_node
+  FUZZ
   SOURCES ${node_interfaces} ${node_private_interfaces} ${node_sources}
 )

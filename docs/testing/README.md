@@ -77,6 +77,27 @@ Test checks must remain effective in release-like builds where `NDEBUG` can
 disable ordinary C++ `assert`. The current integration and its dependencies are
 documented in [cmake.md](../cmake.md#6-googletest-and-ctest).
 
+### Clang instrumentation checks
+
+- Run the ordinary Clang and GCC test suites with both optional
+  instrumentation switches disabled.
+- Check that the fuzz preset configures without GoogleTest and builds the
+  frontend session fuzzer with libFuzzer. Inspect the compile database for
+  instrumentation on the fuzzer and its project libraries. Check that
+  standard-library modules and dependencies have no fuzz compile flags and
+  that ordinary test executables can still link when tests are enabled.
+- Smoke-test the harness with valid multi-command scripts, empty input, and
+  malformed input including a NUL byte. Run a bounded mutation pass from
+  the checked-in frontend fixtures with a fixed seed.
+- In a coverage build, verify that project translation units have coverage
+  flags, synthesized standard-library modules and dependencies have none,
+  and final executable links include the profile runtime. Run CTest with
+  distinct profile output paths, merge the profiles, and read a report
+  with the matching LLVM tools.
+- The tooling suite checks that naming skips fuzzer sources when disabled,
+  checks them when enabled, and still rejects missing compile commands for
+  unregistered sources when enabled.
+
 ## Choosing an oracle
 
 | Evidence | Suitable use and limitation |

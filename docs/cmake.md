@@ -61,7 +61,7 @@ Dandelion/
 - Build outside the source tree; do not generate object files, module BMIs, or third-party build products in source directories.
 - Each build directory should correspond to a fixed generator, compiler, target platform, and major build configuration. Use a new directory or explicitly reconfigure when changing compilers or ABI-related settings; do not mix incompatible caches or BMIs.
 - Keep shared settings in `CMakePresets.json`; put personal paths, parallelism, and local toolchain overrides in an uncommitted `CMakeUserPresets.json` or on the command line. Do not write personal absolute paths such as `/home/zhangx/...` into project configuration. [CMake Presets manual](https://cmake.org/cmake/help/v4.5/manual/cmake-presets.7.html)
-- For the single-configuration Ninja generator, the scaffold provides `debug`, `release`, `relwithdebinfo`, `clang-debug`, and `gcc-asan-ubsan` presets with separate `binaryDir` values and matching build/test presets. Tests, optional warning errors, and sanitizers have implemented options; IPO remains a future option.
+- For the single-configuration Ninja generator, the scaffold provides `debug`, `release`, `relwithdebinfo`, `clang-debug`, `clang-coverage`, and `gcc-asan-ubsan` presets with matching build/test presets. `clang-fuzz` provides matching configure and build presets. Each configuration uses a separate `binaryDir`.
 - Shared presets may use a hidden Ninja base inherited by other configurations, with matching build and test presets for common configurations. Users select the compiler through a personal preset, a toolchain file, or the environment at the first configuration; shared presets should not force an absolute path to a local GCC installation.
 - The shared presets explicitly enable `CMAKE_EXPORT_COMPILE_COMMANDS`. In a fresh direct Ninja configuration with the validated CMake 4.5 toolchain, the root cache assignment can leave this option empty and no database is generated. Until fixed, pass `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON` when a direct build needs the database. A future top-level default should enable it when unspecified while respecting an explicit user or parent-project `OFF`; do not use `FORCE` to override that choice. Keep the database in the build directory.
 - Make tests easy to enable during development. When included as a subproject, avoid enabling unrelated tests and dependencies by default. Test targets, data, and dependency acquisition should be controllable. GoogleTest and CTest have distinct roles described in Section 6.
@@ -119,7 +119,7 @@ also build when tests are enabled with benchmarks disabled.
 - Do not use `CACHE ... FORCE` to override user settings without good reason; project code must not override the user's selected compiler, generator, or installation prefix.
 - Introduce CMake functions or helper modules only when they provide useful reuse. Avoid hard-to-trace macros, deep wrappers, and complex automatic discovery early in the project.
 - Apply warning options to project-owned targets. Make `-Werror` controllable; do not propagate project `-Werror` or private warning flags to third-party code or downstream consumers.
-- In the CMake 4.5 scaffold, `dandelion_configure_target()` takes an explicit owned `SOURCES` list and attaches warnings to those sources in the target's directory. This is a deliberate exception to ordinary target compile options: CMake 4.5 copies those options into synthesized standard-library module targets. C++ standard requirements and sanitizer compatibility options remain target-based; project warnings and `-Werror` do not reach standard-library modules.
+- In the CMake 4.5 scaffold, `dandelion_configure_target()` takes an explicit owned `SOURCES` list and attaches warnings, libFuzzer instrumentation, and source coverage to those sources in the target's directory. CMake 4.5 copies target compile options into synthesized standard-library module targets. C++ standard requirements and ASan+UBSan compatibility options remain target-based.
 - Source properties are directory-scoped. If the same source is compiled into multiple targets in that directory with different policies, verify that warning settings do not leak between them. Avoid compiling project implementation sources again in each test merely to bypass a target boundary.
 - An instrumented static library contains instrumented objects but does not perform the final executable link. Ensure consumers receive the required sanitizer runtime link options, for example through appropriately scoped target usage requirements or an explicit final-link policy. Apply project instrumentation compile options privately to selected targets; CMake may also carry compatible options into synthesized standard-library BMIs. Verify consumers both with and without their own instrumentation. The current smoke executable also applies the helper, so its passing link does not establish that an arbitrary consumer receives those options. [CMake link options](https://cmake.org/cmake/help/v4.5/command/target_link_options.html)
 - Use `BUILD_INTERFACE` and `INSTALL_INTERFACE` to distinguish public paths in build and install trees. Implement and test exports when installation and a CMake package are actually provided; do not embed machine-specific dependency paths in interfaces.
@@ -195,9 +195,11 @@ The scaffold implements the development, documentation, GMP, GoogleTest, and Goo
 | `DANDELION_BUILD_TESTS` | Implemented: ON for top-level development, OFF as a subproject; the caller may override it. |
 | `DANDELION_BUILD_TOOLING_TESTS` | Implemented: ON at the top level, OFF as a subproject; effective only when tests are enabled. Tooling tests require POSIX, Python 3.8+, clang-format 23.1.5, and clang-tidy 23.1.5. |
 | `DANDELION_BUILD_BENCHMARKS` | Implemented: OFF by default; enable component benchmark targets and their Google Benchmark dependency. |
+| `DANDELION_BUILD_FUZZERS` | OFF by default. Build the frontend session fuzzer with Clang and libFuzzer. |
 | `DANDELION_BUILD_DOCS` | OFF by default. Enable the `dandelion_docs` target with Doxygen 1.17.0 or newer and optional Graphviz `dot`. |
 | `DANDELION_WARNINGS_AS_ERRORS` | Implemented: OFF by default; only explicitly listed owned sources receive `-Werror`. |
 | `DANDELION_ENABLE_SANITIZERS` | Implemented: ON by default for newly configured top-level single-configuration GCC Debug builds, OFF otherwise. The `debug` and `gcc-asan-ubsan` presets enable ASan+UBSan; `release`, `relwithdebinfo`, and `clang-debug` disable them. Users may override the option. |
+| `DANDELION_ENABLE_COVERAGE` | OFF by default. Instrument project sources with Clang source-based coverage and link the profile runtime. |
 | `DANDELION_DEPENDENCY_MODE` | Implemented for GMP, GoogleTest, and Google Benchmark: `EXISTING` or `FETCH`, default `EXISTING`. Existing dependencies are preferred in either mode; `FETCH` permits acquisition when needed. The cache retains the choice until changed. |
 | `GMP_ROOT` | Optional prefix of an existing GMP installation. |
 | `GMP_INCLUDE_DIR`, `GMP_LIBRARY` | Optional explicit GMP header directory and library file; set both together. |
@@ -348,6 +350,41 @@ grouped registration that still runs GoogleTest, accepting coarser CTest
 reporting. A CTest label filters the tests selected for a run.
 
 Corpus regression tests use GoogleTest as well, with helper runners where useful. Make their selection and resource limits explicit, and keep them out of the default small test set through actual registration or configuration controls, not labels alone. Follow the [local dataset policy](testing/README.md#local-benchmark-data), including metadata-safe reads and safe copies for external solvers; do not download datasets without explicit user permission. Missing required inputs must be reported, while unavailable optional inputs must not be recorded as passing tests.
+
+### Clang fuzzing and source coverage
+
+The `clang-fuzz` preset enables `DANDELION_BUILD_FUZZERS` and disables
+GoogleTest by default. The frontend session harness reads length-delimited
+inputs through `Session::FromText` and stops at EOF or the first diagnostic.
+Its sources and the util, Node, and frontend libraries receive
+`-fsanitize=fuzzer-no-link`. The harness executable links with
+`-fsanitize=fuzzer`. Other consumers of the instrumented libraries link the
+sanitizer coverage callbacks through the Clang driver and supply their own
+entry point.
+
+```bash
+CXX=clang++ cmake --preset clang-fuzz
+cmake --build --preset clang-fuzz
+corpus=$(mktemp -d build/clang-fuzz/corpus.XXXXXX)
+cp tests/benchmark/fixtures/capture{,_theories}.smt2 "$corpus/"
+build/clang-fuzz/tests/fuzz/dandelion_frontend_session_fuzzer \
+  -seed=1 -runs=256 -max_len=4096 -timeout=5 \
+  -artifact_prefix=build/clang-fuzz/ "$corpus"
+```
+
+The `clang-coverage` preset enables source coverage with GoogleTest. Use
+`llvm-profdata` and `llvm-cov` from the same LLVM release as Clang. For a
+report from the frontend suite, run the following commands.
+
+```sh
+CXX=clang++ cmake --preset clang-coverage
+cmake --build --preset clang-coverage
+profiles=$(mktemp -d build/clang-coverage/profiles.XXXXXX)
+LLVM_PROFILE_FILE="$PWD/$profiles/%m-%p.profraw" ctest --preset clang-coverage -L frontend
+llvm-profdata merge -sparse "$profiles"/*.profraw -o "$profiles/coverage.profdata"
+llvm-cov report build/clang-coverage/tests/frontend/dandelion_frontend_tests \
+  -instr-profile="$profiles/coverage.profdata"
+```
 
 ## 7. Build Speed and Resource Use
 

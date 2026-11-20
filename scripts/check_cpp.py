@@ -106,16 +106,23 @@ def check_naming(files: list[Path], tool: str, build_dir: Path) -> None:
     database = json.loads(database_path.read_text())
     cache_path = build_dir / "CMakeCache.txt"
     if cache_path.is_file():
-        match = re.search(r"^DANDELION_BUILD_BENCHMARKS:BOOL=(.*)$",
-                          cache_path.read_text(), re.MULTILINE)
-        if match and (match.group(1).upper() in
-                      {"", "0", "OFF", "NO", "FALSE", "N", "IGNORE", "NOTFOUND"}
-                      or match.group(1).upper().endswith("-NOTFOUND")):
-            benchmark_root = (ROOT / "benchmarks").resolve()
-            if any(benchmark_root in path.parents for path in files):
-                print("Skipping benchmark naming checks: benchmarks are disabled.",
-                      flush=True)
-                files = [path for path in files if benchmark_root not in path.parents]
+        cache = cache_path.read_text()
+        for option, source_dir, label in (
+            ("DANDELION_BUILD_BENCHMARKS", "benchmarks", "benchmark"),
+            ("DANDELION_BUILD_FUZZERS", "tests/fuzz", "fuzzer"),
+        ):
+            match = re.search(rf"^{option}:BOOL=(.*)$", cache, re.MULTILINE)
+            if not match:
+                continue
+            value = match.group(1).upper()
+            if (value in {"", "0", "OFF", "NO", "FALSE", "N", "IGNORE", "NOTFOUND"}
+                    or value.endswith("-NOTFOUND")):
+                source_root = (ROOT / source_dir).resolve()
+                enabled_files = [path for path in files if source_root not in path.parents]
+                if len(enabled_files) != len(files):
+                    print(f"Skipping {label} naming checks ({option} is disabled).",
+                          flush=True)
+                    files = enabled_files
     units = [path for path in files if is_unit(path)]
     if not units:
         raise CheckError("No C++ translation units found; no naming checks performed.")

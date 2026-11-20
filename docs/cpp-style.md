@@ -178,10 +178,11 @@ Build trees, `CMakeFiles`, `_deps`, `third_party`, `third-party`, `vendor`,
 symlinked source files are not followed. Keep generated sources in a build or
 `generated` directory, rather than mixing them with owned handwritten files.
 An empty source selection fails with exit code 2 instead of reporting success.
-Formatting always checks the benchmark sources. A naming check reports that it
-skips them when its CMake build explicitly disables benchmarks; configure the
-Clang build with `-DDANDELION_BUILD_BENCHMARKS=ON` to include them. With the
-option enabled, a missing benchmark compilation command remains an error.
+Formatting always checks the benchmark and fuzzer sources. A naming check
+reports that it skips these sources when its CMake build explicitly disables
+their targets. Configure the Clang build with `-DDANDELION_BUILD_BENCHMARKS=ON`
+or `-DDANDELION_BUILD_FUZZERS=ON` to include them. Each enabled source still
+requires a compilation command.
 
 Formatting covers headers directly. Tidy checks owned headers when parsed by a
 selected translation unit, using an exact-path header filter computed from the

@@ -526,4 +526,50 @@ TEST_F(CppToolsTest, NamingChecksBenchmarkSourcesWhenEnabled) {
       << result.error;
 }
 
+TEST_F(CppToolsTest, NamingChecksFuzzerSourcesWhenEnabled) {
+  const fs::path project = directory_ / "fuzzer-naming";
+  const fs::path build = project / "build";
+  const fs::path script = project / "scripts/check_cpp.py";
+  fs::create_directories(script.parent_path());
+  fs::copy_file(fs::path(kDandelionSourceDir) / "scripts/check_cpp.py", script);
+  fs::copy_file(fs::path(kDandelionSourceDir) / ".clang-tidy",
+                project / ".clang-tidy");
+  WriteFile(project / "CMakeLists.txt",
+            "cmake_minimum_required(VERSION 4.5)\n"
+            "project(TidyFuzzerFixture LANGUAGES CXX)\n"
+            "option(DANDELION_BUILD_FUZZERS \"Build fuzzers\" OFF)\n"
+            "add_library(probe OBJECT src/probe.cc)\n"
+            "if(DANDELION_BUILD_FUZZERS)\n"
+            "  add_library(fuzz OBJECT tests/fuzz/probe.cc)\n"
+            "endif()\n");
+  WriteFile(project / "src/probe.cc", "int ComputeValue() { return 1; }\n");
+  WriteFile(project / "tests/fuzz/probe.cc",
+            "int FuzzOneInput() { return 0; }\n");
+  auto result = Run({"cmake", "-S", project.string(), "-B", build.string(),
+                     "-G", "Ninja", "-DCMAKE_CXX_COMPILER=clang++",
+                     "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"});
+  ASSERT_EQ(result.exit_code, 0) << result.output << result.error;
+  result = Run({kDandelionPython, script.string(), "tidy", "--build-dir",
+                build.string()});
+  EXPECT_EQ(result.exit_code, 0) << result.output << result.error;
+  EXPECT_NE(result.output.find("Checked 1 project translation units"),
+            std::string::npos);
+
+  result = Run({"cmake", "-S", project.string(), "-B", build.string(),
+                "-DDANDELION_BUILD_FUZZERS=ON"});
+  ASSERT_EQ(result.exit_code, 0) << result.output << result.error;
+  result = Run({kDandelionPython, script.string(), "tidy", "--build-dir",
+                build.string()});
+  EXPECT_EQ(result.exit_code, 0) << result.output << result.error;
+  EXPECT_NE(result.output.find("Checked 2 project translation units"),
+            std::string::npos);
+
+  WriteFile(project / "tests/fuzz/unregistered.cc", "int Unregistered();\n");
+  result = Run({kDandelionPython, script.string(), "tidy", "--build-dir",
+                build.string()});
+  EXPECT_EQ(result.exit_code, 2) << result.output << result.error;
+  EXPECT_NE(result.error.find("No compilation command"), std::string::npos)
+      << result.error;
+}
+
 }  // namespace
