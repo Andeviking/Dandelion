@@ -3,7 +3,7 @@
 This document records the first-version contracts and the implemented Phase 1
 and Phase 2 additions. [Phase 1C](#10-phase-1c-numeric-boundary-and-typed-literals)
 specifies the typed literal API and the boundary between Node and util.
-[Node overview](README.md)
+[Node overview](../node/README.md)
 
 The companion [operator specification](operators.md) and
 [implementation plan](implementation.md) specify the representation and

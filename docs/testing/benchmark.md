@@ -2,7 +2,7 @@
 
 Status: **test design for the Google Benchmark integration**. The benchmark
 programs are performance workloads, not a replacement for GoogleTest.
-This document applies [the common testing strategy](README.md) and the
+This document applies [the common testing strategy](../testing/README.md) and the
 test-first rules in [AGENTS.md](../../AGENTS.md).
 
 ## Dependency and build contracts

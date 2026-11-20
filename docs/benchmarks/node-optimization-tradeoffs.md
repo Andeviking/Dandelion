@@ -33,7 +33,7 @@ setup. Peak RSS includes the loaded fixture, setup, allocator, and runtime.
 Requested node, metadata, and table bytes come from the manager. RSS
 snapshots at a lifecycle boundary measure current residency. The SMT-LIB
 parser and solver have their own timing boundaries.
-[Benchmark guide](README.md) · [Workload definitions](node-workloads.md)
+[Benchmark guide](../benchmarks/README.md) · [Workload definitions](node-workloads.md)
 
 ## Round 1 · Interning, allocation alignment, and traversal state
 

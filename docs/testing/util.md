@@ -2,7 +2,7 @@
 
 **Status.** The numeric GoogleTest suites run against `dandelion_util`.
 The Node and frontend suites cover the typed numeric boundaries.
-[Common testing strategy](README.md), [numeric specification](../util/README.md),
+[Common testing strategy](../testing/README.md), [numeric specification](../util/README.md),
 [test-first rules](../../AGENTS.md)
 
 Add each scoped suite before implementing its behavior. Keep all required

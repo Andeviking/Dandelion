@@ -6,7 +6,7 @@ acceptance requirements. The review did not independently verify the current
 tree or completeness of every subcase. [Phase 1C](#phase-1c-typed-literals-and-inline-numeric-payloads)
 covers the numeric boundary and payloads. See the first-version
 [feature inventory](node-inventory.md) and [acceptance record](node-acceptance.md).
-This document applies the [common testing strategy](README.md) and
+This document applies the [common testing strategy](../testing/README.md) and
 [AGENTS.md](../../AGENTS.md) test-first requirements to the full
 [node design](../node/design.md), [operator specification](../node/operators.md)
 and [implementation plan](../node/implementation.md). It specifies required behavior; the acceptance record contains execution

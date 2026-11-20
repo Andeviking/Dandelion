@@ -3,7 +3,7 @@
 **Status.** Phase 1 and Phase 2 suites are implemented, with historical verified runs recorded in the implementation record. The review did not independently verify the current tree or complete coverage of each required subcase; the cases below remain acceptance requirements.
 The [acceptance record](../frontend/implementation.md) identifies the
 configurations and corpus slice exercised. This document applies the
-[testing strategy](README.md) to SMT-LIB input, name resolution, typing,
+[testing strategy](../testing/README.md) to SMT-LIB input, name resolution, typing,
 and construction of the terms passed to the solver.
 
 ## Contract and input scope
