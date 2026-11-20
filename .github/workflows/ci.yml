@@ -64,9 +64,11 @@ jobs:
       - name: Configure
         env:
           PRESET: ${{ matrix.preset }}
+          BUILD_BENCHMARKS: ${{ matrix.name == 'clang-debug' && 'ON' || 'OFF' }}
         run: |
           cmake --preset "$PRESET" -B "$BUILD_DIR" \
             -DDANDELION_BUILD_TESTS=ON \
+            -DDANDELION_BUILD_BENCHMARKS="$BUILD_BENCHMARKS" \
             -DDANDELION_DEPENDENCY_MODE="$DANDELION_DEPENDENCY_MODE" \
             -DDANDELION_WARNINGS_AS_ERRORS="$DANDELION_WARNINGS_AS_ERRORS" \
             -DDANDELION_SUBPROJECTS_DIR="$DANDELION_SUBPROJECTS_DIR"
@@ -75,15 +77,15 @@ jobs:
       - name: Test
         working-directory: ${{ env.BUILD_DIR }}
         run: ctest --output-on-failure --no-tests=error
+      - name: Check C++ naming
+        if: matrix.name == 'clang-debug'
+        run: python3 scripts/check_cpp.py tidy --build-dir build/clang-debug
 
   quality:
     name: Quality
     runs-on: ubuntu-24.04
     container:
       image: ${{ vars.DANDELION_CI_IMAGE || 'ghcr.io/andeviking/dandelion-ci:toolchain-v1' }}
-    env:
-      CC: clang
-      CXX: clang++
     steps:
       - uses: actions/checkout@v6
         with:
@@ -108,16 +110,6 @@ jobs:
           fi
       - name: Check C++ formatting
         run: python3 scripts/check_cpp.py format-check
-      - name: Configure Clang for naming checks
-        run: |
-          cmake --preset clang-debug \
-            -DDANDELION_BUILD_TESTS=ON \
-            -DDANDELION_BUILD_BENCHMARKS=ON \
-            -DDANDELION_DEPENDENCY_MODE="$DANDELION_DEPENDENCY_MODE" \
-            -DDANDELION_WARNINGS_AS_ERRORS="$DANDELION_WARNINGS_AS_ERRORS" \
-            -DDANDELION_SUBPROJECTS_DIR="$DANDELION_SUBPROJECTS_DIR"
-      - name: Build and check C++ naming
-        run: python3 scripts/check_cpp.py tidy --build-dir build/clang-debug
 
   docs:
     name: Documentation
