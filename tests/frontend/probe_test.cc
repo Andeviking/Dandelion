@@ -27,12 +27,18 @@ std::string ReadFile(std::FILE* file) {
   return result;
 }
 
+struct FileCloser {
+  void operator()(std::FILE* file) const noexcept {
+    if (file) std::fclose(file);
+  }
+};
+
 ProbeResult RunProbe(std::string_view input,
                      std::initializer_list<std::string_view> options = {}) {
-  using File = std::unique_ptr<std::FILE, decltype(&std::fclose)>;
-  const File source(std::tmpfile(), &std::fclose);
-  const File output(std::tmpfile(), &std::fclose);
-  const File diagnostics(std::tmpfile(), &std::fclose);
+  using File = std::unique_ptr<std::FILE, FileCloser>;
+  const File source(std::tmpfile());
+  const File output(std::tmpfile());
+  const File diagnostics(std::tmpfile());
   if (!source || !output || !diagnostics)
     throw std::runtime_error("Could not create probe capture files");
   if ((!input.empty() && std::fwrite(input.data(), 1, input.size(),

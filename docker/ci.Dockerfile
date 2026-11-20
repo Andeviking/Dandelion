@@ -35,7 +35,7 @@ FROM gcc:16.2.0@sha256:531d94a9eb84cb69df20050ddde80d308bf8650c83f4cb0accf4ef39b
 
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-       ca-certificates git graphviz libgmp-dev pkg-config python3 unzip xz-utils \
+       ca-certificates git graphviz libgmp-dev pkg-config python3 time unzip xz-utils \
     && rm -rf /var/lib/apt/lists/*
 
 RUN --mount=type=bind,from=archives,source=/archives,target=/tmp/ci-archives <<'SH'
