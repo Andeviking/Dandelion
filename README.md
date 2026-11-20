@@ -75,6 +75,10 @@ with tests enabled and uses `build/<preset>`.
 | `relwithdebinfo` | RelWithDebInfo | Off | GCC or Clang |
 | `clang-debug` | Debug | Off | Clang (`CXX=clang++`) |
 | `gcc-asan-ubsan` | Debug | On | GCC (`CXX=g++`) |
+| `clang-fuzz` | RelWithDebInfo | On | Clang (`CXX=clang++`, libFuzzer) |
+| `clang-coverage` | Debug | Off | Clang (`CXX=clang++`, `llvm-cov`) |
+
+Note: `clang-fuzz` and `clang-coverage` require Clang's `compiler-rt` fuzzer/profile runtimes (`clang-fuzz` builds with tests off; see [docs/cmake.md](docs/cmake.md)).
 
 CMake defaults to `DANDELION_DEPENDENCY_MODE=EXISTING`. Use
 `-DDANDELION_BUILD_TESTS=OFF` for a library-only build or
