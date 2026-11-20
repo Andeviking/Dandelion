@@ -1,182 +1,191 @@
 # FloatingPointValue and Concrete Evaluation
 
-Status: **proposed design for review**. Node classification and NaN
-normalization already exist; the value class, arithmetic and concrete
-evaluator do not. This is a complete semantic design with an initial exact
-algorithm, not a claim that symbolic FP lowering or FP solving is implemented.
+**Status.** The standalone value and concrete evaluator are implemented
+in Phase 3.
 
-The frontend's numeric bridge exposes checked `RoundRationalToFp` for
-concrete model rendering. It returns a sign and exact stored exponent and
-trailing significand, or a signed infinity. The implementation uses an
-exact GMP quotient and remainder, including subnormal and overflow cases.
-The broader ground evaluator described below remains future work.
+## Format, value, and identity
 
-## Value and format
+`FpFormat{e, s}` keeps two `uint32_t` fields with read-only access. The
+exponent and significand widths satisfy `e,s >= 2`, and
+`e+s <= UINT32_MAX`. The significand width includes the implicit leading
+bit. A checked format factory establishes the invariant by validating
+exact Integer widths before narrowing. A width below two
+gives `kInvalidArgument`. A positive width pair beyond any component
+or sum capacity gives `kSizeLimit`. A valid format can hold special
+values even if a later computation requires large backing storage.
 
-`FloatingPointValue` owns `(e,s,category,finite_bits)` independently of any
-node manager. `e,s >= 2`, and the retained node representation requires
-`e+s <= UINT32_MAX`. An independently checked factory distinguishes invalid `e,s`
-from a valid but unrepresentable size. A format can be accepted even when a
-later operation encounters an actual allocation or representation failure.
-There is no Float32/Float64 assumption. Category is NaN, positive/negative
-infinity, positive/negative zero, or nonzero finite interchange bits. For
-each format all NaN bit patterns
-become one abstract NaN, while the two zeros differ under core equality.
-For typed objects format is part of equality and hash; SMT-LIB's formal
-description shares the abstract NaN across sorts, but nodes and values are
-typed and comparisons require the same format.
+`FloatingPointValue` occupies 24 bytes on the supported 64-bit target.
+It contains the format, a `uint32_t limb_count`, an `FpCategory`
+with an 8-bit underlying type, and a union of `uint64_t word` and
+exclusive `uint64_t* limbs`. The categories, in order from zero, are
+`kNaN`, `kPositiveInfinity`, `kNegativeInfinity`, `kPositiveZero`,
+`kNegativeZero`, and `kFiniteBits` for nonzero finite values. Specials
+carry only category and format, with a zero count and zero word. For a
+finite nonzero value the payload is the packed sign/exponent/fraction
+encoding. A zero count selects an inline word for at most 64 effective
+bits. The wide form uses trimmed little-endian 64-bit limbs, with a
+nonzero top limb. The declared format and the effective payload size
+are independent. Move resets to F(2,2) positive zero.
+[Shared ownership and failures](design.md)
 
-`FromBits(format,bv)` requires exactly `e+s` bits and classifies the sign,
-`e` exponent bits and `s-1` fraction bits. An alternate checked Integer
-factory requires nonnegative bits with bit length at most `e+s`, matching
-`MakeFpBits`. `Special(format,kind)` constructs special values without
-materializing a huge bit string. `Classify`, sign, normal/subnormal, zero,
-infinite and NaN predicates, core equality/hash and IEEE comparisons are
-read-only. `fp.isNegative` and `fp.isPositive` are both false for NaN. IEEE
-`fp.eq` is false for NaN and true for opposite zeros; ordered comparisons
-are false if either operand is NaN. Core equality identifies same-format NaNs
-and distinguishes zeros. A representative NaN bit string may be produced for
-internal encoding only when a concrete bit-vector is actually needed; it is
-not a unique inverse of `to_fp` or a supported `fp.to_ieee_bv` input.
+In interchange order the high bit is the sign, followed by `e` exponent
+bits and `s-1` stored fraction bits. An all-one exponent with a nonzero
+fraction denotes the canonical abstract NaN, irrespective of sign or
+payload. An all-one exponent with a zero fraction denotes signed infinity.
+A zero exponent and zero fraction denote signed zero. All other patterns
+are finite and nonzero. With sign `t`, exponent field `E`, fraction `f`,
+and bias `B=2^(e-1)-1`, the finite magnitude and scale are
 
-Diagnostic output includes the format and category, or the exact sign,
-exponent and fraction fields for finite nonzero values. The SMT-LIB model
-printer can emit the standard special forms and `(fp sign exponent fraction)`
-for other values; it must use exactly the declared field widths and preserve
-signed zero. Printing a huge field can require substantial output and storage.
-Neither a formatted decimal approximation nor an arbitrary NaN encoding is a
-replacement for the value's core identity.
+| Case | `M` | `k` in `(-1)^t * M * 2^k` |
+| --- | --- | --- |
+| Subnormal, `E=0` | `f` | `1-B-(s-1)` |
+| Normal | `2^(s-1)+f` | `E-B-(s-1)` |
 
-For nonzero finite bits, let `B=2^(e-1)-1`, exponent field `E`, fraction
-integer `f` and sign bit `t`. The exact value is
-`(-1)^t * f * 2^(2-B-s)` when `E=0`, and
-`(-1)^t * (2^(s-1)+f) * 2^(E-B-(s-1))` otherwise. The field with all exponent
-bits one is infinity when `f=0`, NaN otherwise. This definition includes
-subnormals. The bias or exponent may itself be too large to materialize: use
-checked symbolic/large-integer exponent comparisons or return a resource
-outcome before an oversized shift. Classification and special construction
-must not allocate a `2^e` mask merely to inspect a short bit payload.
+`FromBits` takes a BV of width exactly `e+s`. A checked packed Integer
+overload accepts a nonnegative value of effective length at most
+`e+s`. An encoding outside that range gives `kValueOutOfRange`.
+`FromFields` derives the format from a BV1 sign, exponent field of
+width `e`, and fraction field of width `s-1`, validates the resulting
+format, and then classifies. A field-width mismatch or invalid
+special-category argument gives `kInvalidArgument`. `Special`
+constructs each canonical special without materializing a bit string.
+Use field ranges and actual payload chunks for classification. Sparse
+or short arguments need no width-sized classification mask.
 
-`RoundingMode` has exactly RNE (ties to even), RNA (ties away), RTP, RTN and
-RTZ. Validate an externally supplied enum. Move its single definition from
-the node interface to a shared FP-facing module and re-export it, preserving
-enumerator names, values and rebuilt-source compatibility, without promising
-a binary ABI. Representation,
-borrowed views and failure guarantees follow [design.md](design.md); a node
-view pairs the existing sort and payload without allocating or extending its
-lifetime.
+Core equality and hash include the format and category, plus the packed
+finite payload when present. Same-format NaNs compare equal under core
+equality. The two zeros are distinct. Expose format, category, field
+inspection, and the seven `fp.is*` predicates. Both sign predicates
+are false on NaN and report the recorded sign on zeros and infinities.
+Numerical comparison of finite same-format values uses ordered exponent
+and fraction fields with sign handling and requires no dyadic expansion.
+A checked representative-bits operation encodes exact interchange bits
+for all non-NaNs and can encode NaN as sign zero, all-one exponent and
+fraction one. That internal encoding convention gives no SMT-LIB
+`fp.to_ieee_bv` operation and recovers no original NaN payload.
+The frontend owns SMT-LIB rendering. [SMT-LIB FloatingPoint, 2024-07-21](https://smt-lib.org/theories-FloatingPoint.shtml)
 
-## Ground operation contract
+## Ground semantics
 
-Arithmetic requires equal operand formats except explicit conversion.
-Every operation either returns a **defined** value, an allowed **choice**, or
-an **unspecified** result; the enclosing `NumericResult` separately reports
-invalid input, limits, cancellation and allocation failure. A choice is a
-semantic outcome, never an allocation error. The caller must not turn a
-choice or unspecified result into an unconditional rewrite.
+`RoundingMode` has an 8-bit underlying type with `kRne`, `kRna`,
+`kRtp`, `kRtn`, `kRtz` in that order starting at zero.
+Validate supplied enum values. RNE rounds to nearest with ties to even,
+RNA rounds to nearest with ties away from zero, RTP toward positive
+infinity, RTN toward negative infinity, and RTZ toward zero. Arithmetic
+and IEEE predicates require equal operand formats except for explicit
+conversions. Mismatched formats and invalid modes give
+`kInvalidArgument`. Apply each operation's special cases before
+invoking finite arithmetic. The formal semantics determines the results
+where the theory declaration is informal. [Formal FP semantics, §§ IV–VI](https://smt-lib.org/papers/BTRW15.pdf)
 
-| Input operations | Concrete result and special requirements |
+| Operation | Contract |
 | --- | --- |
-| `fp`, `to_fp(bits)` | Combine fields or reinterpret packed bits, then classify and canonicalize NaN. These do not perform numeric rounding. |
-| `abs`, `neg` | Exact sign transformation, with abstract NaN remaining NaN and signed zero/infinity handled explicitly. |
-| `add`, `sub`, `mul`, `div` | IEEE/SMT-LIB exact special-case rules; otherwise calculate the exact mathematical result and round once in the requested mode. Preserve signed-zero rules, including exact cancellation under RTN. FP division by zero has specified FP results and is not integer division by zero. |
-| `fma` | Compute `a*b+c` with unbounded exact intermediate and **one** final rounding, including its special cases. Never round the product first. |
-| `sqrt` | Exact square-root rounding; negative finite nonzero and negative infinity produce NaN; `sqrt(-0)=-0`. |
-| `rem` | IEEE remainder `x - n*y`, `n` nearest integer to exact `x/y` with ties to even, and specified NaN/infinity/zero cases; a zero result has the dividend's sign. No RM argument. |
-| `roundToIntegral` | Round the exact finite value to an integer according to the RM and encode it as FP; preserve the required sign of zero. NaN and infinities remain their categories. |
-| `min`, `max` | For a single NaN return the other argument, both NaN return NaN; ordered unequal numbers select the appropriate operand. Opposite signed zeros return a choice restricted to those two values. Do not assume the reversed argument order has the same choice unless justified by the applicable formal semantics. |
-| `eq`, `lt`, `leq`, `gt`, `geq`; classification | IEEE comparison as above; node evaluator folds chainable comparisons over adjacent arguments. |
-| FP-to-FP, signed/unsigned BV-to-FP, Rational-to-FP | Numeric conversion with explicitly supplied RM and target format, exact source interpretation and one correct rounding; preserve FP source signed zero and specials. A Real/rational zero has no negative zero. |
-| Finite FP to exact dyadic or Rational | Return the exact finite mathematical value; expose zero's sign separately if the caller needs it. NaN and infinity have no Rational value. Materializing a numerator or power-of-two denominator may require substantial storage even when the FP value is already representable. |
-| `fp.to_sbv`, `fp.to_ubv` | Round finite source to an integer first, then check the respective signed/unsigned `w`-bit range and encode. NaN, infinity, or a rounded integer outside the range yield an unspecified `BV(w)` value, not a chosen fixed bit pattern. A negative fraction rounded to zero can be in range. |
+| `fp`, `to_fp(bits)` | Assemble fields or reclassify interchange bits, without rounding. |
+| `fp.abs`, `fp.neg` | Clear or toggle the sign on non-NaNs, including specials. NaN remains canonical. |
+| `fp.add`, `fp.sub`, `fp.mul`, `fp.div` | Evaluate the exact finite operator and round once. Subtraction uses addition with the second sign reversed. Apply the special cases below. |
+| `fp.fma` | Round the exact product-plus-addend once. Apply the special rules for zero times infinity and for an infinite product combined with the opposite infinity. |
+| `fp.sqrt` | Round the exact positive root. NaN, negative finite nonzero, and negative infinity give NaN. Positive infinity and each signed zero return themselves. |
+| `fp.rem` | For finite operands and nonzero divisor, return the exact `x - n*y`, with `n` the nearest integer to exact `x/y`, ties to even. A zero result has the dividend's sign. |
+| `fp.roundToIntegral` | Round to the integral FP lattice in the requested mode. Preserve the source sign on zero and return existing zeros, infinities, and NaN as supplied. When a rounded integer crosses beyond the largest finite integral value, map the virtual upper endpoint to signed infinity. |
+| `fp.min`, `fp.max` | One NaN returns the other value, two NaNs return NaN. Ordered unequal operands select the appropriate one. Identical operands return that value. Opposite signed zeros give exactly the two allowed results. |
+| `fp.eq`, `fp.lt`, `fp.leq`, `fp.gt`, `fp.geq` | False if either argument is NaN. Compare numerical values otherwise, treating both zeros as equal. The node evaluator handles adjacent chains. |
+| `fp.isNormal`, `fp.isSubnormal`, `fp.isZero`, `fp.isInfinite`, `fp.isNaN`, `fp.isNegative`, `fp.isPositive` | Classify by the format and categories above. |
+| `RoundRationalToFp` | Round an exact Rational in the specified target format and mode. Exact rational zero gives positive zero. |
+| FP-to-FP, signed and unsigned BV-to-FP | Round the exact source value in the requested target format and mode. FP conversion preserves source signed zero, infinity sign, and canonical NaN. Interpret BV input explicitly as signed or unsigned. |
+| Finite FP to exact Rational | Checked utility conversion returns the exact finite value. Both zeros map to `0/1`, with sign available separately from the source. NaN and infinity give `kInvalidArgument`. |
+| `fp.to_sbv`, `fp.to_ubv` | Validate target width and mode, then round the source to an integer. Return a defined residue when the rounded integer fits the selected signed or unsigned range. NaN, infinities, and rounded out-of-range values give an unspecified result of that width. |
 
-For the arithmetic rows, the special-case dispatch is part of the contract:
+A NaN operand gives NaN for addition, subtraction, multiplication,
+division, fma, and remainder. Opposite infinities in a sum, zero times
+infinity, zero divided by zero, and infinity divided by infinity give
+NaN. The fma cases above also give NaN. Otherwise, adding a lone
+infinity or two infinities of the same sign returns that infinity.
+Products and quotients use the XOR of signs, including finite nonzero
+divided by zero, infinity divided by a finite operand, zero divided
+by finite nonzero, and finite divided by infinity. For a zero exact
+sum, equal-sign zero operands preserve their sign. Other exact zero
+sums give negative zero only under RTN. Apply that rule to the exact
+fma product and addend, taking the zero product's sign from its
+multiplicands. A nonzero finite result rounded to zero keeps its
+mathematical sign. Remainder gives NaN for infinite dividend or zero
+divisor, and returns a finite dividend unchanged for an infinite
+divisor.
 
-- A NaN input produces NaN in arithmetic, including fma, sqrt, rem and
-  integral rounding. In addition, adding opposite infinities, multiplying
-  zero by infinity, dividing zero by zero or infinity by infinity, and fma
-  with a zero-times-infinity product or an infinite product plus the
-  opposite infinity produce NaN. Subtraction applies the corresponding
-  addition rule after negating its second operand.
-- Otherwise, multiplication and division use the XOR of operand signs for
-  zero and infinity results. Finite nonzero divided by signed zero gives
-  signed infinity; zero divided by finite nonzero or finite divided by
-  infinity gives signed zero; an infinite product or quotient has the
-  corresponding signed infinity. Addition of a lone infinity yields it.
-- For an exact zero sum, equal-sign zero operands retain their common sign;
-  otherwise the result is negative zero under RTN and positive zero under
-  the other modes. Apply the same rule to fma's exact product-plus-addend,
-  including signed zero products, with only one rounding.
-- Remainder is NaN for an infinite dividend or zero divisor; a finite
-  dividend with an infinite divisor returns the dividend. An exact zero
-  remainder carries the dividend's sign. `roundToIntegral` preserves the sign
-  of a zero result, and leaves infinity and existing zeros unchanged.
+For FP-to-unsigned-BV the range test applies to the rounded integer.
+A negative fraction can round to zero and produce a defined BV.
+`Min`, `Max`, `ToSignedBv`, and `ToUnsignedBv` use the tagged
+outcomes in the shared design. Model callers keep choices consistent for
+equal ordered semantic arguments. Opposite argument orders are separate
+tuples and may choose independently. [FP outcomes and solver callers](design.md#concrete-fp-outcomes-and-solver-callers)
 
-The [formal FP semantics](https://www.ccs.neu.edu/home/wahl/Publications/btrw15.pdf)
-has precedence where the [theory declaration](https://smt-lib.org/theories-FloatingPoint.shtml)
-is inconsistent: its informal note calls all negative inputs to unsigned
-conversion out of range, while the formal rule checks the rounded integer.
-The latter is the existing Dandelion node contract. No exception flags,
-signaling NaN payloads, host FP environment, or general Real expression is
-part of this value domain.
+## Exact rounding kernel
 
-For opposite-zero min/max the caller retains the allowed two-result set; for
-invalid FP-to-BV it retains the whole destination domain. The solver/model
-must assign one interpretation per operation, format/indices and equal
-**semantic argument tuple**, including RM and canonical NaN, across distinct
-node identities, UF, arrays and DT fields. Separate operation symbols and
-ordered argument tuples cannot be equated without proof. A model may choose
-an allowed result, but a rewrite that commits to one choice can remove other
-valid models and change satisfiability. Symbolic encoding must preserve the
-same constraints and congruence, including when multiple NaN bit patterns
-encode the same value.
+Use GMP-backed integer arithmetic and a private finite `Dyadic` form
+`(-1)^sign * M * 2^k`, with nonnegative integer magnitude `M` and
+wide signed Integer exponent `k`. Keep the zero sign separately.
+Operations may retain a fraction as `N/D * 2^k` with positive `N,D`
+and separate sign. Use these representations of exponents and scales
+through comparison and rounding. An exponent may exceed a machine word
+while its signed binary representation is small. Compare exact
+exponents and bit lengths before materializing shifts.
 
-## Exact baseline without MPFR
+For a positive exact magnitude use bit lengths and a shifted
+comparison to find its leading exponent `L=floor(log2(N/D))+k`.
+Let `emin=1-B` and `emax=B`. The rounding quantum is `2^q`, with
+`q=max(L,emin)-(s-1)`. For magnitudes well below half a subnormal
+quantum or with `L>emax`, choose the result by mode, sign, and the
+proven range before scaling. Otherwise compute the floor coefficient
+and classify its fractional part as zero, below half, half, or above
+half. Quotient/remainder of appropriately scaled operands gives this
+classification by comparing twice the remainder to its divisor.
+Use exact shifted comparisons when the same classification needs
+no materialized shift. Round to the low or high coefficient by mode.
+At a tie, RNE chooses the coefficient with an even low bit and RNA
+chooses away from zero. Directed modes increase magnitude only on an
+inexact result in their outward direction.
 
-Use GMP-backed Integer/Rational machinery, with a private signed dyadic
-`(sign, significand, exponent)` working form for finite FP inputs. It is an
-algorithm-local representation, not a fifth public numeric domain. Handle
-special values before finite arithmetic. Compute exact dyadic sums/products,
-an exact quotient for division and rational conversion, and a common rounding
-routine with guard/remainder or exact comparisons. The input sign and signed
-zero must be carried separately because rational zero loses that information.
-For sqrt, scale the positive rational/dyadic to the target binade and compare
-integer squares against exact midpoint squares; integer square root plus
-remainder suffices to select adjacent representable values without host FP.
-For `rem`, determine the nearest-even integer quotient exactly before the
-subtraction. Operations may exploit early exponent comparisons and sticky
-bits to avoid enormous shifts, but an optimization must prove equivalence to
-exact rounding, especially for cancellation and ties.
+A rounded coefficient may carry into the next binade or from the
+subnormal grid into normal range. Encode zero with the required sign.
+At the top binade, use the virtual next power of two above maximum
+finite as the outward endpoint. For nearest modes the midpoint
+between maximum finite and that endpoint is the overflow threshold.
+Round to signed infinity if the selected unbounded-exponent result
+exceeds the finite exponent range. For directed overflow, outward
+rounding produces signed infinity and inward rounding gives signed
+maximum finite. Close to underflow and overflow, use exact half
+comparisons rather than pre-rounding to a host FP format.
 
-The rounding routine identifies the target normal binade or subnormal quantum,
-computes floor quotient and exact remainder, and selects adjacent candidates:
-RNE compares twice the remainder with the denominator and breaks a tie by an
-even low bit; RNA breaks a tie away from zero; directed modes choose according
-to sign and direction. Normalize a carry into the next binade, preserve
-required zero signs, and apply IEEE overflow after precision rounding: nearest
-and outward-directed rounding can produce infinity, inward-directed rounding
-produces the signed maximum finite value. Test both sides of each boundary.
-`fma` must retain enough exact intermediate information to avoid double
-rounding. Exponent differences, shifts, intermediate products, square roots
-and output size are checked against actual representation and allocation
-requirements. Do not add a discretionary computation budget. If exact
-computation cannot complete, retain a term symbolically or use another sound
-path, subject to the solver's result contract. Never
-round an approximation without an error bound proving the same answer.
+| Operator | Finite reduction |
+| --- | --- |
+| Add, subtract, fma | Sum two signed dyadics with the procedure below. For fma one term is the exact product. |
+| Multiply, divide | Multiply magnitudes and add exponents. For division keep a numerator, denominator, and exponent difference and round the quotient once. |
+| Square root | Halve the leading exponent, rounded downward, to locate the target binade. After scaling the radicand to the squared quantum, use integer square root of the floored radicand to get the low coefficient. Compare with the square of that coefficient for exactness and with the exact square of the midpoint for nearest rounding. |
+| Remainder | Work with magnitudes and write `abs(x/y)=Mx*2^d/My`, where `d=kx-ky`. For `d>=0`, compute the numerator residue modulo `2*My` by modular exponentiation. The upper half of that residue gives the floor quotient's odd parity and its residue modulo `My` gives the remainder coefficient. Subtract `My` from the coefficient when nearest-even rounds the quotient upward. Apply the dividend's sign to the adjusted coefficient and scale by `2^ky`. For `d<0`, return the dividend directly when the quotient magnitude is at most one half. Otherwise use the same parity and adjustment rules with divisor `My<<(-d)` and scale `2^kx`. This shift is bounded by the significand lengths. The resulting dyadic is exact. |
+| Integral rounding and FP-to-BV | Round against quantum one. An already integral source can stay in dyadic form. For `roundToIntegral` the rounded integer is either exactly encodable or the virtual integer endpoint at the next binade, which encodes as signed infinity. In F(2,4), RNE maps `3.5` to positive infinity and RTZ maps it to `3`. For FP-to-BV, compare the rounded magnitude and sign against the integer bounds before materializing a wide result. |
+| Numeric conversions | Reuse the same rounder with the target format, exact components, and source sign. For exact conversion to Rational shift the numerator or denominator according to the exponent after cancelling powers of two, checking the actual count. |
 
-This baseline is feasible using GMP's integer primitives but may be expensive,
-particularly for huge exponent differences, division, fma and sqrt; no
-performance claim is made. A future MPFR backend is an alternative only after
-an explicit dependency decision. MPFR precision and exponent range are
-finite; emulate target subnormals and overflow with the correct ternary
-rounding information, support RNA correctly, and isolate any library exponent
-range/thread-local state. Verify NaN, signed zero, all SMT underspecified
-cases and target formats independently; MPFR alone does not supply symbolic
-FP-to-BV encoding or guarantee support for every representable format. See
-[MPFR 4.2.1 manual](https://www.mpfr.org/mpfr-4.2.1/mpfr.pdf).
+For a sum, handle zero terms and order the remaining terms by leading
+exponent. Let `q` be the rounding quantum at the term with the higher
+leading exponent, and let `k` be that term's dyadic scale. Within
+one eighth of the quantum, rounding boundaries lie on the
+`2^(q-2)` lattice, including immediately below a binade boundary.
+The dominant term lies on the `2^k` lattice. Their minimum lattice
+spacing, `2^min(k,q-2)`, bounds every positive distance from the
+dominant term to a rounding boundary in that interval.
 
-The proposed architecture's symbolic word-blaster is a separate component.
-SymFPU is a candidate, not a dependency selected here; it requires its own
-version, license, format support and consistency evaluation. Even if the same
-library can evaluate concrete and symbolic operations, those paths are not
-independent correctness oracles.
+When the tail is smaller than `2^(min(k,q-2)-1)`, use that power of two
+with the tail's original sign. The replacement stays on the same side
+of every rounding boundary, including one at the dominant term itself.
+Otherwise align the original terms exactly. The materialized shift is
+bounded by their significand lengths and the target precision. This
+also covers cancellation and rounding after the exact product in FMA.
+
+Check GMP and C++ storage requirements for every materialized shift,
+product, and result. Keep the working exponent wide until a checked
+size or shift count is needed. A calculation may report an actual
+representation or C++ allocation failure under the shared policy.
+The interval path must prove the same rounded result as exact
+arithmetic. MPFR is an optional test-only oracle. The runtime kernel
+uses GMP and has no MPFR, host FP environment, exception-flag, or
+symbolic lowering dependency. [Numeric tests](../testing/util.md),
+[research evidence](research.md)

@@ -5,6 +5,7 @@ import std;
 namespace dandelion::frontend::detail {
 struct Signature;
 struct SessionState;
+class Scanner;
 class Transaction;
 struct ModelValue;
 struct ModelState;
@@ -54,6 +55,8 @@ using Outcome = std::expected<T, Diagnostic>;
 using ReadResult = std::expected<std::size_t, std::error_code>;
 // A positive size means bytes available now. Zero is EOF. A callback may
 // block until input is available, then must return without waiting to fill.
+// During a callback, Session getters expose the committed state. Recursive
+// reads and runs on the same instance fail with kInvalidState.
 using Reader = std::function<ReadResult(std::span<char>)>;
 
 enum class SessionPhase { kBeforeLogic, kBuilding, kAfterCheck, kTerminated };
@@ -85,6 +88,8 @@ struct CommandHeader {
 };
 struct ParseOptions {
   bool canonicalize_commutative = false;
+  bool capture_source_records = false;
+  bool strict_metadata = false;
 };
 struct SessionOptions {
   bool print_success = false;
@@ -115,66 +120,34 @@ struct UserSort {
   std::string source_name;
   SourceSpan where;
 };
-// Both views borrow spelling storage owned by the containing query.
-class SourceNameView {
- public:
-  SourceNameView() noexcept = default;
-  std::string_view Canonical() const noexcept { return {data_, size_ >> 1}; }
-  bool IsQuoted() const noexcept { return (size_ & 1) != 0; }
-  friend bool operator==(SourceNameView name,
-                         std::string_view spelling) noexcept {
-    if (!name.IsQuoted()) return name.Canonical() == spelling;
-    return spelling.size() >= 2 && spelling.front() == '|' &&
-           spelling.back() == '|' &&
-           name.Canonical() == spelling.substr(1, spelling.size() - 2);
-  }
-
- private:
-  friend class detail::Transaction;
-  SourceNameView(std::string_view name, bool quoted) noexcept
-      : data_(name.data()), size_((name.size() << 1) | std::size_t{quoted}) {}
-  const char* data_ = nullptr;
-  std::size_t size_ = 0;
-};
-class SourceRankView {
- public:
-  SourceRankView() noexcept = default;
-  // NOLINTNEXTLINE(readability-identifier-naming): Standard range interface.
-  std::size_t size() const noexcept { return rank_.size(); }
-  std::string_view operator[](std::size_t index) const noexcept {
-    return rank_[index];
-  }
-  // NOLINTNEXTLINE(readability-identifier-naming): Standard range interface.
-  std::string_view back() const noexcept { return rank_.back(); }
-  // NOLINTNEXTLINE(readability-identifier-naming): Standard range interface.
-  auto begin() const noexcept { return rank_.begin(); }
-  // NOLINTNEXTLINE(readability-identifier-naming): Standard range interface.
-  auto end() const noexcept { return rank_.end(); }
-  friend bool operator==(SourceRankView rank,
-                         const std::vector<std::string>& spelling) noexcept {
-    return std::ranges::equal(rank.rank_, spelling);
-  }
-
- private:
-  friend class detail::Transaction;
-  explicit SourceRankView(std::span<const std::string_view> rank) noexcept
-      : rank_(rank) {}
-  std::span<const std::string_view> rank_;
-};
 struct UserFunction {
   Decl decl;
-  SourceNameView source_name;
+  std::string source_name;
   // Domain sorts in declaration order followed by the result sort.
-  SourceRankView source_rank;
+  std::vector<std::string> source_rank;
   SourceSpan where;
+};
+struct DefinitionSource {
+  CommandKind kind;
+  std::string source_name;
+  std::vector<std::string> source_rank;
+  SourceSpan where;
+  Node body;
+  std::optional<std::size_t> definition_ordinal;
+};
+struct SourceRecords {
+  std::vector<Assertion> assertions;
+  std::vector<UserSort> user_sorts;
+  std::vector<UserFunction> functions;
+  std::vector<DefinitionSource> definitions;
+  std::vector<NamedTerm> named_terms;
+  std::vector<Annotation> annotations;
+  std::vector<Attribute> metadata;
 };
 struct DefinedFunction {
   Decl decl;
-  DeclInstance instance;
   std::vector<Decl> formals;
   Node body;
-  std::string source_name;
-  SourceSpan where;
 };
 struct FrontendStats {
   std::size_t definition_bodies = 0;
@@ -182,9 +155,14 @@ struct FrontendStats {
   std::size_t recipe_pairs = 0;
   std::size_t sort_recipe_pairs = 0;
   std::size_t closure_visits = 0;
-  std::size_t syntax_page_allocations = 0;
-  std::size_t syntax_page_copies = 0;
-  std::size_t syntax_promoted_pages = 0;
+  std::size_t escape_operands = 0;
+  std::size_t alias_roots_released = 0;
+  std::size_t borrowed_term_names = 0;
+  std::size_t pooled_term_names = 0;
+  std::size_t staging_overlays = 0;
+  std::size_t peak_live_operands = 0;
+  std::size_t peak_grammar_depth = 0;
+  std::size_t peak_retained_fragments = 0;
   std::size_t literal_cache_hits = 0;
   std::size_t sort_cache_hits = 0;
   std::size_t commutative_canonicalizations = 0;
@@ -202,50 +180,41 @@ class QueryContext {
   const ManagerRef& GetManager() const noexcept { return manager_; }
   std::string_view GetLogic() const noexcept { return logic_; }
   const SessionOptions& GetOptions() const noexcept { return options_; }
-  std::span<const Assertion> GetAssertions() const noexcept {
-    return assertions_;
-  }
-  std::span<const UserSort> GetUserSorts() const noexcept {
+  std::span<const Node> GetAssertions() const noexcept { return assertions_; }
+  std::span<const SortConstructor> GetUserSorts() const noexcept {
     return user_sorts_;
   }
-  std::span<const UserFunction> GetFunctions() const noexcept {
-    return functions_;
-  }
+  std::span<const Decl> GetFunctions() const noexcept { return functions_; }
   std::span<const DatatypeGroup> GetDatatypeGroups() const noexcept {
     return datatype_groups_;
   }
-  std::span<const DefinedFunction> GetDefinitions() const noexcept {
-    return definitions_;
+  std::size_t GetDefinitionCount() const noexcept {
+    return definitions_.size();
+  }
+  const DefinedFunction& GetDefinition(std::size_t ordinal) const noexcept {
+    return definitions_[ordinal];
   }
   const DefinedFunction* FindDefinition(DeclView decl) const noexcept;
-  const DefinedFunction* FindDefinition(DeclId id) const noexcept;
-  std::span<const NamedTerm> GetNamedTerms() const noexcept {
-    return named_terms_;
-  }
-  std::span<const Annotation> GetAnnotations() const noexcept {
-    return annotations_;
-  }
-  std::span<const Attribute> GetMetadata() const noexcept { return metadata_; }
   // Resolve a declaration by identity in this sealed signature, for example
   // after attaching to the manager for model evaluation.
   bool HasFunction(DeclView decl) const noexcept;
 
  private:
   friend struct detail::SessionState;
+  friend class Session;
   friend struct detail::Signature;
   friend class detail::Transaction;
   explicit QueryContext(ManagerRef manager);
   ManagerRef manager_;
   std::string_view logic_;
   SessionOptions options_;
-  std::vector<Assertion> assertions_;
-  std::vector<UserSort> user_sorts_;
-  std::vector<UserFunction> functions_;
+  std::vector<Node> assertions_;
+  std::vector<SortConstructor> user_sorts_;
+  std::vector<Decl> functions_;
   std::vector<DatatypeGroup> datatype_groups_;
   std::vector<DefinedFunction> definitions_;
-  std::vector<NamedTerm> named_terms_;
-  std::vector<Annotation> annotations_;
-  std::vector<Attribute> metadata_;
+  std::unordered_map<DeclId, std::size_t> definition_index_;
+  std::vector<std::pair<DeclId, std::size_t>> function_runs_;
   std::unique_ptr<detail::Signature> signature_;
 };
 
@@ -254,13 +223,27 @@ struct ValueRequest {
   std::string input;
   SourceSpan where;
 };
+enum class CommandResponse {
+  kNone,
+  kSuccess,
+  kUnsupported,
+  kTrue,
+  kFalse,
+  kZero,
+  kStdout,
+  kStderr,
+  kName,
+  kVersion,
+  kAuthors,
+  kErrorBehavior,
+  kUnknownReason
+};
+
 struct TypedCommand {
   CommandHeader header;
-  std::string text;
+  std::variant<CommandResponse, std::string> response = CommandResponse::kNone;
   std::shared_ptr<const QueryContext> query;
   std::vector<ValueRequest> values;
-  std::vector<Annotation> annotations;
-  bool needs_unknown_reason = false;
 };
 class ModelOwner;
 class Session;
@@ -395,28 +378,55 @@ class Session {
   static Outcome<Session> ForModelReader(std::shared_ptr<ModelOwner> model,
                                          Reader reader,
                                          std::uint32_t source = 0);
+  static Outcome<Session> ForModelText(std::shared_ptr<ModelOwner> model,
+                                       std::string_view text,
+                                       ParseOptions options,
+                                       std::uint32_t source = 0);
+  static Outcome<Session> ForModelReader(std::shared_ptr<ModelOwner> model,
+                                         Reader reader, ParseOptions options,
+                                         std::uint32_t source = 0);
   Session(Session&&) noexcept;
   Session& operator=(Session&&) noexcept;
   ~Session();
 
-  Outcome<std::optional<CommandHeader>> NextSyntax();
-  // Consumes the pending command. Supplying a model is needed only for
-  // model-local names in a value request.
-  Outcome<TypedCommand> Apply(const ModelOwner* model = nullptr);
+  Outcome<std::optional<TypedCommand>> ReadCommand(
+      const ModelOwner* model = nullptr);
+  RunResult Run(const Engine& engine, const ResponseSink& sink);
   SessionPhase GetPhase() const noexcept;
   const SessionOptions& GetOptions() const noexcept;
-  std::span<const Attribute> GetMetadata() const noexcept;
+  // Borrows committed history until the next mutating session operation.
+  const SourceRecords* GetSourceRecords() const noexcept;
   const QueryContext& GetPrefix() const noexcept;
 #ifdef DANDELION_FRONTEND_TESTING
   FrontendStats GetStats() const noexcept;
-  void ForceSyntaxPromotionThreshold(std::uint64_t threshold) noexcept;
   void FailAllocationAfter(std::size_t checkpoints) noexcept;
+  void FailGrammarAllocationAfter(std::size_t checkpoints) noexcept;
+  // Call before building the signature.
+  void ForceNameHashCollisions() noexcept;
 #endif
 
  private:
-  friend RunResult Run(Session&, const Engine&, const ResponseSink&);
   explicit Session(std::unique_ptr<detail::SessionState> state) noexcept;
   std::unique_ptr<detail::SessionState> state_;
+};
+// An independent grammar reader. The text adapter borrows its input.
+class SyntaxValidator {
+ public:
+  static Outcome<SyntaxValidator> FromText(std::string_view text,
+                                           std::uint32_t source = 0);
+  static Outcome<SyntaxValidator> FromReader(Reader reader,
+                                             std::uint32_t source = 0);
+  SyntaxValidator(SyntaxValidator&&) noexcept;
+  SyntaxValidator& operator=(SyntaxValidator&&) noexcept;
+  ~SyntaxValidator();
+
+  Outcome<std::optional<CommandHeader>> ReadNext();
+
+ private:
+  explicit SyntaxValidator(std::unique_ptr<detail::Scanner> scanner) noexcept;
+  std::unique_ptr<detail::Scanner> scanner_;
+  bool in_read_ = false;
+  bool terminated_ = false;
 };
 // NOLINTEND(readability-identifier-naming)
 }  // namespace dandelion::frontend

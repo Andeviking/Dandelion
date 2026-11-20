@@ -1,5 +1,6 @@
 module dandelion.node;
 import :internal;
+import dandelion.util.numeric;
 import std;
 
 namespace dandelion::detail {
@@ -19,8 +20,9 @@ static_assert(sizeof(void*) != 8 || sizeof(NodeData) == 56);
 constexpr auto kDefaultAlignment = __STDCPP_DEFAULT_NEW_ALIGNMENT__;
 static_assert(alignof(NodeData) <= kDefaultAlignment);
 static_assert(alignof(Integer) <= kDefaultAlignment);
-static_assert(alignof(RationalPayload) <= kDefaultAlignment);
+static_assert(alignof(RationalWords) <= kDefaultAlignment);
 static_assert(alignof(std::uint64_t) <= kDefaultAlignment);
+static_assert(sizeof(RationalPackedPrefix) % alignof(std::uint64_t) == 0);
 
 struct PayloadLayout {
   // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
@@ -36,11 +38,14 @@ constexpr PayloadLayout LayoutOf() noexcept {
 constexpr PayloadLayout Layout(PayloadTag tag) noexcept {
   switch (tag) {
     case PayloadTag::kNone:
+    case PayloadTag::kFpNaN:
+    case PayloadTag::kFpPositiveInfinity:
+    case PayloadTag::kFpNegativeInfinity:
+    case PayloadTag::kFpPositiveZero:
+    case PayloadTag::kFpNegativeZero:
       return {0, 1};
     case PayloadTag::kBool:
       return LayoutOf<bool>();
-    case PayloadTag::kFpSpecial:
-      return LayoutOf<FpCategory>();
     case PayloadTag::kRoundingMode:
       return LayoutOf<RoundingMode>();
     case PayloadTag::kDeclaration:
@@ -49,19 +54,28 @@ constexpr PayloadLayout Layout(PayloadTag tag) noexcept {
       return LayoutOf<std::uint32_t>();
     case PayloadTag::kIndex2:
       return LayoutOf<std::array<std::uint32_t, 2>>();
+    case PayloadTag::kIntWord:
+      return LayoutOf<std::int64_t>();
     case PayloadTag::kBvWord:
     case PayloadTag::kFpWord:
       return LayoutOf<std::uint64_t>();
-    case PayloadTag::kInteger:
+    case PayloadTag::kIntWidePositive:
+    case PayloadTag::kIntWideNegative:
+    case PayloadTag::kBvWide:
     case PayloadTag::kFpWide:
+      return {0, alignof(std::uint64_t)};
     case PayloadTag::kIndexWide:
       return LayoutOf<Integer>();
     case PayloadTag::kRationalConversion:
-      return LayoutOf<RationalPayload>();
+      return LayoutOf<RationalWords>();
+    case PayloadTag::kRationalWidePositive:
+    case PayloadTag::kRationalWideNegative:
+      return {sizeof(RationalPackedPrefix), alignof(std::uint64_t)};
   }
   std::unreachable();
 }
-std::size_t PayloadOffset(std::size_t count, PayloadTag tag) noexcept {
+constexpr std::size_t PayloadOffset(std::size_t count,
+                                    PayloadTag tag) noexcept {
   return AlignUp(ChildOffset(count) + count * sizeof(NodeData*),
                  Layout(tag).alignment);
 }
@@ -74,9 +88,30 @@ struct CandidateLayout {
   // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
   std::size_t payload_offset;
 };
-CandidateLayout CheckedLayout(ManagerState* state, std::size_t count,
-                              PayloadTag tag) {
-  const auto limit = SizeCapacity(state);
+std::uint32_t CheckedLimbCount(std::uint64_t count) {
+  if (count > std::numeric_limits<std::uint32_t>::max())
+    Fail(ErrorCode::kResourceLimit, ResourceKind::kSize);
+  return static_cast<std::uint32_t>(count);
+}
+
+std::uint32_t LimbCount(IntegerView value) {
+  const auto bits = value.BitLength();
+  return CheckedLimbCount(bits / 64 + (bits % 64 != 0));
+}
+
+std::size_t TailEnd(std::size_t prefix, std::size_t limbs) noexcept {
+  return prefix + limbs * sizeof(std::uint64_t);
+}
+
+std::size_t CheckedTailEnd(std::size_t prefix, std::uint64_t limbs,
+                           std::size_t limit) {
+  if (prefix > limit || limbs > (limit - prefix) / sizeof(std::uint64_t))
+    Fail(ErrorCode::kResourceLimit, ResourceKind::kSize);
+  return TailEnd(prefix, static_cast<std::size_t>(limbs));
+}
+
+CandidateLayout CheckedLayout(std::size_t count, PayloadTag tag,
+                              std::uint64_t limbs, std::size_t limit) {
   const auto [size, alignment] = Layout(tag);
   const auto child_offset = ChildOffset(count);
   if (count > (std::numeric_limits<std::size_t>::max() - child_offset) /
@@ -89,37 +124,74 @@ CandidateLayout CheckedLayout(ManagerState* state, std::size_t count,
   const auto payload_offset = AlignUp(child_end, alignment);
   if (payload_offset > limit || size > limit - payload_offset)
     Fail(ErrorCode::kResourceLimit, ResourceKind::kSize);
-  return {payload_offset + size, child_offset, payload_offset};
+  return {CheckedTailEnd(payload_offset + size, limbs, limit), child_offset,
+          payload_offset};
 }
 void FreeStorage(NodeData* node) noexcept {
   auto* storage = node->storage;
   std::destroy_at(node);
   ::operator delete(storage);
 }
-void ConstructPayload(ManagerState* state, void* address, const QueryKey& key) {
-  AllocationCheckpoint(state);
+void CopyMagnitude(IntegerView value, std::span<std::uint64_t> out) noexcept {
+  const auto limbs = value.MagnitudeLimbs();
+  if (limbs.empty()) {
+    out.front() = value.MagnitudeChunk(0);
+  } else {
+    std::ranges::copy(limbs, out.begin());
+  }
+}
+
+void CopyIndex(ManagerState* state, void* address, IntegerView value) {
+  try {
+    AllocationCheckpoint(state);
+    std::construct_at(static_cast<Integer*>(address), value.Copy());
+  } catch (const std::bad_alloc&) {
+    throw Failure{
+        TranslateNumericError(numeric::NumericError::kCppAllocation, false,
+                              std::numeric_limits<std::uint64_t>::max(), 0)};
+  }
+}
+
+template <class Child>
+void ConstructPayload(ManagerState* state, void* address,
+                      const QueryKey<Child>& key, std::uint32_t first_limbs,
+                      std::uint32_t second_limbs) {
   switch (key.tag) {
     case PayloadTag::kNone:
-      std::unreachable();
+    case PayloadTag::kFpNaN:
+    case PayloadTag::kFpPositiveInfinity:
+    case PayloadTag::kFpNegativeInfinity:
+    case PayloadTag::kFpPositiveZero:
+    case PayloadTag::kFpNegativeZero:
+      break;
     case PayloadTag::kBool:
       std::construct_at(static_cast<bool*>(address), key.boolean);
       break;
-    case PayloadTag::kInteger:
-    case PayloadTag::kFpWide:
+    case PayloadTag::kIntWord:
+      std::construct_at(static_cast<std::int64_t*>(address),
+                        static_cast<std::int64_t>(key.word));
+      break;
+    case PayloadTag::kIntWidePositive:
+    case PayloadTag::kIntWideNegative:
+    case PayloadTag::kBvWide:
+    case PayloadTag::kFpWide: {
+      auto* limbs = ::new (address) std::uint64_t[first_limbs];
+      CopyMagnitude(key.integer, {limbs, first_limbs});
+      break;
+    }
     case PayloadTag::kIndexWide:
-      std::construct_at(static_cast<Integer*>(address), key.integer.Copy());
+      CopyIndex(state, address, key.integer);
       break;
     case PayloadTag::kBvWord:
     case PayloadTag::kFpWord:
       std::construct_at(static_cast<std::uint64_t*>(address), key.word);
       break;
-    case PayloadTag::kFpSpecial:
-      std::construct_at(static_cast<FpCategory*>(address), key.fp_category);
-      break;
     case PayloadTag::kRoundingMode:
       std::construct_at(static_cast<RoundingMode*>(address), key.rounding_mode);
       break;
     case PayloadTag::kDeclaration:
+      // Preserve the application preparation checkpoint for rollback tests.
+      AllocationCheckpoint(state);
       std::construct_at(static_cast<DeclInstanceId*>(address), key.declaration);
       break;
     case PayloadTag::kIndex1:
@@ -130,12 +202,52 @@ void ConstructPayload(ManagerState* state, void* address, const QueryKey& key) {
                         key.indices);
       break;
     case PayloadTag::kRationalConversion:
-      std::construct_at(static_cast<RationalPayload*>(address), key.indices,
-                        key.rational->Copy());
+      std::construct_at(static_cast<RationalWords*>(address), key.indices,
+                        *key.rational->Numerator().TryInt64(),
+                        *key.rational->Denominator().TryUint64());
       break;
+    case PayloadTag::kRationalWidePositive:
+    case PayloadTag::kRationalWideNegative: {
+      std::construct_at(static_cast<RationalPackedPrefix*>(address),
+                        key.indices, first_limbs, second_limbs);
+      auto* tail =
+          static_cast<std::byte*>(address) + sizeof(RationalPackedPrefix);
+      auto* limbs =
+          ::new (tail) std::uint64_t[std::size_t{first_limbs} + second_limbs];
+      CopyMagnitude(key.rational->Numerator(), {limbs, first_limbs});
+      CopyMagnitude(key.rational->Denominator(),
+                    {limbs + first_limbs, second_limbs});
+      break;
+    }
   }
 }
 }  // namespace
+
+#ifdef DANDELION_NODE_TESTING
+Result<std::size_t> CheckNumericNodeSize(PayloadTag tag, std::uint64_t limbs,
+                                         std::uint64_t denominator_limbs,
+                                         std::size_t limit) {
+  return Guard<std::size_t>([&] {
+    const bool wide_rational = IsWideRational(tag);
+    const auto first =
+        IsWideLiteral(tag) || wide_rational ? CheckedLimbCount(limbs) : 0;
+    const auto second = wide_rational ? CheckedLimbCount(denominator_limbs) : 0;
+    const auto children =
+        wide_rational || tag == PayloadTag::kRationalConversion
+            ? std::size_t{1}
+            : std::size_t{0};
+    return CheckedLayout(children, tag, std::uint64_t{first} + second, limit)
+        .size;
+  });
+}
+
+Result<std::size_t> CheckNumericTailSize(std::size_t prefix,
+                                         std::uint32_t limbs,
+                                         std::size_t limit) {
+  return Guard<std::size_t>(
+      [&] { return CheckedTailEnd(prefix, limbs, limit); });
+}
+#endif
 
 std::uint64_t Append(std::uint64_t hash, std::uint64_t value) noexcept {
   return Mix(hash ^ Mix(value + 0x9e3779b97f4a7c15ULL));
@@ -189,21 +301,31 @@ class WideIntegerHash {
   std::uint64_t d_;
 };
 
-std::uint64_t FoldInteger(std::uint64_t hash, IntegerView value) noexcept {
-  if (const auto small = value.TryInt64()) {
-    if (*small == 0) return FoldKeyWord(hash, 0);
-    const auto bits = static_cast<std::uint64_t>(*small);
-    const bool negative = *small < 0;
-    return FoldKeyWord(FoldKeyWord(hash, negative ? 3 : 2),
-                       negative ? std::uint64_t{0} - bits : bits);
-  }
-  const auto chunks = (value.BitLength() - 1) / 64 + 1;
-  hash = FoldKeyWord(hash, chunks * 2 + (value.Sign() < 0 ? 1 : 0));
-  if (chunks == 1) return FoldKeyWord(hash, value.MagnitudeChunk(0));
+std::uint64_t FoldSignedWord(std::uint64_t hash, std::int64_t word) noexcept {
+  if (word == 0) return FoldKeyWord(hash, 0);
+  const auto bits = static_cast<std::uint64_t>(word);
+  const bool negative = word < 0;
+  return FoldKeyWord(FoldKeyWord(hash, negative ? 3 : 2),
+                     negative ? std::uint64_t{0} - bits : bits);
+}
+
+std::uint64_t FoldWideInteger(std::uint64_t hash, IntegerView value,
+                              bool negative) noexcept {
+  const auto limbs = value.MagnitudeLimbs();
+  // An inline unsigned value above INT64_MAX has one limb but no span.
+  if (limbs.empty())
+    return FoldKeyWord(FoldKeyWord(hash, 2), *value.TryUint64());
+  const std::uint64_t chunks = limbs.size();
+  hash = FoldKeyWord(hash, chunks * 2 + negative);
+  if (chunks == 1) return FoldKeyWord(hash, limbs.front());
   WideIntegerHash wide(hash);
-  for (std::uint64_t i = 0; i < chunks; ++i)
-    wide.Append(value.MagnitudeChunk(i));
+  for (const auto limb : limbs) wide.Append(limb);
   return FoldKeyWord(hash, wide.Finish(chunks));
+}
+
+std::uint64_t FoldInteger(std::uint64_t hash, IntegerView value) noexcept {
+  if (const auto small = value.TryInt64()) return FoldSignedWord(hash, *small);
+  return FoldWideInteger(hash, value, value.Sign() < 0);
 }
 }  // namespace
 std::span<NodeData* const> Children(const NodeData* node) noexcept {
@@ -219,34 +341,60 @@ const void* Payload(const NodeData* node) noexcept {
 void* Payload(NodeData* node) noexcept {
   return const_cast<void*>(Payload(static_cast<const NodeData*>(node)));
 }
+std::span<const std::uint64_t> LiteralLimbs(const NodeData* node) noexcept {
+  return {std::launder(static_cast<const std::uint64_t*>(Payload(node))),
+          node->literal_limb_count};
+}
+
+std::array<std::uint32_t, 2> RationalIndices(const NodeData* node) noexcept {
+  if (node->payload_tag == PayloadTag::kRationalConversion)
+    return Value<RationalWords>(node).indices;
+  return Value<RationalPackedPrefix>(node).indices;
+}
+
+RationalView ReadRational(const NodeData* node) noexcept {
+  if (node->payload_tag == PayloadTag::kRationalConversion) {
+    const auto& value = Value<RationalWords>(node);
+    return RationalView::FromCanonicalComponents(
+        IntegerView(value.numerator),
+        IntegerView::FromUnsigned(value.denominator));
+  }
+  const auto& prefix = Value<RationalPackedPrefix>(node);
+  const auto* tail = static_cast<const std::byte*>(Payload(node)) +
+                     sizeof(RationalPackedPrefix);
+  const auto* limbs =
+      std::launder(reinterpret_cast<const std::uint64_t*>(tail));
+  return RationalView::FromCanonicalComponents(
+      IntegerView::FromCanonicalMagnitude(
+          {limbs, prefix.numerator_limbs},
+          node->payload_tag == PayloadTag::kRationalWideNegative),
+      IntegerView::FromCanonicalMagnitude(
+          {limbs + prefix.numerator_limbs, prefix.denominator_limbs}, false));
+}
+
 void DestroyPayload(NodeData* node) noexcept {
   // Trivial objects end their lifetimes with the backing storage.
-  switch (node->payload_tag) {
-    case PayloadTag::kInteger:
-    case PayloadTag::kIndexWide:
-    case PayloadTag::kFpWide:
-      std::destroy_at(&Value<Integer>(node));
-      break;
-    case PayloadTag::kRationalConversion:
-      std::destroy_at(&Value<RationalPayload>(node));
-      break;
-    default:
-      break;
-  }
+  if (node->payload_tag == PayloadTag::kIndexWide)
+    std::destroy_at(&Value<Integer>(node));
 }
 namespace {
-std::uint64_t HashShape(Kind kind, SortId explicit_sort,
-                        std::span<const NodeView> children) noexcept {
+template <class Child>
+std::uint64_t HashShape([[maybe_unused]] ManagerState* state, Kind kind,
+                        SortId explicit_sort,
+                        std::span<Child> children) noexcept {
+#ifdef DANDELION_NODE_TESTING
+  ++state->hash_computations;
+#endif
   auto hash = FoldKeyWord(0, explicit_sort);
   hash = FoldKeyWord(hash, children.size());
   hash = FoldKeyWord(hash, std::to_underlying(kind));
-  for (const auto child : children)
+  for (const auto& child : children)
     hash = FoldKeyWord(hash,
                        reinterpret_cast<std::uintptr_t>(Access::Data(child)));
   return hash;
 }
-bool EqualChildren(const NodeData* node,
-                   std::span<const NodeView> requested) noexcept {
+template <class Child>
+bool EqualChildren(const NodeData* node, std::span<Child> requested) noexcept {
   const auto children = Children(node);
   for (std::size_t i = 0; i < children.size(); ++i)
     if (children[i] != Access::Data(requested[i])) return false;
@@ -254,29 +402,41 @@ bool EqualChildren(const NodeData* node,
 }
 }  // namespace
 
-std::uint64_t HashKey(const QueryKey& key) noexcept {
-  auto hash = HashShape(key.kind, key.input_sort, key.children);
+template <class Child>
+std::uint64_t HashKey(ManagerState* state,
+                      const QueryKey<Child>& key) noexcept {
+  auto hash = HashShape(state, key.kind, key.input_sort, key.children);
   // The plain lookup shares the no-payload hash. A different tag must
   // continue probing even if its hash matches.
   if (key.tag != PayloadTag::kNone)
     hash = FoldKeyWord(hash, std::to_underlying(key.tag));
   switch (key.tag) {
     case PayloadTag::kNone:
+    case PayloadTag::kFpNaN:
+    case PayloadTag::kFpPositiveInfinity:
+    case PayloadTag::kFpNegativeInfinity:
+    case PayloadTag::kFpPositiveZero:
+    case PayloadTag::kFpNegativeZero:
       break;
     case PayloadTag::kBool:
       hash = FoldKeyWord(hash, key.boolean);
       break;
-    case PayloadTag::kInteger:
+    case PayloadTag::kIntWord:
+      hash = FoldSignedWord(hash, static_cast<std::int64_t>(key.word));
+      break;
+    case PayloadTag::kIntWidePositive:
+    case PayloadTag::kIntWideNegative:
+    case PayloadTag::kBvWide:
     case PayloadTag::kFpWide:
+      hash = FoldWideInteger(hash, key.integer,
+                             key.tag == PayloadTag::kIntWideNegative);
+      break;
     case PayloadTag::kIndexWide:
       hash = FoldInteger(hash, key.integer);
       break;
     case PayloadTag::kBvWord:
     case PayloadTag::kFpWord:
       hash = FoldKeyWord(hash, key.word);
-      break;
-    case PayloadTag::kFpSpecial:
-      hash = FoldKeyWord(hash, std::to_underlying(key.fp_category));
       break;
     case PayloadTag::kRoundingMode:
       hash = FoldKeyWord(hash, std::to_underlying(key.rounding_mode));
@@ -291,6 +451,8 @@ std::uint64_t HashKey(const QueryKey& key) noexcept {
       hash = FoldKeyWord(FoldKeyWord(hash, key.indices[0]), key.indices[1]);
       break;
     case PayloadTag::kRationalConversion:
+    case PayloadTag::kRationalWidePositive:
+    case PayloadTag::kRationalWideNegative:
       hash = FoldKeyWord(FoldKeyWord(hash, key.indices[0]), key.indices[1]);
       hash = FoldInteger(hash, key.rational->Numerator());
       hash = FoldInteger(hash, key.rational->Denominator());
@@ -298,7 +460,9 @@ std::uint64_t HashKey(const QueryKey& key) noexcept {
   }
   return Mix(hash);
 }
-bool EqualKey(const NodeData* node, const QueryKey& key) noexcept {
+namespace {
+template <class Child>
+bool EqualKey(const NodeData* node, const QueryKey<Child>& key) noexcept {
   if (node->GetKind() != key.kind ||
       (key.input_sort && node->sort_id != key.input_sort) ||
       node->ChildCount() != key.children.size() || node->payload_tag != key.tag)
@@ -306,18 +470,38 @@ bool EqualKey(const NodeData* node, const QueryKey& key) noexcept {
   if (!EqualChildren(node, key.children)) return false;
   switch (key.tag) {
     case PayloadTag::kNone:
+    case PayloadTag::kFpNaN:
+    case PayloadTag::kFpPositiveInfinity:
+    case PayloadTag::kFpNegativeInfinity:
+    case PayloadTag::kFpPositiveZero:
+    case PayloadTag::kFpNegativeZero:
       return true;
     case PayloadTag::kBool:
       return Value<bool>(node) == key.boolean;
-    case PayloadTag::kInteger:
-    case PayloadTag::kFpWide:
+    case PayloadTag::kIntWord: {
+      const auto* address =
+          node->storage + PayloadOffset(0, PayloadTag::kIntWord);
+      return *std::launder(reinterpret_cast<const std::int64_t*>(address)) ==
+             static_cast<std::int64_t>(key.word);
+    }
+    case PayloadTag::kIntWidePositive:
+    case PayloadTag::kIntWideNegative:
+    case PayloadTag::kBvWide:
+    case PayloadTag::kFpWide: {
+      const auto stored = LiteralLimbs(node);
+      const auto requested = key.integer.MagnitudeLimbs();
+      // A positive Int outside the signed word range can be an inline
+      // unsigned view with one significant limb.
+      if (requested.empty())
+        return stored.size() == 1 &&
+               stored.front() == key.integer.MagnitudeChunk(0);
+      return std::ranges::equal(stored, requested);
+    }
     case PayloadTag::kIndexWide:
       return Value<Integer>(node).Borrow().Compare(key.integer) == 0;
     case PayloadTag::kBvWord:
     case PayloadTag::kFpWord:
       return Value<std::uint64_t>(node) == key.word;
-    case PayloadTag::kFpSpecial:
-      return Value<FpCategory>(node) == key.fp_category;
     case PayloadTag::kRoundingMode:
       return Value<RoundingMode>(node) == key.rounding_mode;
     case PayloadTag::kDeclaration:
@@ -326,17 +510,16 @@ bool EqualKey(const NodeData* node, const QueryKey& key) noexcept {
       return Value<std::uint32_t>(node) == key.indices[0];
     case PayloadTag::kIndex2:
       return Value<std::array<std::uint32_t, 2>>(node) == key.indices;
-    case PayloadTag::kRationalConversion: {
-      const auto& value = Value<RationalPayload>(node);
-      return value.indices == key.indices &&
-             value.value.Borrow().Numerator().Compare(
-                 key.rational->Numerator()) == 0 &&
-             value.value.Borrow().Denominator().Compare(
-                 key.rational->Denominator()) == 0;
-    }
+    case PayloadTag::kRationalConversion:
+    case PayloadTag::kRationalWidePositive:
+    case PayloadTag::kRationalWideNegative:
+      return RationalIndices(node) == key.indices &&
+             ReadRational(node) == *key.rational;
   }
   std::unreachable();
 }
+
+}  // namespace
 
 UniqueTable::UniqueTable() {
 #ifdef DANDELION_NODE_TESTING
@@ -353,23 +536,16 @@ void UniqueTable::MeasureStorage(NodeStorageStats& stats) const noexcept {
     const auto count = node->ChildCount();
     stats.live_edges += count;
     const auto tag = node->payload_tag;
-    stats.node_bytes += PayloadOffset(count, tag) + Layout(tag).size;
-    switch (tag) {
-      case PayloadTag::kInteger:
-      case PayloadTag::kFpWide:
-      case PayloadTag::kIndexWide:
-        stats.numeric_backing_bytes +=
-            Value<Integer>(node).Borrow().BackingBytes();
-        break;
-      case PayloadTag::kRationalConversion: {
-        const auto rational = Value<RationalPayload>(node).value.Borrow();
-        stats.numeric_backing_bytes += rational.Numerator().BackingBytes() +
-                                       rational.Denominator().BackingBytes();
-        break;
-      }
-      default:
-        break;
+    std::size_t limbs = node->literal_limb_count;
+    if (IsWideRational(tag)) {
+      const auto& prefix = Value<RationalPackedPrefix>(node);
+      limbs = std::size_t{prefix.numerator_limbs} + prefix.denominator_limbs;
     }
+    stats.node_bytes +=
+        TailEnd(PayloadOffset(count, tag) + Layout(tag).size, limbs);
+    if (tag == PayloadTag::kIndexWide)
+      stats.numeric_backing_bytes +=
+          Value<Integer>(node).Borrow().BackingBytes();
   }
 }
 #ifdef DANDELION_NODE_TESTING
@@ -409,14 +585,16 @@ UniqueTable::ProbeResult UniqueTable::ProbeMatching(std::uint64_t hash,
 #endif
   return {nullptr, slot};
 }
-UniqueTable::ProbeResult UniqueTable::Probe(const QueryKey& key,
+template <class Child>
+UniqueTable::ProbeResult UniqueTable::Probe(const QueryKey<Child>& key,
                                             std::uint64_t hash) noexcept {
   return ProbeMatching(hash,
                        [&](const auto* node) { return EqualKey(node, key); });
 }
-UniqueTable::ProbeResult UniqueTable::ProbePlain(
-    Kind kind, std::span<const NodeView> children,
-    std::uint64_t hash) noexcept {
+template <class Child>
+UniqueTable::ProbeResult UniqueTable::ProbePlain(Kind kind,
+                                                 std::span<Child> children,
+                                                 std::uint64_t hash) noexcept {
   return ProbeMatching(hash, [&](const auto* node) {
     return node->GetKind() == kind && node->payload_tag == PayloadTag::kNone &&
            node->ChildCount() == children.size() &&
@@ -532,11 +710,22 @@ void CheckNodeIdentity(ManagerState* state) {
   if (state->node_ids_exhausted)
     Fail(ErrorCode::kResourceLimit, ResourceKind::kIdentitySpace);
 }
-Candidate PrepareNode(ManagerState* state, const QueryKey& key,
+template <class Child>
+Candidate PrepareNode(ManagerState* state, const QueryKey<Child>& key,
                       SortId result_sort, std::uint64_t hash) {
-  const auto [size, child_offset, payload_offset] =
-      CheckedLayout(state, key.children.size(), key.tag);
+  const bool wide_literal = IsWideLiteral(key.tag);
+  std::uint32_t first_limbs = 0;
+  std::uint32_t second_limbs = 0;
+  if (wide_literal) {
+    first_limbs = LimbCount(key.integer);
+  } else if (IsWideRational(key.tag)) {
+    first_limbs = LimbCount(key.rational->Numerator());
+    second_limbs = LimbCount(key.rational->Denominator());
+  }
   const auto count = key.children.size();
+  const auto [size, child_offset, payload_offset] =
+      CheckedLayout(count, key.tag, std::uint64_t{first_limbs} + second_limbs,
+                    SizeCapacity(state));
   const auto inline_count = static_cast<std::uint16_t>(
       std::min<std::uint64_t>(count, NodeData::kExternalChildCount));
   AllocationCheckpoint(state);
@@ -547,12 +736,13 @@ Candidate PrepareNode(ManagerState* state, const QueryKey& key,
       NodeData{.state = state,
                .storage = storage,
                .id = 0,
-               .ref_count = 1,
+               .ref_count = 0,
                .structural_hash = hash,
                .sort_id = result_sort,
                .inline_child_count = inline_count,
                .kind_code = static_cast<std::uint8_t>(key.kind),
-               .payload_tag = key.tag});
+               .payload_tag = key.tag,
+               .literal_limb_count = wide_literal ? first_limbs : 0});
   if (inline_count == NodeData::kExternalChildCount) {
     std::construct_at(
         reinterpret_cast<std::uint64_t*>(storage + sizeof(NodeData)),
@@ -562,35 +752,50 @@ Candidate PrepareNode(ManagerState* state, const QueryKey& key,
   ++state->allocations;
 #endif
   auto* children =
-      count ? ::new (storage + child_offset) NodeData*[count]() : nullptr;
+      count ? ::new (storage + child_offset) NodeData*[count] : nullptr;
   bool payload_ready = false;
   bool state_held = false;
   std::size_t retained = 0;
   try {
-    if (key.tag != PayloadTag::kNone) {
-      ConstructPayload(state, storage + payload_offset, key);
-      payload_ready = true;
-    }
+    ConstructPayload(state, storage + payload_offset, key, first_limbs,
+                     second_limbs);
+    payload_ready = true;
     RetainState(state);
     state_held = true;
-    for (const auto view : key.children) {
-      auto* child = Access::Data(view);
-      RetainNodeData(child);
-      children[retained++] = child;
+    if constexpr (!std::is_same_v<Child, Node>) {
+      for (const auto& view : key.children) {
+        auto* child = Access::Data(view);
+        RetainNodeData(child);
+        children[retained++] = child;
+      }
     }
-    return Candidate(node);
   } catch (...) {
+    // Only the retained prefix has initialized pointers.
     for (std::size_t i = 0; i < retained; ++i) ReleaseNodeData(children[i]);
     if (payload_ready) DestroyPayload(node);
+#ifdef DANDELION_NODE_TESTING
+    ++state->candidate_frees;
+#endif
     FreeStorage(node);
     if (state_held) ReleaseState(state);
     throw;
   }
+  if constexpr (std::is_same_v<Child, Node>) {
+    // Payload views may borrow from an input child. Copying the payload and
+    // retaining the state must finish before the first ownership transfer.
+    for (auto& child : key.children)
+      children[retained++] = Access::TakeNode(child);
+  }
+  node->ref_count = 1;
+  return Candidate(node);
 }
 void CandidateDeleter::operator()(NodeData* node) const noexcept {
   auto* state = node->state;
   for (auto* child : Children(node)) ReleaseNodeData(child);
   DestroyPayload(node);
+#ifdef DANDELION_NODE_TESTING
+  ++state->candidate_frees;
+#endif
   FreeStorage(node);
   ReleaseState(state);
 }
@@ -613,35 +818,51 @@ std::uint64_t ProbeHash([[maybe_unused]] const ManagerState* state,
 #endif
   return hash;
 }
-Node PublishMiss(ManagerState* state, const QueryKey& key, std::uint64_t hash,
-                 std::size_t slot) {
-  const auto result_sort = CompleteKeySort(state, key);
+template <class Child>
+Node PublishMiss(ManagerState* state, const QueryKey<Child>& key,
+                 std::uint64_t hash, std::size_t slot, SortId result_sort) {
   CheckNodeIdentity(state);
   if (state->table.EnsureSpace(state)) slot = state->table.FindVacant(hash);
   return PublishNode(state, slot, PrepareNode(state, key, result_sort, hash));
 }
 }  // namespace
 
-Node InternNode(ManagerState* state, const QueryKey& key) {
-  const auto hash = ProbeHash(state, HashKey(key));
+template <class Child>
+Node InternNode(ManagerState* state, const QueryKey<Child>& key,
+                SortId established_sort) {
+  const auto hash = ProbeHash(state, HashKey(state, key));
   auto [found, slot] = state->table.Probe(key, hash);
   if (found) {
     RetainNodeData(found);
     return Access::OwnNode(found);
   }
-  return PublishMiss(state, key, hash, slot);
+  const auto result_sort =
+      established_sort ? established_sort : CompleteKeySort(state, key);
+  return PublishMiss(state, key, hash, slot, result_sort);
 }
+template <class Child>
 Node InternPlainBuiltin(ManagerState* state, Kind kind,
-                        std::span<const NodeView> children) {
-  const auto hash = ProbeHash(state, Mix(HashShape(kind, 0, children)));
+                        std::span<Child> children) {
+  const auto hash = ProbeHash(state, Mix(HashShape(state, kind, 0, children)));
   auto [found, slot] = state->table.ProbePlain(kind, children, hash);
   if (found) {
     RetainNodeData(found);
     return Access::OwnNode(found);
   }
   CheckPlainBuiltinShape(state, kind, children.size());
-  return PublishMiss(state, QueryKey{kind, 0, children}, hash, slot);
+  const QueryKey<Child> key{kind, 0, children};
+  return PublishMiss(state, key, hash, slot, CompleteKeySort(state, key));
 }
+
+template std::uint64_t HashKey(ManagerState*, const QueryKey<>&) noexcept;
+template Candidate PrepareNode(ManagerState*, const QueryKey<>&, SortId,
+                               std::uint64_t);
+template Node InternNode(ManagerState*, const QueryKey<>&, SortId);
+template Node InternNode(ManagerState*, const QueryKey<Node>&, SortId);
+template Node InternPlainBuiltin(ManagerState*, Kind,
+                                 std::span<const NodeView>);
+template Node InternPlainBuiltin(ManagerState*, Kind, std::span<Node>);
+
 void RetainNodeData(NodeData* node) {
   RetainCheckpoint(node->state);
   if (node->ref_count >= ReferenceCapacity(node->state)) throw ReferenceLimit{};
@@ -732,8 +953,8 @@ void ReleaseRootBatch(ManagerState* state,
                       std::span<const RootRange> ranges) noexcept {
   ReleaseRootBatchImpl(state, [&](auto consume) noexcept {
     for (const auto& range : ranges) {
-      for (std::size_t i = 0; i < range.count; ++i)
-        consume(*range.at(range.context, i));
+      for (std::size_t i = 0; i < Access::RootCount(range); ++i)
+        consume(Access::RootAt(range, i));
     }
   });
 }

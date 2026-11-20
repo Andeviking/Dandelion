@@ -165,34 +165,37 @@ TEST_F(Lifetime, BatchReleaseMatchesSequentialReleaseWithMostlyLiveNodes) {
   EXPECT_EQ(exercise(true), exercise(false));
 }
 
-TEST(RootRangeTest, FromProjectsNodeMembersInHeterogeneousRecords) {
-  std::array<EntryA, 2> terms{};
-  std::array bodies = {EntryB{11, {}}, EntryB{22, {}}};
+TEST_F(Lifetime, RootRangesReleaseDirectSlotsAndHeterogeneousMembers) {
+  const auto state = Take(manager_.RetainState());
+  std::array roots = {Int(1), Int(2)};
+  std::array terms = {EntryA{Int(3)}, EntryA{Int(4)}};
+  std::array bodies = {EntryB{11, Int(5)}, EntryB{22, Int(6)}};
+  const std::span<Node> direct_roots = roots;
   const std::span<EntryA> term_records = terms;
   const std::span<EntryB> body_records = bodies;
+  static_assert(noexcept(RootRange::From(direct_roots)));
   static_assert(noexcept(RootRange::From<&EntryA::term>(term_records)));
   static_assert(noexcept(RootRange::From<&EntryB::body>(body_records)));
   static_assert(
-      requires(const ManagerRef& state, std::span<const RootRange> ranges) {
+      requires(const ManagerRef& manager, std::span<const RootRange> ranges) {
         {
-          NodeManager::ReleaseRoots(state, ranges)
+          NodeManager::ReleaseRoots(manager, ranges)
         } noexcept -> std::same_as<Result<void>>;
       });
 
-  const auto first = RootRange::From<&EntryA::term>(term_records);
-  const auto second = RootRange::From<&EntryB::body>(body_records);
-  EXPECT_EQ(first.context, terms.data());
-  EXPECT_EQ(second.context, bodies.data());
-  EXPECT_EQ(first.count, terms.size());
-  EXPECT_EQ(second.count, bodies.size());
-  ASSERT_NE(first.at, nullptr);
-  ASSERT_NE(second.at, nullptr);
-  for (std::size_t i = 0; i < terms.size(); ++i) {
-    EXPECT_EQ(first.at(first.context, i), &terms[i].term);
-  }
-  for (std::size_t i = 0; i < bodies.size(); ++i) {
-    EXPECT_EQ(second.at(second.context, i), &bodies[i].body);
-  }
+  const std::array ranges = {RootRange::From(direct_roots),
+                             RootRange::From<&EntryA::term>(term_records),
+                             RootRange::From<&EntryB::body>(body_records)};
+  const auto untouched = Int(7);
+  const auto before = NodeTestPeer::GetStats(manager_).node_reclamations;
+  Take(NodeManager::ReleaseRoots(state, ranges));
+  for (const auto& root : roots) EXPECT_EQ(root.GetId(), 0);
+  for (const auto& entry : terms) EXPECT_EQ(entry.term.GetId(), 0);
+  for (const auto& entry : bodies) EXPECT_EQ(entry.body.GetId(), 0);
+  EXPECT_EQ(bodies[0].tag, 11);
+  EXPECT_EQ(bodies[1].tag, 22);
+  EXPECT_EQ(Int(7), untouched);
+  EXPECT_EQ(NodeTestPeer::GetStats(manager_).node_reclamations, before + 6);
 }
 
 TEST_F(Lifetime, MultiRangeReleaseRejectsNullManager) {
@@ -208,18 +211,19 @@ TEST_F(Lifetime, MultiRangeReleaseRejectsNullManager) {
   EXPECT_EQ(NodeTestPeer::RefCount(terms[0].term), 1);
 }
 
-TEST_F(Lifetime, MultiRangeReleaseRejectsMissingCallbackBeforeConsuming) {
-  const auto state = Take(manager_.RetainState());
-  std::array terms = {EntryA{Int(1)}};
-  const auto id = terms[0].term.GetId();
-  const std::array ranges = {
-      RootRange::From<&EntryA::term>(std::span<EntryA>{terms}),
-      RootRange{terms.data(), 1, nullptr}};
+template <class Range, auto Member, class Record>
+concept ProjectsRoot = requires(std::span<Record> records) {
+  Range::template From<Member>(records);
+};
 
-  Error(NodeManager::ReleaseRoots(state, ranges), ErrorCode::kInvalidParameter);
-  ASSERT_EQ(terms[0].term.GetId(), id);
-  EXPECT_EQ(NodeTestPeer::RefCount(terms[0].term), 1);
-}
+using RootAccessor = Node* (*)(void*, std::size_t) noexcept;
+static_assert(!std::is_aggregate_v<RootRange>);
+static_assert(
+    !std::is_constructible_v<RootRange, void*, std::size_t, RootAccessor>);
+static_assert(!ProjectsRoot<RootRange, &EntryB::tag, EntryB>);
+static_assert(!ProjectsRoot<RootRange, &EntryA::term, const EntryA>);
+static_assert(
+    !ProjectsRoot<RootRange, static_cast<Node EntryA::*>(nullptr), EntryA>);
 
 TEST_F(Lifetime, MultiRangeReleaseRejectsForeignRootBeforeConsuming) {
   const auto state = Take(manager_.RetainState());

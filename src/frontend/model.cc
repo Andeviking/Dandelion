@@ -30,7 +30,8 @@ Node ModelState::RegisterProxy(const ValueRef& value, ProxyBindings& bindings,
   return node;
 }
 
-SessionState::SessionState(Scanner input, std::shared_ptr<ModelOwner> model)
+SessionState::SessionState(Scanner input, std::shared_ptr<ModelOwner> model,
+                           ParseOptions parse)
     : scanner(std::move(input)),
       manager([&]() {
         if (!model)
@@ -41,13 +42,12 @@ SessionState::SessionState(Scanner input, std::shared_ptr<ModelOwner> model)
       }()),
       sealed(model->GetSharedQuery()),
       inspection_model(std::move(model)),
-      metadata(sealed->GetMetadata().begin(), sealed->GetMetadata().end()),
+      source_records(parse.capture_source_records
+                         ? std::make_unique<SourceRecords>()
+                         : nullptr),
       options(sealed->GetOptions()),
-      phase(SessionPhase::kAfterCheck) {
-#ifdef DANDELION_FRONTEND_TESTING
-  scanner.Pool().stats = &stats;
-#endif
-}
+      parse_options(parse),
+      phase(SessionPhase::kAfterCheck) {}
 
 std::pair<Node, std::string> ResolveModelReference(
     const ModelOwner& model, const QueryContext& query, std::string_view name,
@@ -301,16 +301,28 @@ void ModelOwner::ForceKeyHashCollisions() {
 Outcome<Session> Session::ForModelText(std::shared_ptr<ModelOwner> model,
                                        std::string_view text,
                                        std::uint32_t source) {
-  return detail::Guard({source, {}, {}}, [&] {
-    return Session(std::make_unique<detail::SessionState>(
-        detail::Scanner(text, source), std::move(model)));
-  });
+  return ForModelText(std::move(model), text, ParseOptions{}, source);
 }
 Outcome<Session> Session::ForModelReader(std::shared_ptr<ModelOwner> model,
                                          Reader reader, std::uint32_t source) {
+  return ForModelReader(std::move(model), std::move(reader), ParseOptions{},
+                        source);
+}
+Outcome<Session> Session::ForModelText(std::shared_ptr<ModelOwner> model,
+                                       std::string_view text,
+                                       ParseOptions options,
+                                       std::uint32_t source) {
   return detail::Guard({source, {}, {}}, [&] {
     return Session(std::make_unique<detail::SessionState>(
-        detail::Scanner(std::move(reader), source), std::move(model)));
+        detail::Scanner(text, source), std::move(model), options));
+  });
+}
+Outcome<Session> Session::ForModelReader(std::shared_ptr<ModelOwner> model,
+                                         Reader reader, ParseOptions options,
+                                         std::uint32_t source) {
+  return detail::Guard({source, {}, {}}, [&] {
+    return Session(std::make_unique<detail::SessionState>(
+        detail::Scanner(std::move(reader), source), std::move(model), options));
   });
 }
 }  // namespace dandelion::frontend

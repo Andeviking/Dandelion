@@ -1,5 +1,6 @@
 module dandelion.node;
 import :internal;
+import dandelion.util.numeric;
 import std;
 
 namespace dandelion::detail {
@@ -32,6 +33,9 @@ std::uint32_t CheckedFpWidth(std::uint32_t exponent,
   return exponent + significand;
 }
 SortId InternSort(ManagerState* state, SortKey key) {
+#ifdef DANDELION_NODE_TESTING
+  ++state->sort_table_lookups;
+#endif
   const auto found = state->sort_index.find(key);
   if (found != state->sort_index.end()) return (*found)->id;
   const auto id = NextStoreId(state, state->sorts.size());
@@ -45,6 +49,17 @@ SortId InternSort(ManagerState* state, SortKey key) {
   AllocationCheckpoint(state);
   state->sort_index.insert(record.get());
   state->sorts.push_back(std::move(record));
+  return id;
+}
+SortId BvSortId(ManagerState* state, std::uint64_t width) {
+  Require(width != 0, ErrorCode::kInvalidParameter);
+  if (width > std::numeric_limits<std::uint32_t>::max())
+    Fail(ErrorCode::kResourceLimit, ResourceKind::kSize);
+  const SortKey key{
+      SortKind::kBitVector, static_cast<std::uint32_t>(width), 0, 0, {}};
+  if (width > state->bv_sorts.size()) return InternSort(state, key);
+  auto& id = state->bv_sorts[width - 1];
+  if (!id) id = InternSort(state, key);
   return id;
 }
 SortId InstantiateSortId(ManagerState* state, SortConstructorId constructor,
@@ -92,13 +107,11 @@ std::optional<std::uint32_t> SortView::GetWidth() const noexcept {
   if (GetKind() != SortKind::kBitVector) return std::nullopt;
   return static_cast<std::uint32_t>(SortAt(state_, id_).first);
 }
-std::optional<std::uint32_t> SortView::GetFpExponentWidth() const noexcept {
-  if (GetKind() != SortKind::kFloatingPoint) return std::nullopt;
-  return static_cast<std::uint32_t>(SortAt(state_, id_).first);
-}
-std::optional<std::uint32_t> SortView::GetFpSignificandWidth() const noexcept {
-  if (GetKind() != SortKind::kFloatingPoint) return std::nullopt;
-  return static_cast<std::uint32_t>(SortAt(state_, id_).second);
+std::optional<FpFormat> SortView::GetFpFormat() const noexcept {
+  const auto& sort = SortAt(state_, id_);
+  if (sort.kind != SortKind::kFloatingPoint) return std::nullopt;
+  return FpFormat::FromCanonicalWidths(static_cast<std::uint32_t>(sort.first),
+                                       static_cast<std::uint32_t>(sort.second));
 }
 std::optional<SortView> SortView::GetArrayIndex() const noexcept {
   if (GetKind() != SortKind::kArray) return std::nullopt;
@@ -160,25 +173,50 @@ Result<Sort> NodeManager::RoundingModeSort() {
     return Access::Own<SortView>(state, id);
   });
 }
+namespace {
+Sort RetainBvSort(ManagerState* state, std::uint64_t width) {
+  // Acquire the result's reference before first-use sort publication.
+  StateLease lease(state);
+  const auto id = BvSortId(state, width);
+  lease.Transfer();
+  return Access::Own<SortView>(state, id);
+}
+}  // namespace
 Result<Sort> NodeManager::MakeBvSort(IntegerView width) {
   return Guard<Sort>([&] {
     auto* state = CheckedState(*this);
-    const auto value = PositiveWidth(width);
-    StateLease lease(state);
-    const auto id = InternSort(state, {SortKind::kBitVector, value, 0, 0, {}});
-    lease.Transfer();
-    return Access::Own<SortView>(state, id);
+    return RetainBvSort(state, PositiveWidth(width));
   });
+}
+Result<Sort> NodeManager::MakeBvSort(std::uint64_t width) {
+  return Guard<Sort>([&] { return RetainBvSort(CheckedState(*this), width); });
 }
 Result<Sort> NodeManager::MakeFpSort(IntegerView exponent,
                                      IntegerView significand) {
   return Guard<Sort>([&] {
     auto* state = CheckedState(*this);
-    const auto e = PositiveWidth(exponent, 2);
-    const auto s = PositiveWidth(significand, 2);
-    CheckedFpWidth(e, s);
+    const auto format = FpFormat::Make(exponent, significand);
+    if (!format) {
+      using numeric::NumericError;
+      const auto error = format.error();
+      std::uint64_t parameter = std::numeric_limits<std::uint64_t>::max();
+      if (error == NumericError::kInvalidArgument) {
+        parameter = exponent.Compare(IntegerView(2)) < 0 ? 0 : 1;
+      } else if (error == NumericError::kSizeLimit) {
+        if (!exponent.TryUint32())
+          parameter = 0;
+        else if (!significand.TryUint32())
+          parameter = 1;
+      }
+      throw Failure{TranslateNumericError(
+          error, false, std::numeric_limits<std::uint64_t>::max(), parameter)};
+    }
     StateLease lease(state);
-    const auto id = InternSort(state, {SortKind::kFloatingPoint, e, s, 0, {}});
+    const auto id = InternSort(state, {SortKind::kFloatingPoint,
+                                       format->ExponentWidth(),
+                                       format->SignificandWidth(),
+                                       0,
+                                       {}});
     lease.Transfer();
     return Access::Own<SortView>(state, id);
   });

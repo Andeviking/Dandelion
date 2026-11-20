@@ -1,9 +1,79 @@
 # First-version node acceptance
 
-Status: **implemented and verified**, updated 2026-11-19. This is expression-system
-acceptance, not parser, arithmetic evaluation or solver acceptance. The
-[feature inventory](node-inventory.md) records every publishable Kind, sort,
-declaration category, applicable dimensions and deferred frontend checks.
+This record covers the implemented expression system and its numeric
+integration through Phase 6. The [feature inventory](node-inventory.md)
+records every publishable Kind, sort, declaration category, applicable
+dimensions and frontend checks. The dated runs describe their respective
+builds.
+
+## Phases 4B, 5, and 6
+
+Phase 4B migrated the frontend and Node replay to the typed numeric APIs.
+The frontend uses the util FP rounding kernel for concrete rational
+conversion rendering. Targeted CTest runs on 2026-11-20 passed all 312
+frontend cases in GCC Debug with ASan and UBSan, Clang Debug, and GCC Release.
+The evidence is in `dandelion-phase4b-frontend` under the experiment output
+directory, in the `*-ctest-lowercase.log` files.
+
+Phase 5 added typed numeric interning cases and a benchmark-local DAG folder.
+The standalone arithmetic and Node benchmarks and their dry-run contracts
+are recorded in the [benchmark test design](benchmark.md#numeric-and-constant-evaluation-benchmarks).
+Phase 6 optimized standalone arithmetic and Node Int interning. The Node
+path carries the already established Int sort into interning and retains
+the complete signed magnitude in wide keys.
+
+The Phase 6B matrix on 2026-11-20 covered Node, frontend, util, tooling, and
+benchmark integration. All 496 Node and 312 frontend cases passed in each
+configuration. The four skips in each run were opt-in reference or corpus
+probes. Both failures in the benchmark-enabled GCC sanitizer run occurred
+in subprocesses whose address-space limits blocked ASan shadow memory.
+The logs are in `dandelion-phase6b-node` under the experiment output directory.
+
+| Configuration | Passed | Failed | Skipped |
+| --- | ---: | ---: | ---: |
+| GCC Debug with ASan and UBSan, benchmarks off | 937 | 0 | 4 |
+| Clang Debug, benchmarks on | 952 | 0 | 4 |
+| GCC Release, benchmarks on | 952 | 0 | 4 |
+| GCC Debug with ASan and UBSan, benchmarks on | 950 | 2 | 4 |
+
+## Phase 4A numeric boundary and payloads
+
+GCC 16.2.0 and Clang 23.1.5 built `dandelion_util_tests` and
+`dandelion_node_tests` with warnings treated as errors. CTest ran both
+registered suites in each configuration. [Numeric payload coverage](node.md#phase-1c-typed-literals-and-inline-numeric-payloads)
+
+| Configuration | Util passed | Node passed | Failed or skipped |
+| --- | ---: | ---: | ---: |
+| GCC Debug with ASan and UBSan | 48 | 493 | 0 |
+| Clang Debug | 48 | 493 | 0 |
+| GCC Release | 48 | 493 | 0 |
+
+Standalone Node-only, util-only, and typed Node consumers linked and ran
+with tests disabled on both compilers. Compile probes checked module
+visibility with tests enabled and disabled. The project formatter and
+the scoped Clang naming check passed.
+
+The Phase 4A evidence includes `check_module_visibility.py`, the probe
+sources, and `module-visibility.log` in `dandelion-phase4a` under the
+experiment output directory. To repeat the checks in fresh builds, enable
+`CMAKE_EXPORT_COMPILE_COMMANDS` and build the public Node and util consumers
+on GCC and Clang, once with tests enabled and once with tests disabled.
+Use each consumer's object command from `compile_commands.json` with its
+working directory and module-map flags. Replace the source argument with
+the probe source, remove `-o` and its argument and any dependency-emission
+flags, and use `-fsyntax-only` in place of `-c`. Compile the positive
+Node-only, util-only, and typed Node probes first. For each negative probe,
+add one of the imports or names below to the corresponding positive source
+and require a diagnostic at that import or declaration.
+
+| Positive import | Negative probe |
+| --- | --- |
+| `import dandelion.node;` | Refer to `dandelion::numeric::Integer` or `dandelion::NodeTestPeer` in separate probes. |
+| `import dandelion.node;` | Attempt to import the removed `dandelion.numeric` module or Node's private `:internal` partition in separate probes. |
+| `import dandelion.util.numeric;` | Refer to `dandelion::numeric::NumericTestPeer` or `dandelion::NodeManager` in separate probes. |
+
+This phase verified the Node and util boundary before Phase 4B migrated
+`dandelion_frontend` and `dandelion_node_workload`.
 
 ## Node rectification verification
 
@@ -45,10 +115,11 @@ files.
 
 The original first-version acceptance record follows.
 
-## Implemented components
+## First-version implemented components
 
-`dandelion_node` is a C++23 static library with public `dandelion.numeric` and
-`dandelion.node` modules and one private `dandelion.node:internal` partition.
+The first version of `dandelion_node` was a C++23 static library with public
+`dandelion.numeric` and `dandelion.node` modules and one private
+`dandelion.node:internal` partition.
 Shared internal types are defined once in that partition. GMP is a private
 link dependency; no SAT backend is found or linked.
 
@@ -198,7 +269,7 @@ cover potentially allocating project operations and enclosing container work;
 they may fire even when spare capacity avoids a real allocation. They do not
 promise recovery from arbitrary GMP OOM or replace its global allocator.
 
-## Deferred frontend integration
+## First-version deferred frontend integration
 
 The node API tests verify declaration/formal identities, shared actual-argument
 edges, concrete signatures and the typed testers/selectors/ite structures a
@@ -206,7 +277,8 @@ frontend can build. They do not execute a parser or substitution engine.
 Source `let` simultaneity, definition capture/shadowing, match parsing and
 exhaustiveness/duplicate-pattern order, :named closedness and command rollback,
 qualified overload resolution, source occurrences, aliases, logic/profile
-restrictions and parsing roundtrips remain frontend acceptance items.
+restrictions and parsing roundtrips were frontend acceptance items.
+[Frontend implementation and acceptance](../frontend/implementation.md)
 Rewriter, SAT backend, theory procedures and model solving were outside this
 task and are not claimed as implemented.
 

@@ -1,5 +1,6 @@
 module dandelion.frontend:internal;
 import dandelion.frontend;
+import dandelion.util.numeric;
 import std;
 
 namespace dandelion::frontend::detail {
@@ -9,11 +10,31 @@ struct Failure {
   Diagnostic error;
 };
 
-[[noreturn]] inline void Fail(DiagnosticCode code, SourceSpan where,
-                              std::string_view message) {
-  throw Failure{{code, where, message}};
+[[noreturn, gnu::cold]] void Fail(DiagnosticCode code, SourceSpan where,
+                                  std::string_view message);
+[[noreturn]] void OutputError(SourceSpan where, std::string_view message,
+                              std::error_code error = {});
+[[noreturn, gnu::cold]] void NodeFailure(NodeError error, SourceSpan where);
+[[noreturn, gnu::cold]] void NumericFailure(numeric::NumericError error,
+                                            SourceSpan where);
+
+class ReadScope {
+ public:
+  explicit ReadScope(bool& in_read) noexcept : in_read_(in_read) {
+    in_read_ = true;
+  }
+  ReadScope(const ReadScope&) = delete;
+  ReadScope& operator=(const ReadScope&) = delete;
+  ~ReadScope() { in_read_ = false; }
+
+ private:
+  bool& in_read_;
+};
+
+inline Diagnostic ReentrantRead(SourceSpan where) noexcept {
+  return {DiagnosticCode::kInvalidState, where, "Input read is already active"};
 }
-[[noreturn]] void NodeFailure(NodeError error, SourceSpan where);
+
 template <class T>
 T Take(Result<T> result, SourceSpan where) {
   if (!result) NodeFailure(result.error(), where);
@@ -55,7 +76,6 @@ struct TextHash {
 };
 template <class T>
 using TextMap = std::unordered_map<std::string, T, TextHash, std::equal_to<>>;
-using TextSet = std::unordered_set<std::string, TextHash, std::equal_to<>>;
 
 enum class TokenKind : std::uint8_t {
   kLeft,
@@ -73,331 +93,245 @@ enum class TokenKind : std::uint8_t {
 using ExprId = std::size_t;
 constexpr auto kNoExpr = std::numeric_limits<ExprId>::max();
 
-using SpellingId = std::uint16_t;
-constexpr SpellingId kUnknownSpelling = 0;
+enum class SpellingId : std::uint16_t {
+  kUnknown,
+  kAnnotation,
+  kUnderscore,
+  kAs,
+  kExists,
+  kForall,
+  kLambda,
+  kLet,
+  kMatch,
+  kPar,
+  kOtherReserved,
+  kIs,
+  kTrue,
+  kFalse,
+  kBool,
+  kInt,
+  kArray,
+  kBitVec,
+  kFloatingPoint,
+  kRoundingMode,
+  kFloat16,
+  kFloat32,
+  kFloat64,
+  kFloat128,
+  kReal,
+  kString,
+  kRegLan,
+  kFunctionSort,
+  kRne,
+  kRna,
+  kRtp,
+  kRtn,
+  kRtz,
+  kOperatorBase = 128,
+  kCommandBase = 512,
+};
+constexpr auto kUnknownSpelling = SpellingId::kUnknown;
 using SyntaxWord = std::uint64_t;
 
-// The outer directory indexes blocks of pages. Growing it only moves pointers.
-// Compact rows are promoted independently and keep their logical index.
-template <std::size_t Fields, std::size_t Metadata = 0, bool Line = false>
-class SyntaxPages {
- public:
-  using Record = std::array<SyntaxWord, Fields>;
-  using Compact = std::array<std::uint32_t, Line ? 1 : Fields>;
-  static constexpr std::size_t kPrefixSize = 32;
-  static constexpr std::size_t kPageSize = 512;
-  template <class Row>
-  using Rows = std::array<Row, kPageSize>;
-  struct Pool {
-    std::array<std::unique_ptr<Rows<Compact>>, 2> compact;
-    std::unique_ptr<Rows<Record>> wide;
-  };
-
-  SyntaxPages(Pool& pool, SyntaxWord threshold, FrontendStats* stats) noexcept
-      : pool_(pool), threshold_(threshold), stats_(stats) {}
-  ~SyntaxPages() {
-    Return(prefix_page_);
-    for (auto& directory : directory_)
-      for (auto& page : *directory) Return(page);
-  }
-  SyntaxPages(const SyntaxPages&) = delete;
-  SyntaxPages& operator=(const SyntaxPages&) = delete;
-
-  std::size_t Size() const noexcept { return size_; }
-  Record Get(std::size_t index) const noexcept {
-    const auto [page, slot] = Locate(index);
-    if (index < kPrefixSize)
-      return prefix_page_.wide ? (*prefix_page_.wide)[slot]
-                               : Decode(prefix_[slot]);
-    const auto& rows = (*directory_[page / kFanout])[page % kFanout];
-    return rows.wide ? (*rows.wide)[slot] : Decode((*rows.compact)[slot]);
-  }
-  void Append(Record value) {
-    if (size_ == std::numeric_limits<std::size_t>::max())
-      throw std::length_error("Syntax record count");
-    Set(size_, value);
-    ++size_;
-  }
-  void Set(std::size_t index, Record value) {
-    const auto [page_index, slot] = Locate(index);
-    const bool inline_page = index < kPrefixSize;
-    auto& page = inline_page ? prefix_page_ : EnsurePage(page_index);
-    const bool fits = Fits(value);
-    if (!fits && !page.wide) {
-      auto wide = AcquireWide();
-      const auto* compact = inline_page    ? prefix_.data()
-                            : page.compact ? page.compact->data()
-                                           : nullptr;
-      const auto page_start = index - slot;
-      const auto used =
-          std::min(inline_page ? kPrefixSize : kPageSize, size_ - page_start);
-      if (used != 0) {
-        for (std::size_t i = 0; i < used; ++i) (*wide)[i] = Decode(compact[i]);
-        Count(&FrontendStats::syntax_page_copies);
-      }
-      page.wide = std::move(wide);
-      ReturnCompact(page);
-      Count(&FrontendStats::syntax_promoted_pages);
-    }
-    if (page.wide) {
-      (*page.wide)[slot] = value;
-    } else if (inline_page) {
-      prefix_[slot] = Encode(value);
-    } else {
-      if (!page.compact) page.compact = AcquireCompact();
-      (*page.compact)[slot] = Encode(value);
-    }
-  }
-
- private:
-  static constexpr std::size_t kFanout = 64;
-  struct Page {
-    std::unique_ptr<Rows<Compact>> compact;
-    std::unique_ptr<Rows<Record>> wide;
-  };
-  static std::pair<std::size_t, std::size_t> Locate(
-      std::size_t index) noexcept {
-    if (index < kPrefixSize) return {0, index};
-    index -= kPrefixSize;
-    return {index / kPageSize, index % kPageSize};
-  }
-  Page& EnsurePage(std::size_t index) {
-    const auto block = index / kFanout;
-    if (block == directory_.size())
-      directory_.push_back(std::make_unique<std::array<Page, kFanout>>());
-    return (*directory_[block])[index % kFanout];
-  }
-  bool Fits(const Record& row) const noexcept {
-    constexpr auto limit = std::numeric_limits<std::uint32_t>::max();
-    if constexpr (Line)
-      return row[0] <= std::min<SyntaxWord>(limit >> 1, threshold_);
-    for (std::size_t i = 0; i < Fields - Metadata; ++i)
-      if (row[i] > limit || row[i] > threshold_) return false;
-    return true;
-  }
-  static Compact Encode(const Record& row) noexcept {
-    if constexpr (Line) {
-      return {static_cast<std::uint32_t>((row[0] << 1) | row[1])};
-    } else {
-      Compact compact;
-      for (std::size_t i = 0; i < Fields; ++i)
-        compact[i] = static_cast<std::uint32_t>(row[i]);
-      return compact;
-    }
-  }
-  static Record Decode(const Compact& row) noexcept {
-    if constexpr (Line) {
-      return {row[0] >> 1, row[0] & 1};
-    } else {
-      Record wide;
-      for (std::size_t i = 0; i < Fields; ++i) wide[i] = row[i];
-      return wide;
-    }
-  }
-  void Count(std::size_t FrontendStats::* member) noexcept {
-    if (stats_) ++(stats_->*member);
-  }
-  std::unique_ptr<Rows<Compact>> AcquireCompact() {
-    for (auto& page : pool_.compact)
-      if (page) return std::move(page);
-    Count(&FrontendStats::syntax_page_allocations);
-    return std::make_unique_for_overwrite<Rows<Compact>>();
-  }
-  std::unique_ptr<Rows<Record>> AcquireWide() {
-    if (pool_.wide) return std::move(pool_.wide);
-    Count(&FrontendStats::syntax_page_allocations);
-    return std::make_unique_for_overwrite<Rows<Record>>();
-  }
-  void ReturnCompact(Page& page) noexcept {
-    if (!page.compact) return;
-    for (auto& spare : pool_.compact) {
-      if (spare) continue;
-      spare = std::move(page.compact);
-      return;
-    }
-    page.compact.reset();
-  }
-  void Return(Page& page) noexcept {
-    ReturnCompact(page);
-    if (page.wide && !pool_.wide) pool_.wide = std::move(page.wide);
-  }
-
-  Pool& pool_;
-  SyntaxWord threshold_;
-  FrontendStats* stats_;
-  std::size_t size_ = 0;
-  std::array<Compact, kPrefixSize> prefix_;
-  Page prefix_page_;
-  std::vector<std::unique_ptr<std::array<Page, kFanout>>> directory_;
-};
-
-using TokenPages = SyntaxPages<4, 1>;
-using ExpressionPages = SyntaxPages<4>;
-using EdgePages = SyntaxPages<1>;
-using LinePages = SyntaxPages<2, 1, true>;
-static_assert(sizeof(TokenPages::Compact) == 16);
-static_assert(sizeof(ExpressionPages::Compact) == 16);
-static_assert(sizeof(EdgePages::Compact) == 4);
-static_assert(sizeof(LinePages::Compact) == 4);
-
-class ChildRange {
- public:
-  class Iterator {
-   public:
-    // NOLINTBEGIN(readability-identifier-naming): Standard iterator interface.
-    using value_type = ExprId;
-    using difference_type = std::ptrdiff_t;
-    using iterator_concept = std::bidirectional_iterator_tag;
-    // NOLINTEND(readability-identifier-naming)
-    Iterator() noexcept = default;
-    ExprId operator*() const noexcept {
-      return static_cast<ExprId>(edges_->Get(index_)[0]);
-    }
-    Iterator& operator++() noexcept {
-      ++index_;
-      return *this;
-    }
-    Iterator operator++(int) noexcept {
-      auto previous = *this;
-      ++*this;
-      return previous;
-    }
-    Iterator& operator--() noexcept {
-      --index_;
-      return *this;
-    }
-    Iterator operator--(int) noexcept {
-      auto previous = *this;
-      --*this;
-      return previous;
-    }
-    friend bool operator==(Iterator, Iterator) = default;
-
-   private:
-    friend class ChildRange;
-    Iterator(const EdgePages* edges, std::size_t index) noexcept
-        : edges_(edges), index_(index) {}
-    const EdgePages* edges_ = nullptr;
-    std::size_t index_ = 0;
-  };
-
-  ChildRange() noexcept = default;
-  ChildRange(const EdgePages& edges, std::size_t first,
-             std::size_t count) noexcept
-      : edges_(&edges), first_(first), count_(count) {}
-  // NOLINTNEXTLINE(readability-identifier-naming): Standard range interface.
-  std::size_t size() const noexcept { return count_; }
-  // NOLINTNEXTLINE(readability-identifier-naming): Standard range interface.
-  bool empty() const noexcept { return count_ == 0; }
-  ExprId operator[](std::size_t index) const noexcept {
-    return *Iterator(edges_, first_ + index);
-  }
-  // NOLINTNEXTLINE(readability-identifier-naming): Standard range interface.
-  ExprId front() const noexcept { return (*this)[0]; }
-  // NOLINTNEXTLINE(readability-identifier-naming): Standard range interface.
-  ExprId back() const noexcept { return (*this)[count_ - 1]; }
-  // NOLINTNEXTLINE(readability-identifier-naming): Standard range interface.
-  Iterator begin() const noexcept { return Iterator(edges_, first_); }
-  // NOLINTNEXTLINE(readability-identifier-naming): Standard range interface.
-  Iterator end() const noexcept { return Iterator(edges_, first_ + count_); }
-  // NOLINTNEXTLINE(readability-identifier-naming): Span-style accessor.
-  ChildRange subspan(std::size_t start) const noexcept {
-    return ChildRange(edges_, first_ + start, count_ - start);
-  }
-
- private:
-  ChildRange(const EdgePages* edges, std::size_t first,
-             std::size_t count) noexcept
-      : edges_(edges), first_(first), count_(count) {}
-  const EdgePages* edges_ = nullptr;
-  std::size_t first_ = 0;
-  std::size_t count_ = 0;
-};
-
-struct SyntaxPool {
-  TokenPages::Pool tokens;
-  ExpressionPages::Pool expressions;
-  EdgePages::Pool edges;
-  LinePages::Pool lines;
-  std::array<std::unique_ptr<char[]>, 2> slabs;
-  FrontendStats* stats = nullptr;
-  SyntaxWord threshold = std::numeric_limits<std::uint32_t>::max();
-};
+using ChildRange = std::span<const ExprId>;
 
 struct Token {
-  SyntaxWord offset;
-  SyntaxWord storage;
-  SyntaxWord length;
+  // NOLINTBEGIN(readability-identifier-naming): Lexical record fields.
   TokenKind kind;
-  SpellingId spelling_id = kUnknownSpelling;
+  SpellingId spelling_id;
+  std::string_view raw;
+  SourceSpan where;
+  // NOLINTEND(readability-identifier-naming)
 };
-struct Expression {
-  std::size_t token;
-  std::size_t last_token;
-  std::size_t first_child = 0;
-  std::size_t child_count = 0;
-};
+
 struct Replacement {
+  // NOLINTBEGIN(readability-identifier-naming): Lexical record fields.
   std::size_t last_token;
   std::string spelling;
+  // NOLINTEND(readability-identifier-naming)
+};
+
+struct SortRecipe;
+
+// Most structural records hold a command rank or a fixed special-form
+// prefix. Only variable-length structural lists need overflow storage.
+class SyntaxChildren {
+ public:
+  ChildRange Range() const noexcept {
+    return overflow_.empty() ? ChildRange(inline_).first(size_)
+                             : ChildRange(overflow_);
+  }
+  void Push(ExprId id) {
+    if (size_ < inline_.size()) {
+      inline_[size_] = id;
+    } else {
+      if (size_ == inline_.size())
+        overflow_.assign(inline_.begin(), inline_.end());
+      overflow_.push_back(id);
+    }
+    ++size_;
+  }
+  void Pop() noexcept {
+    if (size_-- > inline_.size()) {
+      overflow_.pop_back();
+      if (size_ == inline_.size()) overflow_.clear();
+    }
+  }
+  void Clear() noexcept {
+    size_ = 0;
+    overflow_.clear();
+    if (overflow_.capacity() > 256) std::vector<ExprId>{}.swap(overflow_);
+  }
+
+ private:
+  std::array<ExprId, 6> inline_;
+  std::vector<ExprId> overflow_;
+  std::size_t size_ = 0;
+};
+
+struct Expression {
+  // NOLINTBEGIN(readability-identifier-naming): Lexical record fields.
+  TokenKind kind;
+  SpellingId spelling;
+  SourceSpan where;
+  std::string owned;
+  std::string_view raw;
+  SyntaxChildren children;
+  std::variant<std::monostate, SortView, const SortRecipe*, SortExpr> sort;
+  std::size_t token = 0;
+  std::size_t last_token = 0;
+  // NOLINTEND(readability-identifier-naming)
 };
 
 class Syntax {
  public:
-  Syntax(SyntaxPool& pool, std::string_view bytes, SourceSpan start) noexcept;
-  ~Syntax();
-  Syntax(const Syntax&) = delete;
-  Syntax& operator=(const Syntax&) = delete;
+  // NOLINTNEXTLINE(readability-identifier-naming): Current command record.
+  CommandHeader header{};
+  ExprId Add(Token token, bool borrow);
+  void Close(ExprId id, SourcePosition end) noexcept;
+  void DiscardChildren(ExprId id) noexcept;
+  void Discard(ExprId id) noexcept;
+  void Append(ExprId parent, ExprId child) {
+    Entry(parent).children.Push(child);
+  }
+  void Capture(Token token);
+  void Mark(ExprId id) noexcept;
+  void ForgetSpelling(ExprId id) noexcept {
+    auto& entry = Entry(id);
+    entry.raw = entry.raw == "0" ? "0" : "";
+  }
+  void RemoveLast(ExprId parent) noexcept;
+  void Reset() noexcept;
+  template <class SortValue>
+  const SortValue* ReducedSort(ExprId id) const noexcept {
+    return std::get_if<SortValue>(&GetExpression(id).sort);
+  }
+  template <class SortValue>
+  void SetReducedSort(ExprId id, SortValue sort) noexcept {
+    Entry(id).sort = sort;
+    DiscardChildren(id);
+  }
+  std::size_t LiveCount() const noexcept { return live_count_; }
+  void ClearCapture() noexcept {
+    captured_.clear();
+    mark_ = 0;
+    previous_ = TokenKind::kLeft;
+  }
 
-  // NOLINTNEXTLINE(readability-identifier-naming): Struct-style command record.
-  CommandHeader header = {};
-  std::string_view RawToken(std::size_t i) const noexcept;
+  const Expression& GetExpression(ExprId id) const noexcept {
+    return (*pages_[id / kPageSize])[id % kPageSize];
+  }
+  Token GetTokenInfo(ExprId id) const noexcept {
+    const auto& entry = GetExpression(id);
+    return {entry.kind, entry.spelling, entry.raw, entry.where};
+  }
   std::string_view Raw(ExprId id) const noexcept {
-    return RawToken(GetExpression(id).token);
+    return GetExpression(id).raw;
   }
-  TokenKind Type(ExprId id) const noexcept {
-    return GetToken(GetExpression(id).token).kind;
+  static bool Symbol(TokenKind kind) noexcept {
+    return kind == TokenKind::kSymbol || kind == TokenKind::kQuoted;
   }
+  TokenKind Type(ExprId id) const noexcept { return GetExpression(id).kind; }
   SpellingId Spelling(ExprId id) const noexcept {
-    return GetToken(GetExpression(id).token).spelling_id;
+    return GetExpression(id).spelling;
   }
-  std::string_view Name(ExprId id) const noexcept;
-  SourceSpan Span(ExprId id) const noexcept;
-  ChildRange Children(ExprId id) const noexcept;
-  bool Is(ExprId id, std::string_view unquoted) const noexcept;
-  bool IsSymbol(ExprId id) const noexcept;
+  static std::string_view Name(const Token& token) noexcept {
+    return token.kind == TokenKind::kQuoted
+               ? token.raw.substr(1, token.raw.size() - 2)
+               : token.raw;
+  }
+  std::string_view Name(ExprId id) const noexcept {
+    return Name(GetTokenInfo(id));
+  }
+  const SourceSpan& Span(ExprId id) const noexcept {
+    return GetExpression(id).where;
+  }
+  ChildRange Children(ExprId id) const noexcept {
+    return GetExpression(id).children.Range();
+  }
+  bool Is(ExprId id, std::string_view unquoted) const noexcept {
+    return Type(id) != TokenKind::kQuoted && Raw(id) == unquoted;
+  }
+  bool IsSymbol(ExprId id) const noexcept { return Symbol(Type(id)); }
   bool List(ExprId id) const noexcept { return Type(id) == TokenKind::kLeft; }
-  std::string Render(ExprId id,
-                     const std::unordered_map<std::size_t, Replacement>*
-                         replacements = nullptr) const;
-  Expression GetExpression(ExprId id) const noexcept;
+  std::string Render(
+      ExprId id,
+      const std::map<std::size_t, Replacement>* replacements = nullptr) const;
 
  private:
-  friend class Scanner;
-  static constexpr std::size_t kSlabSize = 16 * 1024;
-  struct Slab {
-    std::unique_ptr<char[]> small;
-    std::string large;
-  };
-  Token GetToken(std::size_t index) const noexcept;
-  void AddToken(Token token);
-  SyntaxWord Store(std::string_view bytes, std::string& scratch);
-  std::string_view Stored(SyntaxWord start, SyntaxWord length) const noexcept;
-  SourcePosition Position(SyntaxWord offset) const noexcept;
-  void LineBreak(SyntaxWord offset, bool continuation);
-
-  SyntaxPool& pool_;
-  std::string_view bytes_;
-  SourceSpan start_;
-  TokenPages tokens_;
-  ExpressionPages expressions_;
-  EdgePages edges_;
-  LinePages lines_;
-  std::array<char, 256> inline_bytes_;
-  std::size_t inline_used_ = 0;
-  std::vector<Slab> slabs_;
-  std::size_t slab_used_ = kSlabSize;
+  static constexpr std::size_t kPageSize = 32;
+  using Page = std::array<Expression, kPageSize>;
+  Expression& Entry(ExprId id) noexcept {
+    return (*pages_[id / kPageSize])[id % kPageSize];
+  }
+  std::vector<std::unique_ptr<Page>> pages_;
+  std::size_t slots_ = 0;
+  ExprId free_ = kNoExpr;
+  std::size_t live_count_ = 0;
+  std::string captured_;
+  std::size_t mark_ = 0;
+  TokenKind previous_ = TokenKind::kLeft;
 };
+
+// A source occurrence whose byte coordinates are needed only on failure.
+struct Location {
+  Location(const Syntax& syntax, ExprId expr) noexcept
+      : syntax_(&syntax), expr_(expr) {}
+  Location(const SourceSpan& where) noexcept : span_(&where), expr_(kNoExpr) {}
+  const SourceSpan& Span() const noexcept {
+    return expr_ == kNoExpr ? *span_ : syntax_->Span(expr_);
+  }
+
+ private:
+  union {
+    const Syntax* syntax_;
+    const SourceSpan* span_;
+  };
+  ExprId expr_;
+};
+
+[[noreturn]] inline void Fail(DiagnosticCode code, Location where,
+                              std::string_view message) {
+  Fail(code, where.Span(), message);
+}
+[[noreturn]] inline void NodeFailure(NodeError error, Location where) {
+  NodeFailure(error, where.Span());
+}
+template <class T>
+T TakeAt(Result<T> result, Location where) {
+  if (!result) [[unlikely]] {
+    NodeFailure(result.error(), where);
+  }
+  if constexpr (!std::is_void_v<T>) return std::move(*result);
+}
+
+template <class T>
+T TakeNumericAt(numeric::NumericResult<T> result, Location where) {
+  if (!result) [[unlikely]] {
+    NumericFailure(result.error(), where.Span());
+  }
+  return std::move(*result);
+}
 
 struct Operator;
 struct Identifier {
@@ -414,58 +348,122 @@ template <class Catalog, class Spelling>
 constexpr auto SpellingBuckets(const Catalog& entries, Spelling spelling) {
   // Bucket by length and first ASCII byte, keeping compact linked ordinals.
   struct Table {
-    std::array<SpellingId, 32 * 128> heads{};
-    std::array<SpellingId, std::tuple_size_v<Catalog>> next{};
+    std::array<std::uint16_t, 32 * 128> heads{};
+    std::array<std::uint16_t, std::tuple_size_v<Catalog>> next{};
   };
   Table table;
   for (std::size_t i = 0; i < entries.size(); ++i) {
     const auto word = spelling(entries[i]);
     auto& head = table.heads[word.size() * 128 +
                              static_cast<unsigned char>(word.front())];
-    table.next[i] = std::exchange(head, static_cast<SpellingId>(i + 1));
+    table.next[i] = std::exchange(head, static_cast<std::uint16_t>(i + 1));
   }
   return table;
 }
 template <class Catalog, class Spelling, class Table>
-SpellingId LookupSpelling(const Catalog& entries, Spelling spelling,
-                          const Table& table, std::string_view word) noexcept {
+std::uint16_t LookupSpelling(const Catalog& entries, Spelling spelling,
+                             const Table& table,
+                             std::string_view word) noexcept {
   if (word.empty() || word.size() >= 32 ||
       static_cast<unsigned char>(word.front()) >= 128)
-    return kUnknownSpelling;
+    return 0;
   auto id =
       table.heads[word.size() * 128 + static_cast<unsigned char>(word.front())];
   while (id && spelling(entries[id - 1]) != word) id = table.next[id - 1];
   return id;
 }
-SpellingId ClassifyOperator(std::string_view word) noexcept;
+SpellingId ClassifySymbol(std::string_view word) noexcept;
 const Operator* GetOperator(SpellingId id) noexcept;
+std::optional<numeric::RoundingMode> GetRoundingMode(SpellingId id) noexcept;
 bool IsSimpleSymbol(std::string_view word) noexcept;
 std::size_t Utf8Size(int first) noexcept;
 bool IsUtf8Continuation(int byte) noexcept;
 bool IsUtf8Scalar(unsigned scalar, std::size_t size) noexcept;
 bool IsQuotedByte(int byte) noexcept;
 
+enum class GrammarRole : std::uint8_t {
+  kCommand,
+  kTerm,
+  kSort,
+  kIdentifier,
+  kHead,
+  kPlainIdentifier,
+  kOpaque,
+  kAttributeValue,
+  kSymbol,
+  kNumeral,
+  kIndex,
+  kKeyword,
+  kString,
+  kBoolean,
+  kPattern,
+  kPatternSymbol,
+  kLetBindings,
+  kLetBinding,
+  kFormals,
+  kNonemptyFormals,
+  kFormal,
+  kCases,
+  kBranch,
+  kSorts,
+  kSymbols,
+  kParameters,
+  kTerms,
+  kValues,
+  kDatatype,
+  kConstructors,
+  kConstructor,
+  kDatatypeHeaders,
+  kDatatypeHeader,
+  kDatatypes,
+  kRecDeclarations,
+  kRecDeclaration,
+  kRecBodies,
+  kCommandName,
+  kInvalid
+};
+
+struct GrammarFrame {
+  // NOLINTBEGIN(readability-identifier-naming): Grammar frame fields.
+  GrammarRole role;
+  SourceSpan where;
+  std::size_t count = 0;
+  SpellingId head = kUnknownSpelling;
+  bool expect_attribute = true;
+  // NOLINTEND(readability-identifier-naming)
+};
+
 class Scanner {
  public:
   Scanner(std::string_view input, std::uint32_t source);
   Scanner(Reader reader, std::uint32_t source);
   SourceSpan Here() const noexcept { return {source_, position_, position_}; }
-  void Next(std::optional<Syntax>& pending);
-  SyntaxPool& Pool() noexcept { return pool_; }
+  std::optional<Token> Next();
+  // One indexed BV literal may borrow its digits until its width and close.
+  void HoldToken(std::string_view bytes);
+  std::string_view HeldToken(SourceSpan where) const;
+  void ReleaseToken() noexcept;
+  bool IsText() const noexcept { return !reader_; }
+  std::vector<GrammarFrame>& Frames() noexcept { return frames_; }
+#ifdef DANDELION_FRONTEND_TESTING
+  void Checkpoint();
+  void FailAllocationAfter(std::size_t checkpoints) noexcept {
+    fail_after_ = checkpoints;
+  }
+#endif
 
  private:
   static constexpr std::size_t kReaderCapacity = 64 * 1024;
   int Peek();
-  void TakeByte(int byte, Syntax* syntax);
+  void TakeByte(int byte);
   void Advance(std::size_t count);
-  void Trivia(Syntax* syntax = nullptr);
+  void Trivia();
   std::string_view TokenBytes();
   void SaveTokenPart();
-  void Scalar(int first, Syntax* syntax);
-  Token ScanToken(Syntax& syntax, int first);
-  void ReadCommand(std::optional<Syntax>& pending);
+  void SaveHeldToken() noexcept;
+  void Scalar(int first);
+  Token ScanToken(int first);
 
-  std::string_view text_;
   Reader reader_;
   std::unique_ptr<std::array<char, kReaderCapacity>> buffer_;
   std::string_view window_;
@@ -474,11 +472,40 @@ class Scanner {
   std::uint32_t source_;
   bool after_cr_ = false;
   bool eof_ = false;
-  SyntaxPool pool_;
   std::string scratch_;
+  std::string held_text_;
+  std::string_view held_;
+  ResourceKind held_error_ = ResourceKind::kNone;
+  bool held_borrowed_ = false;
+  std::vector<GrammarFrame> frames_;
   std::optional<std::size_t> token_start_;
+#ifdef DANDELION_FRONTEND_TESTING
+  std::optional<std::size_t> fail_after_;
+#endif
 };
-void ValidateSyntax(Syntax& syntax);
+
+struct Option;
+
+struct GrammarCommand {
+  // NOLINTBEGIN(readability-identifier-naming): Grammar command fields.
+  CommandKind kind = CommandKind::kUnsupported;
+  CommandKind shape = CommandKind::kUnsupported;
+  std::string_view excluded;
+  const Option* option = nullptr;
+  std::size_t recursive_count = 0;
+  std::size_t datatype_headers = 0;
+  std::size_t datatype_bodies = 0;
+  // NOLINTEND(readability-identifier-naming)
+};
+
+GrammarRole SpecialChildRole(GrammarFrame& parent, const Token& token,
+                             const GrammarCommand& command);
+bool AcceptAtom(GrammarRole role, const Token& token);
+bool AcceptList(GrammarRole role);
+std::size_t Minimum(const GrammarFrame& frame, const GrammarCommand& command);
+void ReadCommandName(GrammarCommand& command, SpellingId spelling);
+
+std::optional<CommandHeader> ReadGrammar(Scanner& scanner);
 
 enum class OptionKind { kBoolean, kNumeral, kString };
 enum class OptionId {
@@ -492,9 +519,102 @@ struct Option {
   std::string_view name;
   OptionId id;
   OptionKind kind;
-  std::string_view default_value;
+  CommandResponse default_value;
 };
 const Option* FindOption(std::string_view name) noexcept;
+
+inline GrammarRole NextRole(GrammarFrame& parent, const Token& token,
+                            const GrammarCommand& command) {
+  using enum GrammarRole;
+  if (parent.role == kTerm && parent.head == kUnknownSpelling &&
+      parent.count != 0) {
+    ++parent.count;
+    return kTerm;
+  }
+  if (parent.role == kLetBindings) {
+    ++parent.count;
+    return kLetBinding;
+  }
+  if (parent.role == kLetBinding && parent.count < 2)
+    return parent.count++ == 0 ? kSymbol : kTerm;
+  return SpecialChildRole(parent, token, command);
+}
+
+inline bool AtomAllowed(GrammarRole role, const Token& token) {
+  using enum GrammarRole;
+  if (role == kTerm)
+    return Syntax::Symbol(token.kind) || token.kind >= TokenKind::kNumeral;
+  if (role == kHead) return Syntax::Symbol(token.kind);
+  return AcceptAtom(role, token);
+}
+
+inline bool ListAllowed(GrammarRole role) {
+  using enum GrammarRole;
+  return role == kTerm || role == kHead || role == kLetBinding ||
+         role == kLetBindings || AcceptList(role);
+}
+
+inline bool Complete(const GrammarFrame& frame, const GrammarCommand& command) {
+  using enum GrammarRole;
+  if (frame.role == kTerm &&
+      (frame.count >= 3 || frame.head == kUnknownSpelling))
+    return frame.count != 0;
+  if (frame.role == kLetBindings) return frame.count != 0;
+  if (frame.role == kLetBinding) return frame.count == 2;
+  return frame.count >= Minimum(frame, command);
+}
+
+inline void ClosedGrammarFrame(const GrammarFrame& frame,
+                               GrammarCommand& command) {
+  using enum GrammarRole;
+  if (frame.role == kRecDeclarations) command.recursive_count = frame.count;
+  if (frame.role == kDatatypeHeaders) command.datatype_headers = frame.count;
+  if (frame.role == kDatatypes) command.datatype_bodies = frame.count;
+}
+
+inline void ReadGrammarAtom(const GrammarFrame& frame, GrammarRole role,
+                            const Token& token, GrammarCommand& command) {
+  using enum GrammarRole;
+  if (role == kCommandName) {
+    ReadCommandName(command, token.spelling_id);
+  } else if (frame.role == kCommand && frame.count == 2 &&
+             command.kind == CommandKind::kSetOption) {
+    command.option = FindOption(token.raw);
+  }
+}
+
+inline bool BeginCommand(Scanner& scanner, Token& token) {
+  const auto first = scanner.Next();
+  if (!first) return false;
+  if (first->kind != TokenKind::kLeft)
+    Fail(DiagnosticCode::kSyntax,
+         {first->where.source, first->where.begin, first->where.begin},
+         "Expected a command list");
+  token = *first;
+  return true;
+}
+
+inline Token ScanCommandToken(Scanner& scanner) {
+  const auto next = scanner.Next();
+  if (!next) [[unlikely]]
+    Fail(DiagnosticCode::kSyntax, scanner.Here(),
+         "Incomplete command at end of input");
+  return *next;
+}
+
+template <class Frame>
+Frame& PushFrame(Scanner& scanner, std::vector<Frame>& frames, GrammarRole role,
+                 const Token& token) {
+#ifdef DANDELION_FRONTEND_TESTING
+  if (frames.size() == frames.capacity()) scanner.Checkpoint();
+#else
+  static_cast<void>(scanner);
+#endif
+  auto& frame = frames.emplace_back();
+  frame.role = role;
+  frame.where = token.where;
+  return frame;
+}
 
 enum Feature : unsigned {
   kArrays = 1 << 0,
@@ -515,7 +635,6 @@ struct Profile {
 };
 const Profile* FindProfile(std::string_view name) noexcept;
 
-struct SortRecipe;
 struct Alias {
   std::uint64_t arity;
   const SortRecipe* root;
@@ -531,8 +650,13 @@ struct DatatypeMember {
   std::uint64_t ctor;
   std::optional<std::uint64_t> field;
 };
-using SortBinding = std::variant<SortConstructorView, Alias, DatatypeSort>;
-using TermBinding = std::variant<DeclInstanceView, DatatypeMember, std::size_t>;
+using SortBinding =
+    std::variant<SortConstructorView, Sort, Alias, DatatypeSort>;
+enum class AliasOrdinal : std::size_t {};
+enum class MemberOrdinal : std::size_t {};
+using TermBinding =
+    std::variant<DeclInstanceView, DatatypeMember, AliasOrdinal>;
+using TermEntry = std::variant<DeclInstanceView, MemberOrdinal, AliasOrdinal>;
 enum class RecipeKind { kConcrete, kParameter, kArray, kApply };
 struct SortRecipe {
   RecipeKind kind;
@@ -553,7 +677,7 @@ struct RecipeHash {
 template <class T>
 class NameTable {
  public:
-  using Entry = std::pair<std::string, T>;
+  using Entry = std::pair<std::string_view, T>;
   const Entry* find(std::string_view name) const
       noexcept {  // NOLINT(readability-identifier-naming): Container interface.
     if (compact_.empty() && wide_.empty()) return nullptr;
@@ -566,13 +690,17 @@ class NameTable {
   void Insert(std::string_view name, T value) {
     const auto size = entries_.size();
     const auto capacity = wide_.empty() ? compact_.size() : wide_.size();
-    if (size >= capacity - capacity / 4) {
-      if (capacity > std::numeric_limits<std::size_t>::max() / 2)
+    const bool grow = size >= capacity - capacity / 4;
+    const bool widen =
+        wide_.empty() && size == std::numeric_limits<std::uint32_t>::max();
+    if (grow || widen) {
+      if (grow && capacity > std::numeric_limits<std::size_t>::max() / 2)
         throw std::length_error("Name table capacity");
-      const auto next = std::max(std::size_t{8}, capacity * 2);
-      if (size >= std::numeric_limits<std::uint32_t>::max() || !wide_.empty()) {
+      const auto next =
+          grow ? std::max(std::size_t{8}, capacity * 2) : capacity;
+      if (widen || !wide_.empty()) {
         Rehash(wide_, next);
-        compact_.clear();
+        std::vector<Compact>{}.swap(compact_);
       } else {
         Rehash(compact_, next);
       }
@@ -584,8 +712,9 @@ class NameTable {
     else
       Place(wide_, hash, size + 1);
   }
-  void EraseLast(std::string_view name) noexcept {
-    const auto hash = Hash(name);
+  std::size_t Size() const noexcept { return entries_.size(); }
+  void EraseLast() noexcept {
+    const auto hash = Hash(entries_.back().first);
     if (wide_.empty())
       Erase(compact_, hash);
     else
@@ -593,6 +722,9 @@ class NameTable {
     entries_.pop_back();
   }
   const auto& Entries() const noexcept { return entries_; }
+#ifdef DANDELION_FRONTEND_TESTING
+  void ForceCollisions() noexcept { collide_ = true; }
+#endif
 
  private:
   template <class Ordinal>
@@ -604,7 +736,10 @@ class NameTable {
   using Wide = Slot<std::size_t>;
   static_assert(sizeof(Compact) == 8);
 
-  static std::uint32_t Hash(std::string_view name) noexcept {
+  std::uint32_t Hash(std::string_view name) const noexcept {
+#ifdef DANDELION_FRONTEND_TESTING
+    if (collide_) return 0;
+#endif
     const auto hash = static_cast<std::uint64_t>(TextHash{}(name));
     return static_cast<std::uint32_t>(hash ^ (hash >> 32));
   }
@@ -614,8 +749,10 @@ class NameTable {
     const auto mask = slots.size() - 1;
     auto index = hash & mask;
     while (const auto ordinal = slots[index].ordinal) {
-      const auto& entry = entries_[ordinal - 1];
-      if (slots[index].hash == hash && entry.first == name) return &entry;
+      if (slots[index].hash == hash) {
+        const auto& entry = entries_[ordinal - 1];
+        if (entry.first == name) return &entry;
+      }
       index = (index + 1) & mask;
     }
     return nullptr;
@@ -631,8 +768,13 @@ class NameTable {
   template <class Ordinal>
   void Rehash(std::vector<Slot<Ordinal>>& slots, std::size_t capacity) {
     std::vector<Slot<Ordinal>> next(capacity);
-    for (std::size_t i = 0; i < entries_.size(); ++i)
-      Place(next, Hash(entries_[i].first), i + 1);
+    if (wide_.empty()) {
+      for (auto [hash, ordinal] : compact_)
+        if (ordinal) Place(next, hash, ordinal);
+    } else {
+      for (auto [hash, ordinal] : wide_)
+        if (ordinal) Place(next, hash, ordinal);
+    }
     slots.swap(next);
   }
   template <class Ordinal>
@@ -650,55 +792,93 @@ class NameTable {
     }
     slots[hole] = {};
   }
-  std::deque<Entry> entries_;
+  std::vector<Entry> entries_;
+#ifdef DANDELION_FRONTEND_TESTING
+  bool collide_ = false;
+#endif
   std::vector<Compact> compact_;
   std::vector<Wide> wide_;
 };
 
-using Rank = std::span<const std::string_view>;
-struct RankHash {
-  std::size_t operator()(Rank rank) const noexcept;
-};
-struct RankEqual {
-  bool operator()(Rank left, Rank right) const noexcept {
-    return std::ranges::equal(left, right);
+// Owns canonical keys that do not already have manager-backed spelling.
+class NamePool {
+ public:
+  struct Mark {
+    // NOLINTBEGIN(readability-identifier-naming): Struct fields, snake_case.
+    std::size_t blocks;
+    std::size_t used;
+    // NOLINTEND(readability-identifier-naming)
+  };
+
+  Mark GetMark() const noexcept {
+    return {blocks_.size(), blocks_.empty() ? 0 : blocks_.back().used};
   }
-};
-struct RankPool {
-  static constexpr std::size_t kBlockSize = 1024;
-  TextSet spellings;
-  std::unordered_set<Rank, RankHash, RankEqual> ranks;
-  std::vector<std::unique_ptr<std::string_view[]>> blocks;
-  std::size_t remaining = 0;
+  std::string_view Append(std::string_view name) {
+    if (name.empty()) return {};
+    if (blocks_.empty() ||
+        name.size() > blocks_.back().capacity - blocks_.back().used) {
+      constexpr std::size_t kBlockSize = 4096;
+      const auto capacity = std::max(kBlockSize, name.size());
+      blocks_.push_back(
+          {std::make_unique_for_overwrite<char[]>(capacity), capacity, 0});
+    }
+    auto& block = blocks_.back();
+    auto* const written = block.text.get() + block.used;
+    std::ranges::copy(name, written);
+    block.used += name.size();
+    return {written, name.size()};
+  }
+  void Restore(Mark mark) noexcept {
+    blocks_.resize(mark.blocks);
+    if (!blocks_.empty()) blocks_.back().used = mark.used;
+  }
+
+ private:
+  struct Block {
+    // NOLINTBEGIN(readability-identifier-naming): Struct fields, snake_case.
+    std::unique_ptr<char[]> text;
+    std::size_t capacity;
+    std::size_t used;
+    // NOLINTEND(readability-identifier-naming)
+  };
+  std::vector<Block> blocks_;
 };
 
 struct Signature {
   static const Signature& Of(const QueryContext& query) noexcept {
     return *query.signature_;
   }
+
+  TermBinding ResolveTerm(const TermEntry& entry) const noexcept {
+    if (const auto* member = std::get_if<MemberOrdinal>(&entry))
+      return members[std::to_underlying(*member)];
+    if (const auto* instance = std::get_if<DeclInstanceView>(&entry))
+      return *instance;
+    return std::get<AliasOrdinal>(entry);
+  }
+
   const Profile* profile = nullptr;
+  NamePool name_pool;
   NameTable<SortBinding> sorts;
-  NameTable<TermBinding> terms;
+  NameTable<TermEntry> terms;
+  std::vector<DatatypeMember> members;
+  std::vector<Node> aliases;
   std::unordered_set<SortRecipe, RecipeHash> recipes;
-  std::unordered_map<SortId, std::string_view> sort_spellings;
-  std::unordered_map<DeclId, std::size_t> definition_index;
-  std::vector<std::pair<DeclId, std::size_t>> function_runs;
-  RankPool rank_pool;
   static std::optional<std::size_t> FunctionOrdinal(const QueryContext& query,
                                                     DeclView decl) noexcept;
 };
 
 constexpr std::size_t kCacheSlots = 256;
 struct LiteralCache {
+  using Value =
+      std::variant<std::uint64_t, numeric::Integer, numeric::BitVector>;
   struct Entry {
     std::string digits;
-    IntegerView value = IntegerView(0);
-    std::uint64_t width = 0;
+    Value value;
+    std::uint32_t width = 0;
     int radix = 0;
   };
   std::array<Entry, kCacheSlots> entries;
-  // Wide views borrow these exact integers. Word-sized values have no backing.
-  std::array<Integer, kCacheSlots> backing;
   std::size_t key_bytes = 0;
   std::size_t eviction = 0;
 };
@@ -717,9 +897,36 @@ struct CachedSort {
 };
 using SortCache = std::array<CachedSort, kCacheSlots>;
 
+class ElaborationScratch;
+struct DeleteElaborationScratch {
+  void operator()(ElaborationScratch* scratch) const noexcept;
+};
+
+template <class T>
+void ClearScratch(std::vector<T>& buffer) noexcept {
+  constexpr std::size_t kMaxRetainedBytes = 256 * 1024;
+  buffer.clear();
+  if (buffer.capacity() > kMaxRetainedBytes / sizeof(T))
+    std::vector<T>{}.swap(buffer);
+}
+
+template <class Map>
+void ClearScratch(Map& buffer) noexcept {
+  constexpr std::size_t kMaxRetainedBuckets = 4096;
+  buffer.clear();
+  if (buffer.bucket_count() > kMaxRetainedBuckets) Map{}.swap(buffer);
+}
+
+struct PendingTerms;
+struct DefinitionInputs;
+class PendingDatatypeGroup;
+class PendingSortAlias;
+
 struct SessionState {
   explicit SessionState(Scanner scanner, ParseOptions parse = {});
-  SessionState(Scanner scanner, std::shared_ptr<ModelOwner> model);
+  SessionState(Scanner scanner, std::shared_ptr<ModelOwner> model,
+               ParseOptions parse);
+  ~SessionState();
   const QueryContext& Prefix() const noexcept;
   const Signature& GetSignature() const noexcept {
     return *Prefix().signature_;
@@ -729,24 +936,39 @@ struct SessionState {
     ++(stats.*member);
 #endif
   }
+  void AddAnnotations(std::vector<Annotation> annotations);
+#ifdef DANDELION_FRONTEND_TESTING
   void Checkpoint();
+#endif
   Node NumericLiteral(std::string_view digits, int radix, SortView sort,
-                      SourceSpan where);
-  TypedCommand Apply(Syntax& syntax, const ModelOwner* model);
-  void ApplySemantic(const Syntax& syntax, TypedCommand& command);
+                      Location where);
+  Outcome<std::optional<TypedCommand>> ReadCommand(
+      const ModelOwner* model,
+      const std::optional<CheckAnswer>* answer = nullptr);
+  void CheckCommand(CommandKind kind, SourceSpan where, const ModelOwner* model,
+                    const std::optional<CheckAnswer>* answer) const;
+  void Publish(const Syntax& syntax, TypedCommand& command, Node term,
+               PendingTerms& pending, DefinitionInputs* definition,
+               PendingDatatypeGroup* datatypes, PendingSortAlias* alias);
+  void ApplySemantic(const Syntax& syntax, TypedCommand& command, Node term,
+                     PendingTerms& pending, DefinitionInputs* definition,
+                     PendingDatatypeGroup* datatypes, PendingSortAlias* alias);
 
   Scanner scanner;
-  std::optional<Syntax> pending;
+  std::unique_ptr<Syntax> fragments;
   NodeManager manager;
   std::shared_ptr<QueryContext> building;
   std::shared_ptr<const QueryContext> sealed;
   std::shared_ptr<ModelOwner> inspection_model;
-  std::vector<Attribute> metadata;
+  std::unique_ptr<SourceRecords> source_records;
   SessionOptions options;
   ParseOptions parse_options;
   std::unique_ptr<LiteralCache> literal_cache;
   std::unique_ptr<SortCache> sort_cache;
+  std::unique_ptr<ElaborationScratch, DeleteElaborationScratch> elaboration;
+  std::vector<SortView> domain_sorts;
   SessionPhase phase = SessionPhase::kBeforeLogic;
+  bool in_read = false;
 #ifdef DANDELION_FRONTEND_TESTING
   FrontendStats stats;
   std::optional<std::size_t> fail_after;
@@ -759,72 +981,148 @@ class Transaction {
   Transaction& operator=(const Transaction&) = delete;
   ~Transaction() noexcept;
   void Commit() noexcept { committed_ = true; }
-  void AddTerm(std::string_view name, TermBinding binding);
+  void AddTerm(std::string_view name, DeclInstanceView instance);
+  void AddTerm(std::string_view name, DatatypeMember member);
   void AddSort(std::string_view name, SortBinding binding);
-  void RememberAlias(SortView sort, std::string_view name);
   const SortRecipe* InternRecipe(SortRecipe recipe);
-  void AddNamed(std::string_view name, Node term, SourceSpan where);
+  void AddAlias(std::string_view name, Node term);
+  void AddNamed(std::string_view name, const Node& term, SourceSpan where);
   void AddAnnotation(Annotation annotation);
-  void AddAssertion(Assertion assertion);
-  void AddUserSort(UserSort sort);
-  void AddFunction(Decl decl, bool quoted, std::span<std::string> spelling,
+  void AddAssertion(Node term, SourceSpan where);
+  void AddUserSort(SortConstructor sort, std::string_view spelling,
                    SourceSpan where);
-  void AddDefinition(DefinedFunction definition);
+  void AddFunction(Decl decl, std::string_view spelling,
+                   std::vector<std::string> rank, SourceSpan where);
+  std::size_t AddDefinition(DefinedFunction definition);
+  void AddDefinitionSource(DefinitionSource source);
   std::size_t StageGroup();
   void FinishGroup(std::size_t index, DatatypeGroup group) noexcept;
 
  private:
-  enum class NameSpace { kTerm, kSort };
-  struct NameEntry {
-    NameSpace space;
-    std::string_view name;
-  };
   SessionState& state_;
   QueryContext& query_;
   Signature& signature_;
-  std::vector<NameEntry> names_;
+  std::string_view StoreName(std::string_view name);
+  SourceRecords* records_;
   std::vector<const SortRecipe*> added_recipes_;
-  std::vector<SortId> added_spellings_;
-  const std::size_t named_;
-  const std::size_t annotations_;
+  const NamePool::Mark pooled_names_;
+  const std::size_t term_names_;
+  const std::size_t sort_names_;
+  const std::size_t alias_roots_;
+  const std::size_t members_;
   const std::size_t assertions_;
   const std::size_t sorts_;
   const std::size_t functions_;
   const std::size_t function_runs_;
-  const std::size_t rank_blocks_;
-  const std::size_t rank_remaining_;
-  std::vector<std::string_view> added_rank_strings_;
-  Rank added_rank_;
   const std::size_t definitions_;
   const std::size_t groups_;
+  const std::size_t source_definitions_;
+  const std::size_t source_named_;
+  const std::size_t source_annotations_;
   bool committed_ = false;
 };
 
 bool IsReservedName(std::string_view name) noexcept;
-bool IsActiveSort(const Profile& profile, std::string_view name) noexcept;
-bool IsActiveTerm(const Profile& profile, std::string_view name) noexcept;
+bool IsActiveSort(const Profile& profile, SpellingId spelling) noexcept;
+bool IsActiveTerm(const Profile& profile, std::string_view name,
+                  SpellingId spelling) noexcept;
+inline bool IsActiveTerm(const Profile& profile,
+                         std::string_view name) noexcept {
+  return IsActiveTerm(profile, name, ClassifySymbol(name));
+}
 void CheckSortName(const SessionState& state, const Syntax& syntax, ExprId name,
                    bool global);
+void CheckTermName(const SessionState& state, std::string_view name,
+                   SpellingId spelling, SourceSpan where, bool global);
 void CheckTermName(const SessionState& state, const Syntax& syntax, ExprId name,
                    bool global);
-std::vector<Integer> NumericIndices(const Syntax& syntax, Identifier id,
-                                    std::size_t expected, SourceSpan where);
+std::vector<numeric::Integer> NumericIndices(const Syntax& syntax,
+                                             Identifier id,
+                                             std::size_t expected,
+                                             Location where);
 std::uint64_t ParseArity(const Syntax& syntax, ExprId numeral);
 void CheckMinimumIndex(const Syntax& syntax, Identifier id,
-                       std::span<const Integer> indices, std::size_t index,
-                       std::int64_t minimum);
+                       std::span<const numeric::Integer> indices,
+                       std::size_t index, std::int64_t minimum);
+
+inline std::optional<std::uint64_t> ParseWord(std::string_view digits,
+                                              int radix = 10) noexcept {
+  std::uint64_t value;
+  const auto* end = digits.data() + digits.size();
+  const auto parsed = std::from_chars(digits.data(), end, value, radix);
+  if (parsed.ec == std::errc{} && parsed.ptr == end) return value;
+  return std::nullopt;
+}
+SortView CachedBitVectorSort(SessionState& session, std::uint64_t width,
+                             Location where);
+SortView CachedBitVectorSort(SessionState& session, numeric::IntegerView width,
+                             Location where);
+SortView CachedFloatingPointSort(SessionState& session,
+                                 numeric::IntegerView exponent,
+                                 numeric::IntegerView significand,
+                                 Location where);
 
 using Parameters = TextMap<std::uint64_t>;
-Sort ResolveSort(SessionState& session, const Syntax& syntax, ExprId root,
-                 Transaction* txn);
-Alias ResolveAlias(SessionState& session, Transaction& txn,
-                   const Syntax& syntax, ExprId root,
-                   const Parameters& parameters);
+SortView ResolveSort(SessionState& session, const Syntax& syntax, ExprId root);
+class PendingSortAlias {
+ public:
+  PendingSortAlias(SessionState& state, const Syntax& syntax, ExprId name,
+                   ChildRange parameters);
+  bool HasParameter(std::string_view name) const noexcept {
+    return parameters_.contains(name);
+  }
+  const SortRecipe* Reduce(ExprId expr);
+  const SortRecipe* InternRecipe(SortRecipe recipe);
+  void Publish(Transaction& txn, ExprId name, ExprId body);
+
+ private:
+  SessionState& state_;
+  const Syntax& syntax_;
+  Parameters parameters_;
+  std::unordered_set<SortRecipe, RecipeHash> recipes_;
+  std::vector<const SortRecipe*> order_;
+};
+
 SortExpr ResolveField(SessionState& session, const Syntax& syntax, ExprId root,
                       const Parameters& parameters, DatatypeBuilder& builder,
-                      std::size_t group, std::uint64_t slot);
-void DeclareDatatypes(SessionState& session, Transaction& txn,
-                      const Syntax& syntax);
+                      const TextMap<DatatypeSort>& forward, std::uint64_t slot);
+
+class PendingDatatypeGroup {
+ public:
+  explicit PendingDatatypeGroup(SessionState& session);
+  void ReadHeaders(const Syntax& syntax, ExprId list, SourceSpan where);
+  void StartBody(const Syntax& syntax, ExprId body, ExprId name,
+                 ChildRange parameters);
+  void StartConstructor(const Syntax& syntax, ExprId name);
+  bool HasSortName(std::string_view name) const noexcept {
+    return parameters_.contains(name) || sorts_.contains(name);
+  }
+  SortExpr ReduceSort(const Syntax& syntax, ExprId expr);
+  void AddField(const Syntax& syntax, ExprId field);
+  void EndConstructor(SourceSpan where);
+  void EndBody() noexcept;
+  void Publish(Transaction& txn, SourceSpan where);
+
+ private:
+  void AddHeader(const Syntax& syntax, ExprId name, std::uint64_t arity);
+  void Start(SourceSpan where);
+  std::string_view AddMember(const Syntax& syntax, ExprId name,
+                             std::optional<std::uint64_t> field);
+
+  SessionState& session_;
+  const std::size_t group_;
+  TextMap<DatatypeSort> sorts_;
+  std::vector<DatatypeHeader> headers_;
+  std::unordered_set<std::string, TextHash, std::equal_to<>> term_index_;
+  std::vector<std::pair<std::string_view, DatatypeMember>> members_;
+  std::optional<DatatypeBuilder> builder_;
+  Parameters parameters_;
+  std::vector<DatatypeFieldSpec> fields_;
+  std::string_view constructor_name_;
+  std::uint64_t slot_ = 0;
+  std::uint64_t ctor_ = 0;
+  bool in_body_ = false;
+};
 struct Operator {
   std::string_view name;
   Kind kind;
@@ -833,21 +1131,45 @@ struct Operator {
   std::uint64_t min_arity;
   std::uint64_t max_arity = min_arity;
 };
-const Operator* FindOperator(std::string_view name, bool indexed) noexcept;
-std::span<NodeView> CommutativeOperands(Kind kind,
-                                        std::span<NodeView> operands) noexcept;
-bool OrderCommutative(std::span<NodeView> operands) noexcept;
+std::span<Node> CommutativeOperands(Kind kind,
+                                    std::span<Node> operands) noexcept;
+bool OrderCommutative(std::span<Node> operands) noexcept;
 const Operator& OperatorFor(Kind kind) noexcept;
 bool IsRestrictedInt(Kind kind) noexcept;
 bool IsKnownExcludedTerm(std::string_view name) noexcept;
-std::optional<RoundingMode> FindRoundingMode(std::string_view name) noexcept;
-std::optional<FpSpecial> FindFpSpecial(std::string_view name) noexcept;
-std::string_view RoundingSpelling(RoundingMode mode) noexcept;
-std::string_view SpecialSpelling(FpSpecial special) noexcept;
+std::optional<numeric::FpSpecial> FindFpSpecial(std::string_view name) noexcept;
+std::string_view RoundingSpelling(numeric::RoundingMode mode) noexcept;
+std::string_view SpecialSpelling(numeric::FpSpecial special) noexcept;
+struct NamedAliases {
+  // NOLINTBEGIN(readability-identifier-naming): Pending publication fields.
+  std::deque<NamedTerm> records;
+  std::unordered_map<std::string_view, std::size_t> index;
+  // NOLINTEND(readability-identifier-naming)
+};
+
+struct PendingTerms {
+  // NOLINTBEGIN(readability-identifier-naming): Pending publication fields.
+  std::unique_ptr<NamedAliases> named;
+  std::vector<Annotation> annotations;
+  const Node* Find(std::string_view name) const noexcept;
+  void AddNamed(SessionState& state, std::string_view name, const Node& term,
+                SourceSpan where);
+  void Publish(Transaction& txn);
+  // NOLINTEND(readability-identifier-naming)
+};
+
+struct DefinitionInputs {
+  // NOLINTBEGIN(readability-identifier-naming): Pending publication fields.
+  std::vector<Decl> formals;
+  std::vector<SortView> domain;
+  std::vector<std::string> source_rank;
+  SortView range;
+  // NOLINTEND(readability-identifier-naming)
+};
+
 void ApplyTerms(SessionState& state, const Syntax& syntax,
-                TypedCommand& command, Transaction& txn);
-void ApplyValues(SessionState& state, const Syntax& syntax,
-                 TypedCommand& command, const ModelOwner* model);
+                TypedCommand& command, Transaction& txn, Node term,
+                DefinitionInputs* definition);
 std::pair<Node, std::string> ResolveModelReference(
     const ModelOwner& model, const QueryContext& query, std::string_view name,
     std::optional<SortView> qualifier, SourceSpan where);

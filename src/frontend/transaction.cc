@@ -1,5 +1,6 @@
 module dandelion.frontend;
 import :internal;
+import dandelion.util.numeric;
 import std;
 
 namespace dandelion::frontend::detail {
@@ -8,12 +9,6 @@ void HashCombine(std::size_t& value, std::size_t next) noexcept {
   value ^= next + std::size_t{0x9e3779b9} + (value << 6) + (value >> 2);
 }
 }  // namespace
-
-std::size_t RankHash::operator()(Rank rank) const noexcept {
-  auto hash = rank.size();
-  for (auto spelling : rank) HashCombine(hash, TextHash{}(spelling));
-  return hash;
-}
 
 std::size_t RecipeHash::operator()(const SortRecipe& recipe) const noexcept {
   auto hash = static_cast<std::size_t>(recipe.kind);
@@ -29,69 +24,81 @@ Transaction::Transaction(SessionState& state) noexcept
     : state_(state),
       query_(*state.building),
       signature_(*query_.signature_),
-      named_(query_.named_terms_.size()),
-      annotations_(query_.annotations_.size()),
+      records_(state.source_records.get()),
+      pooled_names_(signature_.name_pool.GetMark()),
+      term_names_(signature_.terms.Size()),
+      sort_names_(signature_.sorts.Size()),
+      alias_roots_(signature_.aliases.size()),
+      members_(signature_.members.size()),
       assertions_(query_.assertions_.size()),
       sorts_(query_.user_sorts_.size()),
       functions_(query_.functions_.size()),
-      function_runs_(signature_.function_runs.size()),
-      rank_blocks_(signature_.rank_pool.blocks.size()),
-      rank_remaining_(signature_.rank_pool.remaining),
+      function_runs_(query_.function_runs_.size()),
       definitions_(query_.definitions_.size()),
-      groups_(query_.datatype_groups_.size()) {}
+      groups_(query_.datatype_groups_.size()),
+      source_definitions_(records_ ? records_->definitions.size() : 0),
+      source_named_(records_ ? records_->named_terms.size() : 0),
+      source_annotations_(records_ ? records_->annotations.size() : 0) {}
 
 Transaction::~Transaction() noexcept {
+  ClearScratch(state_.domain_sorts);
   if (committed_) return;
-  for (auto sort : added_spellings_) signature_.sort_spellings.erase(sort);
-  for (const auto& [space, name] : names_ | std::views::reverse) {
-    if (space == NameSpace::kTerm)
-      signature_.terms.EraseLast(name);
-    else
-      signature_.sorts.EraseLast(name);
-  }
+  while (signature_.terms.Size() > term_names_) signature_.terms.EraseLast();
+  while (signature_.sorts.Size() > sort_names_) signature_.sorts.EraseLast();
+  signature_.name_pool.Restore(pooled_names_);
+  signature_.aliases.resize(alias_roots_);
+  signature_.members.resize(members_);
   for (const auto* recipe : added_recipes_ | std::views::reverse)
     if (recipe) signature_.recipes.erase(*recipe);
-  signature_.function_runs.resize(function_runs_);
-  auto& pool = signature_.rank_pool;
-  if (!added_rank_.empty()) pool.ranks.erase(added_rank_);
-  pool.blocks.resize(rank_blocks_);
-  pool.remaining = rank_remaining_;
-  for (auto spelling : added_rank_strings_) pool.spellings.erase(spelling);
+  query_.function_runs_.resize(function_runs_);
   for (auto i = definitions_; i < query_.definitions_.size(); ++i)
-    signature_.definition_index.erase(query_.definitions_[i].decl.GetId());
+    query_.definition_index_.erase(query_.definitions_[i].decl.GetId());
   query_.functions_.resize(functions_);
   query_.definitions_.resize(definitions_);
-  query_.named_terms_.resize(named_);
-  query_.annotations_.resize(annotations_);
   query_.assertions_.resize(assertions_);
   query_.user_sorts_.resize(sorts_);
   query_.datatype_groups_.resize(groups_);
+  if (records_) {
+    records_->assertions.resize(assertions_);
+    records_->user_sorts.resize(sorts_);
+    records_->functions.resize(functions_);
+    records_->definitions.resize(source_definitions_);
+    records_->named_terms.resize(source_named_);
+    records_->annotations.resize(source_annotations_);
+  }
 }
 
-void Transaction::AddTerm(std::string_view name, TermBinding binding) {
+std::string_view Transaction::StoreName(std::string_view name) {
+#ifdef DANDELION_FRONTEND_TESTING
   state_.Checkpoint();
-  names_.push_back({NameSpace::kTerm, name});
-  try {
-    signature_.terms.Insert(name, std::move(binding));
-  } catch (...) {
-    names_.pop_back();
-    throw;
-  }
+#endif
+  return signature_.name_pool.Append(name);
+}
+
+void Transaction::AddTerm(std::string_view name, DeclInstanceView instance) {
+  const auto hint = instance.GetDeclaration().GetNameHint();
+  const auto key = name == hint ? hint : StoreName(name);
+#ifdef DANDELION_FRONTEND_TESTING
+  state_.Checkpoint();
+#endif
+  signature_.terms.Insert(key, instance);
+}
+void Transaction::AddTerm(std::string_view name, DatatypeMember member) {
+  const auto ordinal = signature_.members.size();
+  signature_.members.push_back(member);
+  const auto key = StoreName(name);
+#ifdef DANDELION_FRONTEND_TESTING
+  state_.Checkpoint();
+#endif
+  signature_.terms.Insert(key, MemberOrdinal(ordinal));
 }
 void Transaction::AddSort(std::string_view name, SortBinding binding) {
+  const auto* constructor = std::get_if<SortConstructorView>(&binding);
+  const auto key = constructor ? constructor->GetNameHint() : StoreName(name);
+#ifdef DANDELION_FRONTEND_TESTING
   state_.Checkpoint();
-  names_.push_back({NameSpace::kSort, name});
-  try {
-    signature_.sorts.Insert(name, std::move(binding));
-  } catch (...) {
-    names_.pop_back();
-    throw;
-  }
-}
-void Transaction::RememberAlias(SortView sort, std::string_view name) {
-  added_spellings_.push_back(sort.GetId());
-  if (!signature_.sort_spellings.try_emplace(sort.GetId(), name).second)
-    added_spellings_.pop_back();
+#endif
+  signature_.sorts.Insert(key, std::move(binding));
 }
 const SortRecipe* Transaction::InternRecipe(SortRecipe recipe) {
   for (const auto* child : recipe.children)
@@ -104,70 +111,96 @@ const SortRecipe* Transaction::InternRecipe(SortRecipe recipe) {
     added_recipes_.pop_back();
   return &*it;
 }
-void Transaction::AddNamed(std::string_view name, Node term, SourceSpan where) {
-  const auto index = query_.named_terms_.size();
-  AddTerm(name, index);
+void Transaction::AddAlias(std::string_view name, Node term) {
+  const auto index = signature_.aliases.size();
+  const auto key = StoreName(name);
+#ifdef DANDELION_FRONTEND_TESTING
   state_.Checkpoint();
-  query_.named_terms_.push_back({std::string(name), std::move(term), where});
+#endif
+  signature_.aliases.push_back(std::move(term));
+  signature_.terms.Insert(key, AliasOrdinal(index));
+}
+void Transaction::AddNamed(std::string_view name, const Node& term,
+                           SourceSpan where) {
+  AddAlias(name, term);
+  if (!records_) return;
+#ifdef DANDELION_FRONTEND_TESTING
+  state_.Checkpoint();
+#endif
+  records_->named_terms.push_back({std::string(name), term, where});
 }
 void Transaction::AddAnnotation(Annotation annotation) {
+#ifdef DANDELION_FRONTEND_TESTING
   state_.Checkpoint();
-  query_.annotations_.push_back(std::move(annotation));
+#endif
+  records_->annotations.push_back(std::move(annotation));
 }
-void Transaction::AddAssertion(Assertion assertion) {
+void Transaction::AddAssertion(Node term, SourceSpan where) {
+#ifdef DANDELION_FRONTEND_TESTING
   state_.Checkpoint();
-  query_.assertions_.push_back(std::move(assertion));
+#endif
+  if (records_) {
+    records_->assertions.push_back({term, where});
+#ifdef DANDELION_FRONTEND_TESTING
+    state_.Checkpoint();
+#endif
+  }
+  query_.assertions_.push_back(std::move(term));
 }
-void Transaction::AddUserSort(UserSort sort) {
+void Transaction::AddUserSort(SortConstructor sort, std::string_view spelling,
+                              SourceSpan where) {
+#ifdef DANDELION_FRONTEND_TESTING
   state_.Checkpoint();
+#endif
+  if (records_) {
+    records_->user_sorts.push_back({sort, std::string(spelling), where});
+#ifdef DANDELION_FRONTEND_TESTING
+    state_.Checkpoint();
+#endif
+  }
   query_.user_sorts_.push_back(std::move(sort));
 }
-void Transaction::AddFunction(Decl decl, bool quoted,
-                              std::span<std::string> spelling,
-                              SourceSpan where) {
+void Transaction::AddFunction(Decl decl, std::string_view spelling,
+                              std::vector<std::string> rank, SourceSpan where) {
+#ifdef DANDELION_FRONTEND_TESTING
   state_.Checkpoint();
-  auto& pool = signature_.rank_pool;
-  std::vector<std::string_view> views;
-  views.reserve(spelling.size());
-  added_rank_strings_.reserve(spelling.size());
-  for (auto& sort : spelling) {
-    const auto [it, inserted] = pool.spellings.insert(std::move(sort));
-    views.emplace_back(*it);
-    if (inserted) added_rank_strings_.emplace_back(*it);
-  }
-  auto interned = pool.ranks.find(Rank(views));
-  if (interned == pool.ranks.end()) {
-    const auto size = views.size();
-    if (size > pool.remaining) {
-      const auto capacity = std::max(size, RankPool::kBlockSize);
-      pool.blocks.push_back(std::make_unique<std::string_view[]>(capacity));
-      pool.remaining = capacity;
-    }
-    // Fill backwards within each block so the remaining size is the cursor.
-    auto* start = pool.blocks.back().get() + pool.remaining - size;
-    std::ranges::copy(views, start);
-    const Rank rank(start, size);
-    interned = pool.ranks.insert(rank).first;
-    added_rank_ = rank;
-    pool.remaining -= size;
-  }
+#endif
   const auto ordinal = query_.functions_.size();
   const auto id = decl.GetId();
-  if (ordinal == 0 || id - query_.functions_.back().decl.GetId() != 1)
-    signature_.function_runs.emplace_back(id, ordinal);
-  const SourceNameView name(decl.Borrow().GetNameHint(), quoted);
-  query_.functions_.push_back(
-      {std::move(decl), name, SourceRankView(*interned), where});
+  if (ordinal == 0 || id - query_.functions_.back().GetId() != 1)
+    query_.function_runs_.emplace_back(id, ordinal);
+  if (records_) {
+    records_->functions.push_back(
+        {decl, std::string(spelling), std::move(rank), where});
+#ifdef DANDELION_FRONTEND_TESTING
+    state_.Checkpoint();
+#endif
+  }
+  query_.functions_.push_back(std::move(decl));
 }
-void Transaction::AddDefinition(DefinedFunction definition) {
+std::size_t Transaction::AddDefinition(DefinedFunction definition) {
   const auto index = query_.definitions_.size();
   const auto id = definition.decl.GetId();
+#ifdef DANDELION_FRONTEND_TESTING
   state_.Checkpoint();
+#endif
   query_.definitions_.push_back(std::move(definition));
-  signature_.definition_index.emplace(id, index);
+#ifdef DANDELION_FRONTEND_TESTING
+  state_.Checkpoint();
+#endif
+  query_.definition_index_.emplace(id, index);
+  return index;
+}
+void Transaction::AddDefinitionSource(DefinitionSource source) {
+#ifdef DANDELION_FRONTEND_TESTING
+  state_.Checkpoint();
+#endif
+  records_->definitions.push_back(std::move(source));
 }
 std::size_t Transaction::StageGroup() {
+#ifdef DANDELION_FRONTEND_TESTING
   state_.Checkpoint();
+#endif
   const auto index = query_.datatype_groups_.size();
   query_.datatype_groups_.emplace_back();
   return index;
@@ -175,44 +208,86 @@ std::size_t Transaction::StageGroup() {
 void Transaction::FinishGroup(std::size_t index, DatatypeGroup group) noexcept {
   query_.datatype_groups_[index] = std::move(group);
 }
+const Node* PendingTerms::Find(std::string_view name) const noexcept {
+  if (!named) return nullptr;
+  const auto it = named->index.find(name);
+  return it == named->index.end() ? nullptr : &named->records[it->second].term;
+}
+
+void PendingTerms::AddNamed(SessionState& state, std::string_view name,
+                            const Node& term, SourceSpan where) {
+#ifdef DANDELION_FRONTEND_TESTING
+  state.Checkpoint();
+#endif
+  if (!named) {
+    state.Count(&FrontendStats::staging_overlays);
+    named = std::make_unique<NamedAliases>();
+  }
+  auto& entry = named->records.emplace_back(std::string(name), term, where);
+  named->index.emplace(entry.name, named->records.size() - 1);
+}
+
+void PendingTerms::Publish(Transaction& txn) {
+  if (named) {
+    for (const auto& [name, term, where] : named->records)
+      txn.AddNamed(name, term, where);
+  }
+  for (auto& annotation : annotations) txn.AddAnnotation(std::move(annotation));
+}
+
 bool IsReservedName(std::string_view name) noexcept {
   return name.starts_with('@') || name.starts_with('.');
 }
 void CheckSortName(const SessionState& state, const Syntax& syntax, ExprId name,
                    bool global) {
-  const auto spelling = syntax.Name(name);
+  const auto token = syntax.GetTokenInfo(name);
+  const auto spelling = syntax.Name(token);
   if (IsReservedName(spelling) ||
-      IsActiveSort(*state.GetSignature().profile, spelling))
+      IsActiveSort(*state.GetSignature().profile, token.spelling_id))
     Fail(DiagnosticCode::kInvalidInput, syntax.Span(name),
          "Reserved sort name");
   if (global && state.GetSignature().sorts.contains(spelling))
     Fail(DiagnosticCode::kInvalidInput, syntax.Span(name),
          "Sort name is already in use");
 }
-void CheckTermName(const SessionState& state, const Syntax& syntax, ExprId name,
-                   bool global) {
-  const auto spelling = syntax.Name(name);
-  if (IsReservedName(spelling) ||
-      IsActiveTerm(*state.GetSignature().profile, spelling))
-    Fail(DiagnosticCode::kInvalidInput, syntax.Span(name),
-         "Reserved term name");
-  if (global && state.GetSignature().terms.contains(spelling))
-    Fail(DiagnosticCode::kInvalidInput, syntax.Span(name),
-         "Term name is already in use");
+void CheckTermName(const SessionState& state, std::string_view name,
+                   SpellingId spelling, SourceSpan where, bool global) {
+  if (IsReservedName(name) ||
+      IsActiveTerm(*state.GetSignature().profile, name, spelling))
+    Fail(DiagnosticCode::kInvalidInput, where, "Reserved term name");
+  if (global && state.GetSignature().terms.contains(name))
+    Fail(DiagnosticCode::kInvalidInput, where, "Term name is already in use");
 }
 
-std::vector<Integer> NumericIndices(const Syntax& syntax, Identifier id,
-                                    std::size_t expected, SourceSpan where) {
+void CheckTermName(const SessionState& state, const Syntax& syntax, ExprId name,
+                   bool global) {
+  const auto token = syntax.GetTokenInfo(name);
+  CheckTermName(state, Syntax::Name(token), token.spelling_id, token.where,
+                global);
+}
+
+std::vector<numeric::Integer> NumericIndices(const Syntax& syntax,
+                                             Identifier id,
+                                             std::size_t expected,
+                                             Location where) {
   if (id.indices.size() != expected)
     Fail(DiagnosticCode::kInvalidInput, where, "Wrong number of indices");
-  std::vector<Integer> indices;
+  std::vector<numeric::Integer> indices;
   indices.reserve(expected);
   for (const auto index : id.indices) {
-    if (syntax.Type(index) != TokenKind::kNumeral)
+    const auto token = syntax.GetTokenInfo(index);
+    if (token.kind != TokenKind::kNumeral)
       Fail(DiagnosticCode::kInvalidInput, syntax.Span(index),
            "Expected a numeral index");
-    indices.push_back(
-        Take(Integer::ParseDecimal(syntax.Raw(index)), syntax.Span(index)));
+    const auto digits = token.raw;
+    if (const auto value = ParseWord(digits);
+        value && *value <= static_cast<std::uint64_t>(
+                               std::numeric_limits<std::int64_t>::max())) {
+      indices.emplace_back(static_cast<std::int64_t>(*value));
+    } else {
+      indices.push_back(TakeNumericAt(numeric::Integer::ParseDecimal(digits),
+                                      {syntax, index}));
+    }
   }
   return indices;
 }
@@ -227,9 +302,9 @@ std::uint64_t ParseArity(const Syntax& syntax, ExprId numeral) {
   return arity;
 }
 void CheckMinimumIndex(const Syntax& syntax, Identifier id,
-                       std::span<const Integer> indices, std::size_t index,
-                       std::int64_t minimum) {
-  if (indices[index].Borrow().Compare(IntegerView(minimum)) < 0)
+                       std::span<const numeric::Integer> indices,
+                       std::size_t index, std::int64_t minimum) {
+  if (indices[index].Borrow().Compare(numeric::IntegerView(minimum)) < 0)
     NodeFailure(
         {.code = ErrorCode::kInvalidParameter, .parameter_index = index},
         syntax.Span(id.indices[index]));

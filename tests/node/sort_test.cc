@@ -15,8 +15,9 @@ TEST_F(NodeTest, SortIdentityParametersAndNestedCombinations) {
   EXPECT_EQ(z.Borrow().GetKind(), SortKind::kInt);
   EXPECT_EQ(r.Borrow().GetKind(), SortKind::kRoundingMode);
   EXPECT_EQ(v.Borrow().GetWidth(), 1);
-  EXPECT_EQ(f.Borrow().GetFpExponentWidth(), 2);
-  EXPECT_EQ(f.Borrow().GetFpSignificandWidth(), 2);
+  EXPECT_EQ(f.Borrow().GetFpFormat(), Format(2, 2));
+  EXPECT_EQ(View(Fp(8, 24)).GetFpFormat(), Format(8, 24));
+  EXPECT_EQ(View(Fp(65, 66)).GetFpFormat(), Format(65, 66));
   EXPECT_FALSE(b.Borrow().GetWidth());
   EXPECT_FALSE(b.Borrow().GetArrayIndex());
   EXPECT_FALSE(b.Borrow().GetSortConstructor());
@@ -67,7 +68,7 @@ TEST_F(NodeTest, ExactSortBoundariesAndForeignInputs) {
            ResourceKind::kSize);
   Resource(manager_.MakeFpSort(too_big.Borrow(), two.Borrow()),
            ResourceKind::kSize);
-  EXPECT_EQ(View(Fp(2, 3)).GetFpSignificandWidth(), 3);
+  EXPECT_EQ(View(Fp(2, 3)).GetFpFormat(), Format(2, 3));
   auto other = Take(NodeManager::Create());
   const auto foreign = Take(other.BoolSort());
   const auto local = Take(manager_.BoolSort());

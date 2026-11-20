@@ -1,5 +1,6 @@
 module dandelion.frontend;
 import :internal;
+import dandelion.util.numeric;
 import std;
 
 namespace dandelion::frontend::detail {
@@ -55,7 +56,8 @@ constexpr auto kProfiles = std::to_array<Profile>({
      kFunctions},
 });
 
-Attribute ReadInfo(const Syntax& syntax, ChildRange args) {
+std::optional<Attribute> ReadInfo(const Syntax& syntax, ChildRange args,
+                                  ParseOptions options) {
   const auto key = syntax.Raw(args.front());
   const auto value = args.size() == 2 ? args[1] : kNoExpr;
   const auto raw = value != kNoExpr ? syntax.Raw(value) : std::string_view{};
@@ -77,8 +79,8 @@ Attribute ReadInfo(const Syntax& syntax, ChildRange args) {
          "Source must be a string or a quoted symbol");
   } else if (key == ":category") {
     need(type(TokenKind::kString) &&
-             (raw == "\"crafted\"" || raw == "\"random\"" ||
-              raw == "\"industrial\""),
+             (!options.strict_metadata || raw == "\"crafted\"" ||
+              raw == "\"random\"" || raw == "\"industrial\""),
          "Invalid benchmark category");
   } else if (key == ":license") {
     need(type(TokenKind::kString), "License must be a string");
@@ -88,23 +90,26 @@ Attribute ReadInfo(const Syntax& syntax, ChildRange args) {
          "Invalid benchmark status");
   }
 
+  if (!options.capture_source_records) return std::nullopt;
   auto attribute_span = syntax.Span(args.front());
   if (value != kNoExpr) attribute_span.end = where.end;
-  return {std::string(key),
-          value != kNoExpr ? std::optional(syntax.Render(value)) : std::nullopt,
-          attribute_span};
+  return Attribute{
+      std::string(key),
+      value != kNoExpr ? std::optional(syntax.Render(value)) : std::nullopt,
+      attribute_span};
 }
 
-std::string_view ReadOption(std::string_view name, SessionOptions options) {
+CommandResponse ReadOption(std::string_view name, SessionOptions options) {
+  using enum CommandResponse;
   const auto* option = FindOption(name);
-  if (!option) return "unsupported";
+  if (!option) return kUnsupported;
   switch (option->id) {
     case OptionId::kPrintSuccess:
-      return options.print_success ? "true" : "false";
+      return options.print_success ? kTrue : kFalse;
     case OptionId::kProduceModels:
-      return options.produce_models ? "true" : "false";
+      return options.produce_models ? kTrue : kFalse;
     case OptionId::kGlobalDeclarations:
-      return options.global_declarations ? "true" : "false";
+      return options.global_declarations ? kTrue : kFalse;
     case OptionId::kFixedFalse:
     case OptionId::kUnsupported:
       return option->default_value;
@@ -139,6 +144,17 @@ SessionOptions ChangeOption(SessionOptions options, SessionPhase phase,
 const Profile* FindProfile(std::string_view name) noexcept {
   const auto found = std::ranges::find(kProfiles, name, &Profile::name);
   return found != kProfiles.end() ? &*found : nullptr;
+}
+
+[[noreturn]] void OutputError(SourceSpan where, std::string_view message,
+                              std::error_code error) {
+  Diagnostic diagnostic{DiagnosticCode::kOutputIo, where, message};
+  diagnostic.io_error = error;
+  throw Failure{diagnostic};
+}
+
+void Fail(DiagnosticCode code, SourceSpan where, std::string_view message) {
+  throw Failure{{code, where, message}};
 }
 
 void NodeFailure(NodeError error, SourceSpan where) {
@@ -205,21 +221,51 @@ void NodeFailure(NodeError error, SourceSpan where) {
   throw Failure{{code, where, message, error}};
 }
 
+void NumericFailure(numeric::NumericError error, SourceSpan where) {
+  using enum numeric::NumericError;
+  switch (error) {
+    case kInvalidText:
+    case kValueOutOfRange:
+      NodeFailure({ErrorCode::kInvalidLiteral}, where);
+    case kInvalidArgument:
+      NodeFailure({ErrorCode::kInvalidParameter}, where);
+    case kDivisionByZero:
+      // A zero divisor in the closed rational rank is outside the profile.
+      NodeFailure({ErrorCode::kUnsupportedFeature}, where);
+    case kSizeLimit:
+      NodeFailure({ErrorCode::kResourceLimit, ResourceKind::kSize}, where);
+    case kCppAllocation:
+      NodeFailure({ErrorCode::kResourceLimit, ResourceKind::kCppAllocation},
+                  where);
+  }
+  std::unreachable();
+}
+
 SessionState::SessionState(Scanner input, ParseOptions parse)
     : scanner(std::move(input)),
       manager(Take(NodeManager::Create(), scanner.Here())),
       building(new QueryContext(Take(manager.RetainState(), scanner.Here()))),
-      parse_options(parse) {
-#ifdef DANDELION_FRONTEND_TESTING
-  scanner.Pool().stats = &stats;
-#endif
-}
+      source_records(parse.capture_source_records
+                         ? std::make_unique<SourceRecords>()
+                         : nullptr),
+      parse_options(parse) {}
 const QueryContext& SessionState::Prefix() const noexcept {
   return sealed ? *sealed : *building;
 }
 
-void SessionState::Checkpoint() {
+SessionState::~SessionState() {
+  if (!source_records) return;
+  auto& records = *source_records;
+  const std::array ranges{
+      RootRange::From<&Assertion::term>(std::span(records.assertions)),
+      RootRange::From<&DefinitionSource::body>(std::span(records.definitions)),
+      RootRange::From<&NamedTerm::term>(std::span(records.named_terms)),
+      RootRange::From<&Annotation::term>(std::span(records.annotations))};
+  static_cast<void>(NodeManager::ReleaseRoots(Prefix().GetManager(), ranges));
+}
+
 #ifdef DANDELION_FRONTEND_TESTING
+void SessionState::Checkpoint() {
   if (fail_after) {
     if (*fail_after == 0) {
       fail_after.reset();
@@ -227,62 +273,128 @@ void SessionState::Checkpoint() {
     }
     --*fail_after;
   }
+}
 #endif
+
+void SessionState::AddAnnotations(std::vector<Annotation> annotations) {
+  if (annotations.empty()) return;
+#ifdef DANDELION_FRONTEND_TESTING
+  Checkpoint();
+#endif
+  auto& captured = source_records->annotations;
+  if (annotations.size() > captured.max_size() - captured.size())
+    throw std::length_error("Source annotation count");
+  captured.reserve(captured.size() + annotations.size());
+  for (auto& annotation : annotations)
+    captured.push_back(std::move(annotation));
 }
 
-TypedCommand SessionState::Apply(Syntax& syntax, const ModelOwner* model) {
+void SessionState::CheckCommand(
+    CommandKind kind, SourceSpan where, const ModelOwner* model,
+    const std::optional<CheckAnswer>* answer) const {
+  switch (kind) {
+    case CommandKind::kUnsupported:
+      Fail(DiagnosticCode::kUnsupported, where,
+           "Command is outside the input profile");
+    case CommandKind::kSetLogic:
+      if (phase != SessionPhase::kBeforeLogic)
+        Fail(DiagnosticCode::kInvalidState, where,
+             "Logic has already been set");
+      break;
+    case CommandKind::kCheckSat:
+      if (phase != SessionPhase::kBuilding)
+        Fail(DiagnosticCode::kInvalidState, where,
+             "Expected one check-sat after set-logic");
+      break;
+    case CommandKind::kGetModel:
+    case CommandKind::kGetValue:
+      if (phase != SessionPhase::kAfterCheck || !options.produce_models)
+        Fail(DiagnosticCode::kInvalidState, where,
+             "Model queries require check-sat and produce-models");
+      if (model && (&model->GetQuery() != sealed.get() ||
+                    (inspection_model && model != inspection_model.get())))
+        Fail(DiagnosticCode::kModelFailure, where,
+             "Inspection session belongs to a different model or query");
+      if (answer) {
+        if (*answer == CheckAnswer::kUnsat)
+          Fail(DiagnosticCode::kInvalidState, where,
+               "Model inspection is unavailable after unsat");
+        if (!model)
+          Fail(DiagnosticCode::kModelUnavailable, where,
+               "No inspectable model is available");
+      }
+      break;
+    case CommandKind::kSetInfo:
+    case CommandKind::kSetOption:
+    case CommandKind::kGetInfo:
+    case CommandKind::kGetOption:
+    case CommandKind::kEcho:
+    case CommandKind::kExit:
+      break;
+    default:
+      if (phase != SessionPhase::kBuilding)
+        Fail(DiagnosticCode::kInvalidState, where,
+             "Command requires a logic and an unchecked query");
+      break;
+  }
+}
+
+void SessionState::Publish(const Syntax& syntax, TypedCommand& command,
+                           Node term, PendingTerms& pending,
+                           DefinitionInputs* definition,
+                           PendingDatatypeGroup* datatypes,
+                           PendingSortAlias* alias) {
+  using enum CommandResponse;
   const auto args = syntax.Children(0).subspan(1);
   const auto [kind, where] = syntax.header;
-  TypedCommand command{syntax.header, {}, nullptr, {}, {}};
-  if (kind == CommandKind::kUnsupported)
-    Fail(DiagnosticCode::kUnsupported, where,
-         "Command is outside the input profile");
   if (kind == CommandKind::kGetOption) {
-    command.text = ReadOption(syntax.Raw(args[0]), options);
-    return command;
+    command.response = ReadOption(syntax.Raw(args[0]), options);
+    return;
   }
   if (kind == CommandKind::kGetInfo) {
     const auto key = syntax.Raw(args[0]);
     if (key == ":name")
-      command.text = "(:name \"Dandelion\")";
+      command.response = kName;
     else if (key == ":version")
-      command.text = "(:version \"development\")";
+      command.response = kVersion;
     else if (key == ":authors")
-      command.text = "(:authors \"\")";
+      command.response = kAuthors;
     else if (key == ":error-behavior")
-      command.text = "(:error-behavior immediate-exit)";
+      command.response = kErrorBehavior;
     else if (key == ":reason-unknown") {
       if (phase != SessionPhase::kAfterCheck)
         Fail(DiagnosticCode::kInvalidState, where,
              "No unknown result is available");
-      command.needs_unknown_reason = true;
+      command.response = kUnknownReason;
     } else
-      command.text = "unsupported";
-    return command;
+      command.response = kUnsupported;
+    return;
   }
-  if (kind == CommandKind::kEcho) {
-    command.text = syntax.Raw(args[0]);
-    return command;
-  }
+  if (kind == CommandKind::kEcho) return;
   if (kind == CommandKind::kSetOption) {
     const auto next = ChangeOption(options, phase, syntax, args);
-    if (next.print_success) command.text = "success";
+    if (next.print_success) command.response = kSuccess;
+#ifdef DANDELION_FRONTEND_TESTING
     Checkpoint();
+#endif
     options = next;
-    return command;
+    return;
   }
   if (kind != CommandKind::kCheckSat && kind != CommandKind::kGetModel &&
       kind != CommandKind::kGetValue && options.print_success)
-    command.text = "success";
+    command.response = kSuccess;
 
   switch (kind) {
     case CommandKind::kExit:
       phase = SessionPhase::kTerminated;
       break;
     case CommandKind::kSetInfo: {
-      auto info = ReadInfo(syntax, args);
-      Checkpoint();
-      metadata.push_back(std::move(info));
+      if (auto info = ReadInfo(syntax, args, parse_options)) {
+#ifdef DANDELION_FRONTEND_TESTING
+        Checkpoint();
+#endif
+        source_records->metadata.push_back(std::move(*info));
+      }
       break;
     }
     case CommandKind::kSetLogic: {
@@ -293,7 +405,9 @@ TypedCommand SessionState::Apply(Syntax& syntax, const ModelOwner* model) {
       if (!profile)
         Fail(DiagnosticCode::kUnsupported, syntax.Span(args[0]),
              "Unregistered logic");
+#ifdef DANDELION_FRONTEND_TESTING
       Checkpoint();
+#endif
       building->signature_->profile = profile;
       building->logic_ = profile->name;
       phase = SessionPhase::kBuilding;
@@ -303,29 +417,34 @@ TypedCommand SessionState::Apply(Syntax& syntax, const ModelOwner* model) {
       if (phase != SessionPhase::kBuilding)
         Fail(DiagnosticCode::kInvalidState, where,
              "Expected one check-sat after set-logic");
+#ifdef DANDELION_FRONTEND_TESTING
       Checkpoint();
-      building->metadata_ = metadata;
+#endif
+      if (!options.produce_models) {
+        auto& aliases = building->signature_->aliases;
+        const std::array ranges{RootRange::From(aliases)};
+        Take(NodeManager::ReleaseRoots(building->GetManager(), ranges), where);
+#ifdef DANDELION_FRONTEND_TESTING
+        stats.alias_roots_released += aliases.size();
+#endif
+        sort_cache.reset();
+        building->signature_.reset();
+      }
       building->options_ = options;
       sealed = std::move(building);
       command.query = sealed;
       phase = SessionPhase::kAfterCheck;
       break;
     case CommandKind::kGetModel:
+      break;
     case CommandKind::kGetValue:
-      if (phase != SessionPhase::kAfterCheck || !options.produce_models)
-        Fail(DiagnosticCode::kInvalidState, where,
-             "Model queries require check-sat and produce-models");
-      if (kind == CommandKind::kGetValue)
-        ApplyValues(*this, syntax, command, model);
+      AddAnnotations(std::move(pending.annotations));
       break;
     default:
-      if (phase != SessionPhase::kBuilding)
-        Fail(DiagnosticCode::kInvalidState, where,
-             "Command requires a logic and an unchecked query");
-      ApplySemantic(syntax, command);
+      ApplySemantic(syntax, command, std::move(term), pending, definition,
+                    datatypes, alias);
       break;
   }
-  return command;
 }
 
 }  // namespace dandelion::frontend::detail
@@ -347,26 +466,21 @@ QueryContext::QueryContext(ManagerRef manager)
       signature_(std::make_unique<detail::Signature>()) {}
 QueryContext::~QueryContext() {
   const std::array ranges{
-      RootRange::From<&Assertion::term>(std::span(assertions_)),
+      RootRange::From(assertions_),
       RootRange::From<&DefinedFunction::body>(std::span(definitions_)),
-      RootRange::From<&NamedTerm::term>(std::span(named_terms_)),
-      RootRange::From<&Annotation::term>(std::span(annotations_))};
+      signature_ ? RootRange::From(signature_->aliases) : RootRange{}};
   static_cast<void>(NodeManager::ReleaseRoots(manager_, ranges));
-}
-const DefinedFunction* QueryContext::FindDefinition(DeclId id) const noexcept {
-  const auto found = signature_->definition_index.find(id);
-  return found == signature_->definition_index.end()
-             ? nullptr
-             : &definitions_[found->second];
 }
 const DefinedFunction* QueryContext::FindDefinition(
     DeclView decl) const noexcept {
-  const auto* definition = FindDefinition(decl.GetId());
-  return definition && definition->decl.Borrow() == decl ? definition : nullptr;
+  const auto found = definition_index_.find(decl.GetId());
+  if (found == definition_index_.end()) return nullptr;
+  const auto& definition = definitions_[found->second];
+  return definition.decl.Borrow() == decl ? &definition : nullptr;
 }
 std::optional<std::size_t> detail::Signature::FunctionOrdinal(
     const QueryContext& query, DeclView decl) noexcept {
-  const auto& runs = Of(query).function_runs;
+  const auto& runs = query.function_runs_;
   const auto id = decl.GetId();
   const auto next = std::ranges::upper_bound(
       runs, id, {}, &std::pair<DeclId, std::size_t>::first);
@@ -376,9 +490,8 @@ std::optional<std::size_t> detail::Signature::FunctionOrdinal(
   const auto end = next == runs.end() ? query.functions_.size() : next->second;
   if (delta >= end - start) return std::nullopt;
   const auto ordinal = start + static_cast<std::size_t>(delta);
-  return query.functions_[ordinal].decl.Borrow() == decl
-             ? std::optional(ordinal)
-             : std::nullopt;
+  return query.functions_[ordinal].Borrow() == decl ? std::optional(ordinal)
+                                                    : std::nullopt;
 }
 bool QueryContext::HasFunction(DeclView decl) const noexcept {
   return detail::Signature::FunctionOrdinal(*this, decl).has_value();
@@ -410,52 +523,74 @@ Outcome<Session> Session::FromReader(Reader reader, ParseOptions options,
         detail::Scanner(std::move(reader), source), options));
   });
 }
-Outcome<std::optional<CommandHeader>> Session::NextSyntax() {
-  if (state_->phase == SessionPhase::kTerminated) return std::nullopt;
-  if (state_->pending)
-    return std::unexpected(Diagnostic{DiagnosticCode::kInvalidState,
-                                      state_->pending->header.where,
-                                      "A parsed command is already pending"});
-  auto next = detail::Guard(state_->scanner.Here(),
-                            [&] { state_->scanner.Next(state_->pending); });
-  if (!next || !state_->pending) {
-    state_->pending.reset();
-    state_->phase = SessionPhase::kTerminated;
-    if (!next) return std::unexpected(next.error());
-    return std::nullopt;
-  }
-  return state_->pending->header;
+Outcome<std::optional<TypedCommand>> Session::ReadCommand(
+    const ModelOwner* model) {
+  return state_->ReadCommand(model);
 }
-Outcome<TypedCommand> Session::Apply(const ModelOwner* model) {
-  if (!state_->pending)
-    return std::unexpected(Diagnostic{DiagnosticCode::kInvalidState,
-                                      state_->scanner.Here(),
-                                      "No parsed command is pending"});
-  auto& syntax = *state_->pending;
-  auto result = detail::Guard(syntax.header.where, [&] {
-    const auto* bound = state_->inspection_model.get();
-    if (bound && model && model != bound)
-      detail::Fail(DiagnosticCode::kModelFailure, syntax.header.where,
-                   "Inspection session belongs to a different model");
-    return state_->Apply(syntax, bound ? bound : model);
+
+SyntaxValidator::SyntaxValidator(
+    std::unique_ptr<detail::Scanner> scanner) noexcept
+    : scanner_(std::move(scanner)) {}
+SyntaxValidator::SyntaxValidator(SyntaxValidator&&) noexcept = default;
+SyntaxValidator& SyntaxValidator::operator=(SyntaxValidator&&) noexcept =
+    default;
+SyntaxValidator::~SyntaxValidator() = default;
+
+Outcome<SyntaxValidator> SyntaxValidator::FromText(std::string_view text,
+                                                   std::uint32_t source) {
+  return detail::Guard({source, {}, {}}, [&] {
+    return SyntaxValidator(std::make_unique<detail::Scanner>(text, source));
   });
-  state_->pending.reset();
-  return result;
 }
+Outcome<SyntaxValidator> SyntaxValidator::FromReader(Reader reader,
+                                                     std::uint32_t source) {
+  return detail::Guard({source, {}, {}}, [&] {
+    return SyntaxValidator(
+        std::make_unique<detail::Scanner>(std::move(reader), source));
+  });
+}
+Outcome<std::optional<CommandHeader>> SyntaxValidator::ReadNext() {
+  if (in_read_) return std::unexpected(detail::ReentrantRead(scanner_->Here()));
+  if (terminated_) return std::nullopt;
+  const detail::ReadScope reading(in_read_);
+  auto next = detail::Guard(scanner_->Here(),
+                            [&] { return detail::ReadGrammar(*scanner_); });
+  if (!next || !*next || (**next).kind == CommandKind::kExit)
+    terminated_ = true;
+  return next;
+}
+
 SessionPhase Session::GetPhase() const noexcept { return state_->phase; }
 const SessionOptions& Session::GetOptions() const noexcept {
   return state_->options;
 }
-std::span<const Attribute> Session::GetMetadata() const noexcept {
-  return state_->metadata;
+const SourceRecords* Session::GetSourceRecords() const noexcept {
+  return state_->source_records.get();
 }
 const QueryContext& Session::GetPrefix() const noexcept {
   return state_->Prefix();
 }
 #ifdef DANDELION_FRONTEND_TESTING
-FrontendStats Session::GetStats() const noexcept { return state_->stats; }
-void Session::ForceSyntaxPromotionThreshold(std::uint64_t threshold) noexcept {
-  state_->scanner.Pool().threshold = threshold;
+FrontendStats Session::GetStats() const noexcept {
+  auto stats = state_->stats;
+  if (const auto* signature = state_->Prefix().signature_.get()) {
+    for (const auto& [name, entry] : signature->terms.Entries()) {
+      const auto* instance = std::get_if<DeclInstanceView>(&entry);
+      if (instance &&
+          instance->GetDeclaration().GetNameHint().data() == name.data())
+        ++stats.borrowed_term_names;
+      else
+        ++stats.pooled_term_names;
+    }
+  }
+  return stats;
+}
+void Session::ForceNameHashCollisions() noexcept {
+  state_->building->signature_->terms.ForceCollisions();
+  state_->building->signature_->sorts.ForceCollisions();
+}
+void Session::FailGrammarAllocationAfter(std::size_t checkpoints) noexcept {
+  state_->scanner.FailAllocationAfter(checkpoints);
 }
 void Session::FailAllocationAfter(std::size_t checkpoints) noexcept {
   state_->fail_after = checkpoints;

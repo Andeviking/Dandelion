@@ -15,19 +15,24 @@ TEST(FrontendSorts, ArrayShapePrecedesProfileGatesOnArguments) {
   const auto query =
       RequireQuery(Parse("(set-logic QF_SAT)(define-sort Array (T) T)"
                          "(declare-const x (Array Bool))(check-sat)"));
-  EXPECT_EQ(query->GetFunctions()[0].decl.Borrow().GetRange()->GetKind(),
+  EXPECT_EQ(query->GetFunctions()[0].Borrow().GetRange()->GetKind(),
             SortKind::kBool);
 }
 
-TEST(FrontendDatatypes, HeaderAndBodyCountsPrecedeProfileGating) {
+TEST(FrontendDatatypes, GrammarAndFirstDeferredErrorPrecedeCountMismatch) {
   for (auto declaration : {"(declare-datatypes ((A 0) (B 0)) (((a))))",
                            "(declare-datatypes ((A 0)) (((a)) ((b))))"}) {
-    const auto script = "(set-logic QF_SAT)" + std::string(declaration);
-    SCOPED_TRACE(::testing::Message() << "FE-PROFILE-SHAPE-02 " << script);
-    ExpectError(Parse(script), DiagnosticCode::kInvalidInput);
+    SCOPED_TRACE(::testing::Message() << "FE-PROFILE-SHAPE-02 " << declaration);
+    ExpectError(Parse("(set-logic QF_SAT)" + std::string(declaration)),
+                DiagnosticCode::kUnsupported);
+    ExpectError(Parse("(set-logic QF_DT)" + std::string(declaration)),
+                DiagnosticCode::kInvalidInput);
   }
   ExpectError(Parse("(set-logic QF_SAT)(declare-datatypes ((A 0)) (((a))))"),
               DiagnosticCode::kUnsupported);
+  ExpectError(
+      Parse("(set-logic QF_SAT)(declare-datatypes ((A 0) (B 0)) (((a)))"),
+      DiagnosticCode::kSyntax);
 }
 
 TEST(FrontendSorts, AliasParametersOrderedRanksAndFpAliases) {
@@ -42,20 +47,19 @@ TEST(FrontendSorts, AliasParametersOrderedRanksAndFpAliases) {
       "(declare-const ar (Array S (U Float16 R)))"
       "(assert (= same direct))(assert (= b t))(check-sat)"));
   const auto fs = query->GetFunctions();
-  const auto range = [&](std::size_t i) {
-    return *fs[i].decl.Borrow().GetRange();
-  };
+  const auto range = [&](std::size_t i) { return *fs[i].Borrow().GetRange(); };
   EXPECT_EQ(range(0), range(1));
   EXPECT_NE(range(0), range(2));
   EXPECT_EQ(range(0).GetArguments()[0].GetKind(), SortKind::kBool);
   EXPECT_EQ(range(0).GetArguments()[1].GetKind(), SortKind::kInt);
-  EXPECT_EQ(range(3).GetSortConstructor(),
-            query->GetUserSorts()[1].constructor.Borrow());
+  EXPECT_EQ(range(3).GetSortConstructor(), query->GetUserSorts()[1].Borrow());
   constexpr std::array<std::pair<unsigned, unsigned>, 4> formats{
       {{5, 11}, {8, 24}, {11, 53}, {15, 113}}};
   for (std::size_t i = 0; i < formats.size(); ++i) {
-    EXPECT_EQ(range(i + 4).GetFpExponentWidth(), formats[i].first);
-    EXPECT_EQ(range(i + 4).GetFpSignificandWidth(), formats[i].second);
+    EXPECT_EQ(range(i + 4).GetFpFormat().value().ExponentWidth(),
+              formats[i].first);
+    EXPECT_EQ(range(i + 4).GetFpFormat().value().SignificandWidth(),
+              formats[i].second);
   }
   EXPECT_EQ(range(5), range(8));
   EXPECT_EQ(range(9).GetKind(), SortKind::kRoundingMode);
@@ -112,16 +116,17 @@ TEST(FrontendSorts, RepresentationLimitsAndExactlySizedSorts) {
             "(declare-sort Big 18446744073709551615)(check-sat)"));
   const auto decls = query->GetFunctions();
   constexpr auto max = std::numeric_limits<std::uint32_t>::max();
-  EXPECT_EQ(decls[0].decl.Borrow().GetRange()->GetWidth(), max);
-  EXPECT_EQ(decls[1].decl.Borrow().GetRange()->GetFpExponentWidth(), max - 2);
-  EXPECT_EQ(decls[1].decl.Borrow().GetRange()->GetFpSignificandWidth(), 2u);
+  EXPECT_EQ(decls[0].Borrow().GetRange()->GetWidth(), max);
+  EXPECT_EQ(decls[1].Borrow().GetRange()->GetFpFormat().value().ExponentWidth(),
+            max - 2);
+  EXPECT_EQ(
+      decls[1].Borrow().GetRange()->GetFpFormat().value().SignificandWidth(),
+      2u);
   const auto sorts = query->GetUserSorts();
   ASSERT_EQ(sorts.size(), 3);
-  EXPECT_EQ(sorts[0].constructor.Borrow().GetArity(),
-            std::uint64_t{4294967295});
-  EXPECT_EQ(sorts[1].constructor.Borrow().GetArity(),
-            std::uint64_t{4294967296});
-  const auto big = sorts[2].constructor.Borrow();
+  EXPECT_EQ(sorts[0].Borrow().GetArity(), std::uint64_t{4294967295});
+  EXPECT_EQ(sorts[1].Borrow().GetArity(), std::uint64_t{4294967296});
+  const auto big = sorts[2].Borrow();
   static_assert(std::same_as<decltype(big.GetArity()), std::uint64_t>);
   EXPECT_EQ(big.GetArity(), std::numeric_limits<std::uint64_t>::max());
   for (auto bigger : {"(declare-const b (_ BitVec 4294967296))",
@@ -187,7 +192,7 @@ TEST(FrontendDatatypes,
   }
   EXPECT_EQ(session.GetStats().recipe_pairs, 13u);
   const auto node =
-      session.GetPrefix().GetAssertions()[0].term.Borrow().GetChildren()[0];
+      session.GetPrefix().GetAssertions()[0].Borrow().GetChildren()[0];
   EXPECT_EQ(node.GetSort().GetArguments()[0].GetKind(), SortKind::kInt);
 
   constexpr std::string_view setup =
@@ -325,10 +330,10 @@ TEST(FrontendMatch, FirstMatchChecksEveryBranchAndLowersGuardedSelectors) {
             " ((box c d) (! (* 3 4) :named unreachable)) (none 0)))"
             " (ite ((_ is box) ch) (* 2 (item ch)) 0)))"
             "(assert (= unreachable (* 3 4)))(check-sat)"));
-  EXPECT_EQ(Argument(query->GetAssertions()[0].term, 0),
-            Argument(query->GetAssertions()[0].term, 1));
-  EXPECT_EQ(Argument(query->GetAssertions()[1].term, 0),
-            Argument(query->GetAssertions()[1].term, 1));
+  EXPECT_EQ(Argument(query->GetAssertions()[0], 0),
+            Argument(query->GetAssertions()[0], 1));
+  EXPECT_EQ(Argument(query->GetAssertions()[1], 0),
+            Argument(query->GetAssertions()[1], 1));
 }
 
 TEST(FrontendCombinations, DatatypeArrayFpAndUfRanksAndBoundaries) {
@@ -371,14 +376,14 @@ TEST(FrontendScale, DeepShorthandSortsAndNestedMatches) {
   for (std::size_t i = 0; i < kMatchDepth; ++i) script += ") (blue 2)))";
   script += "1))(check-sat)";
   auto query = RequireQuery(Parse(script));
-  auto sort = *query->GetFunctions()[1].decl.Borrow().GetRange();
+  auto sort = *query->GetFunctions()[1].Borrow().GetRange();
   for (std::size_t i = 0; i < kSortDepth; ++i) {
     ASSERT_EQ(sort.GetKind(), SortKind::kArray);
     EXPECT_EQ(sort.GetArrayIndex()->GetKind(), SortKind::kBool);
     sort = *sort.GetArrayElement();
   }
   EXPECT_EQ(sort.GetKind(), SortKind::kInt);
-  auto node = Argument(query->GetAssertions()[0].term, 0);
+  auto node = Argument(query->GetAssertions()[0], 0);
   for (std::size_t i = 0; i < kMatchDepth; ++i) {
     ASSERT_EQ(node.GetKind(), Kind::kIte);
     const auto children = node.GetChildren();
@@ -498,11 +503,11 @@ TEST(FrontendSorts, FailedAliasRecipeLeavesPriorAliasAndAllowsSameNameRetry) {
   RequireNext(session, CommandKind::kSetLogic);
   RequireNext(session, CommandKind::kDefineSort);
   RequireNext(session, CommandKind::kDeclareConst);
-  const auto prior = session.GetPrefix().GetFunctions()[0].decl;
+  const auto prior = session.GetPrefix().GetFunctions()[0];
   ExpectError(Next(session), DiagnosticCode::kInvalidInput);
   ExpectError(Next(session), DiagnosticCode::kInvalidInput);
   ASSERT_EQ(session.GetPrefix().GetFunctions().size(), 1);
-  EXPECT_EQ(session.GetPrefix().GetFunctions()[0].decl, prior);
+  EXPECT_EQ(session.GetPrefix().GetFunctions()[0], prior);
   RequireNext(session, CommandKind::kDefineSort);
   RequireNext(session, CommandKind::kDeclareConst);
   RequireNext(session, CommandKind::kDeclareConst);
@@ -510,9 +515,9 @@ TEST(FrontendSorts, FailedAliasRecipeLeavesPriorAliasAndAllowsSameNameRetry) {
   const auto query = RequireCheck(session);
   const auto functions = query->GetFunctions();
   ASSERT_EQ(functions.size(), 3);
-  EXPECT_EQ(functions[0].decl, prior);
-  const auto later = *functions[1].decl.Borrow().GetRange();
-  EXPECT_EQ(later, functions[2].decl.Borrow().GetRange());
+  EXPECT_EQ(functions[0], prior);
+  const auto later = *functions[1].Borrow().GetRange();
+  EXPECT_EQ(later, functions[2].Borrow().GetRange());
   EXPECT_EQ(later.GetArrayIndex(), prior.Borrow().GetRange());
   EXPECT_EQ(later.GetArrayElement()->GetArrayIndex()->GetKind(),
             SortKind::kInt);

@@ -1,15 +1,119 @@
 # Frontend implementation and acceptance record
 
-**Status: implemented frontend, including Phase 2.** The
-[Phase 2 cases](../testing/frontend.md#phase-2-test-design) trace the
-refined contracts to the GoogleTest suite. The results below record the
-verified Phase 2 run and the earlier baseline and corpus runs.
+**Status.** Phase 2 uses the fused `Session::ReadCommand` protocol
+with incremental grammar validation and command-local semantic reductions.
+The Phase 1 sections record the previous split reader.
 
 The frontend uses the selected [input profile](logic-profile.md),
 [command and ownership contracts](semantic-interfaces.md), and
 [test inventory](../testing/frontend.md).
 
-## Source and ownership choices
+## Phase 1 implementation
+
+`QueryContext` retains the semantic query. Sessions capture written
+occurrences only when requested. Source capture and strict metadata
+validation are independent. Model-enabled queries keep the frozen term
+and sort namespace. Other queries batch-release alias roots at seal.
+
+Nullary definitions and `:named` share one direct-body binding.
+Parameterized definitions retain ordered formals and saturated calls.
+Lexical dependency marks follow source occurrences in binder scopes.
+Binder-free operands use the owning node stack without a parallel mark
+for each operand. The name tables borrow canonical declaration spellings
+or use stable pooled storage.
+
+Free model declarations are rendered from their semantic ranks. The
+printer memoizes concrete sort spellings and parameterized recipe matches.
+Frontend inspection benchmarks enable source capture. Timed parsing
+counts definition commands with capture disabled.
+
+The [Phase 1 tests](../testing/frontend.md#phase-1-test-design) were added
+before the frontend implementation. The first GCC build stopped at the
+missing capture and query APIs. The literal tests use the specified Phase 1
+width reduction for indexed BV numerals. The Node factories retain their
+exact in-range value precondition. Model text expectations follow the
+documented sort-head count and name-length rules. The seal fixture grows
+the Node table to exercise detachment because Node retains its initial
+capacity when releasing a small graph.
+
+## Phase 2 implementation
+
+The scanner reports online byte positions. Typed sessions and independent
+syntax validators use the same iterative grammar frames. The typed reader
+reduces terms, sorts and datatype fields while consuming tokens. It reuses
+the owning term buffer and recycles completed source fragments. Opaque
+metadata keeps only open grammar frames and the captured value when
+requested.
+
+Named aliases, datatype headers and declaration recipes remain private
+until the complete grammar boundary. The first semantic failure stops
+reduction and the grammar reader drains the remaining input. A complete
+failed command permits recovery. Structural failures terminate the reader.
+Source records and phase changes publish after successful preparation.
+The driver maps fixed response tags to static strings and retains the
+model printer's flush boundary for abstract name publication.
+
+The Clang test-first build reported the missing
+`Session::ReadCommand` and `NodeManager::CheckBuiltinOperands` members.
+The Phase 2 coordinate fixture uses byte column 21 for the written
+significand index, counting the characters before it directly. The
+datatype fixture includes a free sort in the previous user-sort range
+because datatype groups have a separate query range. The gate fixture
+supplies a model provider for a successful `sat` with model production
+enabled. The old forced page-widening case now checks live frame and
+operand growth while preserving its DAG, spelling and span assertions.
+
+## Phase 2 implementation sequence
+
+The [fused `ReadCommand` design](design.md#phase-2-fused-command-reading)
+uses the [Phase 2 frontend tests](../testing/frontend.md#phase-2-test-design)
+and [Node consuming tests](../testing/node.md#phase-2-consuming-construction)
+as its test-first gates. The Phase 1 results concern the split protocol.
+
+1. Add the scoped GoogleTest cases before implementing the behavior.
+   Keep the split path available during the additive migration so its
+   existing tests continue to run. Record missing-interface failures and
+   preserve the existing coverage during the switch.
+2. Add the checked Node move-in path, with shared key/rank access for
+   owning and borrowed inputs. Verify it independently against the
+   borrowed factories, including retains, collisions and publication
+   rollback. The frontend and Node continue to build without solving or
+   a SAT dependency.
+3. In the scanner and grammar, introduce online positions and a shared
+   iterative frame machine. Establish the syntax-only adapter with the
+   existing grammar-without-logic fixtures before wiring semantic
+   reductions. Keep Phase 1 paging and its promotion hooks confined to
+   the migration path while its test coverage is still required.
+4. Wire sort, term, datatype and request reducers to the fused command
+   stack. Keep operand slots contiguous with separate location metadata.
+   Separate inline scope from the sparse overlay, and move publication
+   preparation to the completed grammar boundary. Verify failure drain,
+   user Reader inspection and rollback before switching the default.
+5. Dispatch `Session::Run` through the same reader with private result
+   context. Map response tags to static text and preserve the model
+   printer's separate staged output lifecycle. Migrate parser-only tools
+   and benchmark callers to `ReadCommand`, using `SyntaxValidator` where
+   callers require only shape validation.
+6. Run the existing acceptance configurations and the Phase 2 cases.
+   After the scoped tests pass, retire the pending-syntax API and
+   storage, preserving grammar and semantic regression coverage.
+   Record observed status and compare Phase 2 performance using the
+   [fused workload measurements](../benchmarks/frontend-workloads.md#phase-2-fused-measurement).
+
+The architecture review traced a staged alias through a Reader callback,
+late grammar failure and post-close preparation failure. This requires
+private early bindings and reverse-append rollback only after the last
+read. It also traced a malformed result-dependent request and an
+abandoned rational candidate. Both require syntax transitions independent
+of semantic success. The ownership review traced repeated child slots
+through a hit, miss and failed retain, and separated command commit from
+the flush boundary for output bindings. The consuming path transfers each
+owner only after all fallible preparation.
+
+## Historical baseline source and ownership (Phase 1)
+
+This section describes the retired split protocol and its original representation;
+the current interface is `ReadCommand` and `SyntaxValidator` as described above.
 
 The public C++ module exposes a session whose pending syntax belongs to that
 session. `NextSyntax` supplies the public `CommandHeader` with the kind and
@@ -60,7 +164,7 @@ during baseline implementation.
   required out-of-line equality for the two exported source-coordinate
   records. Its module mangler crashed on their imported defaulted friends.
 
-## Elaboration test inventory
+## Baseline elaboration test inventory
 
 The `Registered/LogicProfile` cases enumerate the profile table and check
 both declaration spellings, definitions, family admission and availability.
@@ -70,7 +174,7 @@ operator kind, ordered operands, result sort information and exact indices
 for the tabulated spellings. Its shared negatives exercise an empty
 application where illegal and a replacement of the first operand with
 a wrong sort. Separate tests cover selected width and format mismatches,
-qualifier errors, literals and special ranks. Phase 2 checks exact
+qualifier errors, literals and special ranks. Baseline refinements check exact
 per-profile root counts and kinds, rank-specific arity and operand
 negatives, array index and element checks, asymmetric FP conversion formats,
 and Core equality versus `fp.eq` for signed zero.
@@ -118,12 +222,16 @@ Import `dandelion.frontend` and link against the static target
 `dandelion_frontend`.
 
 - For typed parsing, open a `Session` with `FromText` or `FromReader`.
-  Alternate `NextSyntax` and `Apply`. The typed check command owns the
-  sealed `QueryContext`, including the original declaration ranks,
-  ordered assertions, datatype groups, retained definitions, and source
-  records. Views into a building prefix are borrowed until mutation.
+  Call `ReadCommand` until EOF, `exit` or a diagnostic. The typed check command owns the
+  sealed `QueryContext`, including semantic declaration ranks, ordered
+  assertions, datatype groups, and parameterized definition templates.
+  Enable `ParseOptions::capture_source_records` to read occurrence history
+  through `Session::GetSourceRecords()`. Prefix and source history views
+  borrow their owners until mutation.
+- For grammar-only reading, open a `SyntaxValidator` with `FromText` or
+  `FromReader` and call `ReadNext` for each command header.
 - For protocol execution, pass an `Engine` callback and `ResponseSink` to
-  `Run`. The callback receives the sealed query by `const QueryContext&`
+  `Session::Run`. The callback receives the sealed query by `const QueryContext&`
   and a copy of the session options.
   `Run` attaches an eligible provider to a `ModelOwner` before publishing its
   result. A sink returns the number of bytes it accepted and can provide a
@@ -131,13 +239,15 @@ Import `dandelion.frontend` and link against the static target
   storage remains live through the returned result.
 - For subsequent inspection of an owned result, use `ForModelText` or
   `ForModelReader`. They share the sealed signature and model-local name
-  registry. Query and manager access follows Node's single-thread contract.
+  registry. Their options overloads support canonicalization, fresh source
+  capture, and strict metadata. Query and manager access follows Node's
+  single-thread contract.
 
 The [profile table](logic-profile.md) defines supported inputs. The
 [semantic interfaces](semantic-interfaces.md) describe result and model
 obligations in detail.
 
-## Implementation evidence
+## Baseline implementation evidence
 
 The lexer separates quoted names from grammar keywords and validates UTF-8
 before resolving names. The parser checks all written grammar roles against a
@@ -196,8 +306,48 @@ No reference source is linked into the frontend or the default tests.
 
 ### Verified Phase 2 run
 
-On 2026-11-19, the CTest logs recorded the following runs for the Phase 2
-implementation before the post-fix cleanup.
+GCC 16.2.0 and Clang 23.1.5 built with warnings as errors using
+CMake 4.5.0 and Ninja 1.13.2. The Debug GCC build enabled ASan and
+UBSan.
+
+| Build | Discovered | Passed | Failed | Skipped |
+| --- | ---: | ---: | ---: | ---: |
+| `build/debug` | 884 | 880 | 0 | 4 |
+| `build/clang-debug` | 891 | 887 | 0 | 4 |
+| `build/benchmark-clang` | 891 | 887 | 0 | 4 |
+
+All 17 Phase 2 frontend cases and the owning-operand validation case
+passed in each configuration. The skips were opt-in benchmark probes
+for a reference capture, large snapshot, workload probes and graph
+lifetime. The Release benchmark executable passed all three pipeline
+checks. The Python differential-runner unit tests passed all 14 cases.
+Formatting covered 76 C++ files, and clang-tidy checked 73 translation
+units. The GCC Release frontend library also built with tests and
+benchmarks disabled.
+
+### Verified Phase 1 run
+
+On 2026-11-19, all 286 frontend tests passed in each full suite.
+GCC 16.2.0 built the Debug suite with ASan and UBSan. Clang 23.1.5
+built the Debug and benchmark-enabled Release suites.
+
+| Build directory | Discovered | Passed | Failed | Skipped |
+| --- | ---: | ---: | ---: | ---: |
+| `build/debug` | 858 | 854 | 0 | 4 |
+| `build/clang-debug` | 865 | 861 | 0 | 4 |
+| `build/benchmark-clang` | 865 | 861 | 0 | 4 |
+
+The four skips in each suite were opt-in reference and workload tests.
+The frontend benchmark pipeline passed generator smoke inspection,
+synthetic corpus safety, and concurrent runner checks using the Clang
+Release benchmark executable. The Release library built with testing
+disabled contains no allocation-checkpoint or fault-injection symbols.
+These checks establish behavior on the covered fixtures.
+
+### Verified frontend baseline run
+
+On 2026-11-19, the CTest logs recorded the following baseline runs
+before the post-fix cleanup.
 
 | Configuration | CTest discovered | Passed | Failed | Skipped |
 | --- | ---: | ---: | ---: | ---: |

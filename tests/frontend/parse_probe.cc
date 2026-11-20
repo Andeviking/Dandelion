@@ -1,5 +1,6 @@
 import std;
 import dandelion.frontend;
+import dandelion.util.numeric;
 
 namespace dandelion::frontend::testing {
 namespace {
@@ -70,7 +71,7 @@ std::string_view Operator(Kind kind) {
 void QuoteSymbol(std::ostream& out, std::string_view name) {
   out << '|' << name << '|';
 }
-using DefinitionNames = std::unordered_map<DeclId, std::string>;
+using DefinitionNames = std::unordered_map<NodeId, std::string>;
 void Serialize(std::ostream& out, const DefinitionNames& definitions,
                NodeView root) {
   using Task = std::variant<NodeView, char>;
@@ -83,6 +84,11 @@ void Serialize(std::ostream& out, const DefinitionNames& definitions,
       continue;
     }
     const auto term = std::get<NodeView>(task);
+    if (const auto alias = definitions.find(term.GetId());
+        alias != definitions.end()) {
+      out << alias->second;
+      continue;
+    }
     const auto kind = term.GetKind();
     if (kind == Kind::kBoolValue) {
       out << (*term.GetValue()->GetBool() ? "true" : "false");
@@ -97,8 +103,10 @@ void Serialize(std::ostream& out, const DefinitionNames& definitions,
       continue;
     }
     if (kind == Kind::kBvValue) {
-      out << "(_ bv" << term.GetValue()->GetInteger()->ToDecimal() << ' '
-          << *term.GetSort().GetWidth() << ')';
+      const auto bits = term.GetValue()->GetBitVector().value();
+      const auto number = numeric::BitVector::ToUnsignedInteger(bits.Copy());
+      if (!number) throw std::runtime_error("Cannot render bit-vector literal");
+      out << "(_ bv" << number->ToDecimal() << ' ' << bits.Width() << ')';
       continue;
     }
     const auto children = term.GetChildren();
@@ -109,9 +117,6 @@ void Serialize(std::ostream& out, const DefinitionNames& definitions,
         out << "(_ is ";
         QuoteSymbol(out, decl.GetConstructor()->GetNameHint());
         out << ')';
-      } else if (const auto definition = definitions.find(decl.GetId());
-                 definition != definitions.end()) {
-        out << definition->second;
       } else {
         if (decl.GetParameterCount() != 0)
           throw std::runtime_error(
@@ -184,24 +189,23 @@ int Probe(bool compare) {
   const std::string input((std::istreambuf_iterator<char>(std::cin)),
                           std::istreambuf_iterator<char>());
   if (std::cin.bad()) throw std::runtime_error("Input read failed");
-  auto session = Session::FromText(input);
+  auto session =
+      Session::FromText(input, ParseOptions{.capture_source_records = compare});
   if (!session) return Report(session.error());
   std::ostringstream validation;
   std::shared_ptr<const QueryContext> query;
-  std::string_view considered_input = input;
   std::size_t commands = 0;
+  auto considered_input = std::string_view(input);
   while (true) {
-    const auto syntax = session->NextSyntax();
-    if (!syntax) return Report(syntax.error());
-    if (!*syntax) break;
-    auto typed = session->Apply();
-    if (!typed) return Report(typed.error());
+    auto command = session->ReadCommand();
+    if (!command) return Report(command.error());
+    if (!*command) break;
+    auto& typed = *command;
     if (typed->query) query = std::move(typed->query);
     ++commands;
     const auto header = typed->header;
     if (header.kind == CommandKind::kExit)
-      considered_input = considered_input.substr(
-          0, static_cast<std::size_t>(header.where.end.offset));
+      considered_input = considered_input.substr(0, header.where.end.offset);
     if (compare && SignatureCommand(header.kind))
       validation << At(input, header.where) << '\n';
   }
@@ -209,34 +213,35 @@ int Probe(bool compare) {
   std::cerr << query->GetLogic() << " commands=" << commands
             << " assertions=" << query->GetAssertions().size()
             << " functions=" << query->GetFunctions().size()
-            << " definitions=" << query->GetDefinitions().size()
+            << " definitions=" << query->GetDefinitionCount()
             << " datatype_groups=" << query->GetDatatypeGroups().size() << '\n';
   if (!compare) return 0;
-  if (!query->GetNamedTerms().empty()) {
+  if (!session->GetSourceRecords()->named_terms.empty()) {
     std::cerr << "Comparison with named assertions is unavailable\n";
     return 3;
   }
   try {
     DefinitionNames definitions;
+    if (query->GetDefinitionCount() != 0)
+      throw std::runtime_error(
+          "Comparison with non-nullary definitions is unavailable");
     std::string prefix = "dandelion_recovered_";
     while (considered_input.contains(prefix)) prefix.push_back('_');
-    for (const auto& definition : query->GetDefinitions()) {
-      if (!definition.formals.empty())
-        throw std::runtime_error(
-            "Comparison with non-nullary definitions is unavailable");
-      auto name = prefix + std::to_string(definitions.size());
+    std::size_t ordinal = 0;
+    for (const auto& definition : session->GetSourceRecords()->definitions) {
+      auto name = prefix + std::to_string(ordinal++);
       validation << "(define-fun " << name << " () ";
       ComparisonSort(validation, definition.body.Borrow().GetSort());
       validation << ' ';
       Serialize(validation, definitions, definition.body.Borrow());
       validation << ")\n";
-      definitions.emplace(definition.decl.GetId(), std::move(name));
+      definitions.try_emplace(definition.body.GetId(), std::move(name));
     }
     if (query->GetAssertions().empty()) {
       validation << "(assert false)\n";
     } else {
       validation << "(assert (or false\n";
-      for (const auto& assertion : query->GetAssertions()) {
+      for (const auto& assertion : session->GetSourceRecords()->assertions) {
         validation << "(xor " << At(input, assertion.where) << '\n';
         Serialize(validation, definitions, assertion.term.Borrow());
         validation << ")\n";

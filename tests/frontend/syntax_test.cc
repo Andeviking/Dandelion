@@ -22,23 +22,24 @@ TEST(FrontendSyntax, ExactSpansAndLexemesAtEverySplitPoint) {
           offset += count;
           return count;
         },
-        42));
+        ParseOptions{.capture_source_records = true}, 42));
     const auto echo = RequireNext(session, CommandKind::kEcho);
-    EXPECT_EQ(echo.text, "\"a\"\"b \\ ; café λ\"");
+    EXPECT_EQ(std::get<std::string>(echo.response), "\"a\"\"b \\ ; café λ\"");
     EXPECT_EQ(echo.header.where.source, 42);
     EXPECT_EQ(echo.header.where.begin, (SourcePosition{11, 2, 1}));
     EXPECT_EQ(echo.header.where.end, (SourcePosition{input.find(")\r") + 1, 2,
                                                      input.find(")\r") - 9}));
     const auto info = RequireNext(session, CommandKind::kSetInfo);
     EXPECT_EQ(info.header.where.begin.line, 3);
-    ASSERT_EQ(session.GetMetadata().size(), 1);
-    EXPECT_EQ(session.GetMetadata()[0].value, "(|match| \"\" #xAB #b00 ())");
+    ASSERT_EQ(session.GetSourceRecords()->metadata.size(), 1);
+    EXPECT_EQ(session.GetSourceRecords()->metadata[0].value,
+              "(|match| \"\" #xAB #b00 ())");
     RequireNext(session, CommandKind::kSetLogic);
     RequireNext(session, CommandKind::kDeclareConst);
     RequireNext(session, CommandKind::kAssert);
     const auto checked = RequireCheck(session);
     ASSERT_EQ(checked->GetAssertions().size(), 1);
-    EXPECT_EQ(Applied(checked->GetAssertions()[0].term.Borrow()).GetNameHint(),
+    EXPECT_EQ(Applied(checked->GetAssertions()[0].Borrow()).GetNameHint(),
               "let");
     EXPECT_FALSE(Require(Next(session)));
   }
@@ -71,10 +72,10 @@ TEST(FrontendSyntax, MalformedTokensAndTruncatedCommands) {
   for (const auto& input : inputs) {
     SCOPED_TRACE(input);
     auto session = Require(Session::FromText(input));
-    ExpectError(session.NextSyntax(), DiagnosticCode::kSyntax);
+    ExpectError(session.ReadCommand(), DiagnosticCode::kSyntax);
   }
   auto session = Require(Session::FromText("; lead\r\n  (echo \"open"));
-  const auto error = session.NextSyntax();
+  const auto error = session.ReadCommand();
   ASSERT_FALSE(error);
   EXPECT_EQ(error.error().where.begin, (SourcePosition{16, 2, 9}));
 }
@@ -89,15 +90,17 @@ TEST(FrontendSyntax, ReportsReadFailureSeparatelyFromEof) {
         std::copy(prefix.begin(), prefix.end(), chunk.begin());
         return prefix.size();
       }));
-  const auto result = session.NextSyntax();
+  const auto result = session.ReadCommand();
   ExpectError(result, DiagnosticCode::kInputIo);
   ASSERT_FALSE(result);
   EXPECT_EQ(result.error().io_error, failed);
   EXPECT_EQ(result.error().where.begin.offset, prefix.size());
   auto eof = Require(Session::FromText(prefix));
-  ExpectError(eof.NextSyntax(), DiagnosticCode::kSyntax);
+  ExpectError(eof.ReadCommand(), DiagnosticCode::kSyntax);
   auto complete = Require(Session::FromText("(echo \"done\")"));
-  EXPECT_EQ(RequireNext(complete, CommandKind::kEcho).text, "\"done\"");
+  EXPECT_EQ(
+      std::get<std::string>(RequireNext(complete, CommandKind::kEcho).response),
+      "\"done\"");
   EXPECT_FALSE(Require(Next(complete)));
 }
 
@@ -135,11 +138,12 @@ TEST(FrontendSyntax, ChecksTermAndCommandGrammarBeforeSemanticState) {
     SCOPED_TRACE(input);
     auto session = Require(Session::FromText(input));
     if (input == "(check-sat-assuming ()) extra)") {
-      ASSERT_TRUE(Require(session.NextSyntax()));
-      ExpectError(session.Apply(), DiagnosticCode::kUnsupported);
+      auto validator = Require(SyntaxValidator::FromText(input));
+      ASSERT_TRUE(Require(validator.ReadNext()));
+      ExpectError(session.ReadCommand(), DiagnosticCode::kUnsupported);
       continue;
     }
-    ExpectError(session.NextSyntax(), DiagnosticCode::kSyntax);
+    ExpectError(session.ReadCommand(), DiagnosticCode::kSyntax);
   }
 }
 
@@ -154,7 +158,7 @@ TEST(FrontendSyntax, ReservedKeywordsAndMalformedCommandArguments) {
         "(declare-datatype D ((c field)))", "(check-sat-assuming () extra)"}) {
     SCOPED_TRACE(input);
     auto session = Require(Session::FromText(input));
-    ExpectError(session.NextSyntax(), DiagnosticCode::kSyntax);
+    ExpectError(session.ReadCommand(), DiagnosticCode::kSyntax);
     EXPECT_EQ(session.GetPhase(), SessionPhase::kTerminated);
   }
 }
@@ -175,9 +179,9 @@ TEST(FrontendSyntax, QuotedDataKeepsUtf8AndLineBreaksAtEverySplit) {
           offset += count;
           return count;
         },
-        27));
+        ParseOptions{.capture_source_records = true}, 27));
     const auto echo = RequireNext(session, CommandKind::kEcho);
-    EXPECT_EQ(echo.text, "\"🌱;()\r\nnext\"");
+    EXPECT_EQ(std::get<std::string>(echo.response), "\"🌱;()\r\nnext\"");
     EXPECT_EQ(echo.header.where, (SourceSpan{27, {0, 1, 1}, {22, 2, 7}}));
     RequireNext(session, CommandKind::kSetLogic);
     RequireNext(session, CommandKind::kDeclareConst);
@@ -187,12 +191,12 @@ TEST(FrontendSyntax, QuotedDataKeepsUtf8AndLineBreaksAtEverySplit) {
     ASSERT_EQ(checked->GetAssertions().size(), 1);
     // The source spelling retains delimiters. The declaration hint is the
     // canonical dequoted name.
-    EXPECT_EQ(checked->GetFunctions()[0].source_name, "|🌱;()\nnext|");
-    EXPECT_EQ(checked->GetFunctions()[0].decl.Borrow().GetNameHint(),
-              "🌱;()\nnext");
-    EXPECT_EQ(Applied(checked->GetAssertions()[0].term.Borrow()),
-              checked->GetFunctions()[0].decl.Borrow());
-    EXPECT_FALSE(Require(session.NextSyntax()));
+    EXPECT_EQ(session.GetSourceRecords()->functions[0].source_name,
+              "|🌱;()\nnext|");
+    EXPECT_EQ(checked->GetFunctions()[0].Borrow().GetNameHint(), "🌱;()\nnext");
+    EXPECT_EQ(Applied(checked->GetAssertions()[0].Borrow()),
+              checked->GetFunctions()[0].Borrow());
+    EXPECT_FALSE(Require(session.ReadCommand()));
   }
 }
 
@@ -221,7 +225,7 @@ TEST(FrontendSyntax, ThrowingReaderTerminatesAtIncompleteCommandBoundary) {
     RequireNext(session, CommandKind::kSetLogic);
     RequireNext(session, CommandKind::kAssert);
     EXPECT_EQ(reads, 1);
-    const auto next = session.NextSyntax();
+    const auto next = session.ReadCommand();
     ASSERT_FALSE(next);
     EXPECT_EQ(next.error().code, end == End::kEof ? DiagnosticCode::kSyntax
                                                   : DiagnosticCode::kInputIo);
@@ -235,15 +239,11 @@ TEST(FrontendSyntax, ThrowingReaderTerminatesAtIncompleteCommandBoundary) {
     EXPECT_EQ(session.GetPhase(), SessionPhase::kTerminated);
     EXPECT_EQ(session.GetPrefix().GetLogic(), "QF_SAT");
     ASSERT_EQ(session.GetPrefix().GetAssertions().size(), 1);
-    EXPECT_EQ(session.GetPrefix()
-                  .GetAssertions()[0]
-                  .term.Borrow()
-                  .GetValue()
-                  ->GetBool(),
-              false);
-    ExpectError(session.Apply(), DiagnosticCode::kInvalidState);
+    EXPECT_EQ(
+        session.GetPrefix().GetAssertions()[0].Borrow().GetValue()->GetBool(),
+        false);
     EXPECT_EQ(reads, 2);
-    EXPECT_FALSE(Require(session.NextSyntax()));
+    EXPECT_FALSE(Require(session.ReadCommand()));
     EXPECT_EQ(reads, 2);
   }
 }
@@ -282,7 +282,7 @@ TEST(FrontendSyntax, AllReaderExceptionsUseTheCurrentReadBoundary) {
         kSource));
     RequireNext(session, CommandKind::kSetLogic);
     EXPECT_EQ(reads, 1);
-    const auto next = session.NextSyntax();
+    const auto next = session.ReadCommand();
     ASSERT_FALSE(next);
     EXPECT_EQ(next.error().code, DiagnosticCode::kInputIo);
     EXPECT_EQ(next.error().where, (SourceSpan{kSource, kBoundary, kBoundary}));
@@ -290,8 +290,7 @@ TEST(FrontendSyntax, AllReaderExceptionsUseTheCurrentReadBoundary) {
     EXPECT_EQ(session.GetPhase(), SessionPhase::kTerminated);
     EXPECT_EQ(session.GetPrefix().GetLogic(), "QF_SAT");
     EXPECT_TRUE(session.GetPrefix().GetAssertions().empty());
-    ExpectError(session.Apply(), DiagnosticCode::kInvalidState);
-    EXPECT_FALSE(Require(session.NextSyntax()));
+    EXPECT_FALSE(Require(session.ReadCommand()));
     EXPECT_EQ(reads, 2);
   }
 }
@@ -299,8 +298,8 @@ TEST(FrontendSyntax, AllReaderExceptionsUseTheCurrentReadBoundary) {
 TEST(FrontendSyntax, MissingReaderAndOversizedReadCountReportInputIo) {
   const auto check = [](Reader reader) {
     auto session = Session::FromReader(std::move(reader), 45);
-    const auto result = session ? session->NextSyntax()
-                                : Outcome<std::optional<CommandHeader>>(
+    const auto result = session ? session->ReadCommand()
+                                : Outcome<std::optional<TypedCommand>>(
                                       std::unexpected(session.error()));
     ASSERT_FALSE(result);
     EXPECT_EQ(result.error().code, DiagnosticCode::kInputIo);
@@ -330,7 +329,7 @@ TEST(FrontendSyntax, StopsOnExitWithUnreadOrAlreadyBufferedSuffix) {
       }));
   RequireNext(session, CommandKind::kExit);
   EXPECT_EQ(session.GetPhase(), SessionPhase::kTerminated);
-  EXPECT_FALSE(Require(session.NextSyntax()));
+  EXPECT_FALSE(Require(session.ReadCommand()));
   EXPECT_EQ(reads, 1);
 
   const auto unread = std::string_view(input).substr(6);
@@ -344,7 +343,7 @@ TEST(FrontendSyntax, StopsOnExitWithUnreadOrAlreadyBufferedSuffix) {
       }));
   RequireNext(split, CommandKind::kExit);
   EXPECT_EQ(split.GetPhase(), SessionPhase::kTerminated);
-  EXPECT_FALSE(Require(split.NextSyntax()));
+  EXPECT_FALSE(Require(split.ReadCommand()));
   EXPECT_EQ(reads, 1);
 }
 
@@ -356,22 +355,24 @@ TEST(FrontendSyntax, DeepOpaqueAttributesAndLongUtf8Symbol) {
                      ")(set-logic QF_UF)(declare-const |" + name +
                      "λ| Bool)(assert |" + name + "λ|)(check-sat)";
   std::size_t offset = 0;
-  auto session =
-      Require(Session::FromReader([&](std::span<char> chunk) -> ReadResult {
+  auto session = Require(Session::FromReader(
+      [&](std::span<char> chunk) -> ReadResult {
         const auto count = std::min(chunk.size(), input.size() - offset);
         std::copy_n(input.data() + offset, count, chunk.data());
         offset += count;
         return count;
-      }));
+      },
+      ParseOptions{.capture_source_records = true}));
   RequireNext(session, CommandKind::kSetInfo);
-  ASSERT_EQ(session.GetMetadata().size(), 1);
-  EXPECT_EQ(session.GetMetadata()[0].value->size(), 2 * kDepth + 4);
+  ASSERT_EQ(session.GetSourceRecords()->metadata.size(), 1);
+  EXPECT_EQ(session.GetSourceRecords()->metadata[0].value->size(),
+            2 * kDepth + 4);
   RequireNext(session, CommandKind::kSetLogic);
   RequireNext(session, CommandKind::kDeclareConst);
   RequireNext(session, CommandKind::kAssert);
   const auto query = RequireCheck(session);
   ASSERT_EQ(query->GetFunctions().size(), 1);
-  EXPECT_EQ(query->GetFunctions()[0].decl.Borrow().GetNameHint(), name + "λ");
+  EXPECT_EQ(query->GetFunctions()[0].Borrow().GetNameHint(), name + "λ");
 }
 
 }  // namespace

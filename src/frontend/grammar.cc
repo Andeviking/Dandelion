@@ -51,6 +51,16 @@ constexpr auto kReserved = std::to_array<std::string_view>(
      "exists", "forall", "lambda", "let", "match", "par"});
 static_assert(std::ranges::is_sorted(kReserved));
 
+constexpr std::array kReservedIds{
+    SpellingId::kAnnotation,    SpellingId::kOtherReserved,
+    SpellingId::kOtherReserved, SpellingId::kOtherReserved,
+    SpellingId::kOtherReserved, SpellingId::kOtherReserved,
+    SpellingId::kUnderscore,    SpellingId::kAs,
+    SpellingId::kExists,        SpellingId::kForall,
+    SpellingId::kLambda,        SpellingId::kLet,
+    SpellingId::kMatch,         SpellingId::kPar};
+static_assert(kReservedIds.size() == kReserved.size());
+
 constexpr auto kReservedSpellings = [] {
   std::array<std::string_view, kCommands.size() + kReserved.size()> result{};
   for (std::size_t i = 0; i < kCommands.size(); ++i)
@@ -63,431 +73,391 @@ constexpr auto kSpelling = [](std::string_view name) { return name; };
 constexpr auto kReservedBuckets =
     SpellingBuckets(kReservedSpellings, kSpelling);
 const CommandSpec* GetCommand(SpellingId id) noexcept {
-  return id && id <= kCommands.size() ? &kCommands[id - 1] : nullptr;
+  const auto index = static_cast<std::size_t>(std::to_underlying(id)) -
+                     std::to_underlying(SpellingId::kCommandBase);
+  return index < kCommands.size() ? &kCommands[index] : nullptr;
 }
 
 constexpr auto kOptions = std::to_array<Option>({
-    {":print-success", OptionId::kPrintSuccess, OptionKind::kBoolean, "false"},
+    {":print-success", OptionId::kPrintSuccess, OptionKind::kBoolean,
+     CommandResponse::kFalse},
     {":produce-models", OptionId::kProduceModels, OptionKind::kBoolean,
-     "false"},
+     CommandResponse::kFalse},
     {":global-declarations", OptionId::kGlobalDeclarations,
-     OptionKind::kBoolean, "false"},
-    {":interactive-mode", OptionId::kFixedFalse, OptionKind::kBoolean, "false"},
+     OptionKind::kBoolean, CommandResponse::kFalse},
+    {":interactive-mode", OptionId::kFixedFalse, OptionKind::kBoolean,
+     CommandResponse::kFalse},
     {":produce-assertions", OptionId::kFixedFalse, OptionKind::kBoolean,
-     "false"},
+     CommandResponse::kFalse},
     {":produce-assignments", OptionId::kFixedFalse, OptionKind::kBoolean,
-     "false"},
-    {":produce-proofs", OptionId::kFixedFalse, OptionKind::kBoolean, "false"},
+     CommandResponse::kFalse},
+    {":produce-proofs", OptionId::kFixedFalse, OptionKind::kBoolean,
+     CommandResponse::kFalse},
     {":produce-unsat-assumptions", OptionId::kFixedFalse, OptionKind::kBoolean,
-     "false"},
+     CommandResponse::kFalse},
     {":produce-unsat-cores", OptionId::kFixedFalse, OptionKind::kBoolean,
-     "false"},
-    {":random-seed", OptionId::kUnsupported, OptionKind::kNumeral, "0"},
+     CommandResponse::kFalse},
+    {":random-seed", OptionId::kUnsupported, OptionKind::kNumeral,
+     CommandResponse::kZero},
     {":reproducible-resource-limit", OptionId::kUnsupported,
-     OptionKind::kNumeral, "0"},
+     OptionKind::kNumeral, CommandResponse::kZero},
     {":regular-output-channel", OptionId::kUnsupported, OptionKind::kString,
-     "\"stdout\""},
+     CommandResponse::kStdout},
     {":diagnostic-output-channel", OptionId::kUnsupported, OptionKind::kString,
-     "\"stderr\""},
-    {":verbosity", OptionId::kUnsupported, OptionKind::kNumeral, "0"},
+     CommandResponse::kStderr},
+    {":verbosity", OptionId::kUnsupported, OptionKind::kNumeral,
+     CommandResponse::kZero},
 });
 
-enum class Role { kTerm, kSort };
-enum class Projection { kDirect, kSecond, kDatatype, kConstructor, kRecursive };
-struct Cursor {
-  // NOLINTBEGIN(readability-identifier-naming): Struct fields, snake_case.
-  ExprId single;
-  Role role;
-  ChildRange entries;
-  std::size_t next = 0;
-  Projection projection = Projection::kDirect;
-  // NOLINTEND(readability-identifier-naming)
-};
-constexpr auto kAny = std::numeric_limits<std::size_t>::max();
+using enum GrammarRole;
 
-class Grammar {
- public:
-  explicit Grammar(Syntax& syntax) : syntax_(syntax) {}
-  void Check();
+GrammarRole Slot(std::size_t index, std::initializer_list<GrammarRole> slots) {
+  return index < slots.size() ? slots.begin()[index] : kInvalid;
+}
 
- private:
-  void Need(bool condition, ExprId id, std::string_view message) const;
-  void Type(ExprId id, TokenKind kind) const;
-  void Symbol(ExprId id) const;
-  ChildRange List(ExprId id, std::size_t min, std::size_t max = kAny) const;
-  bool AttributeValue(ExprId id) const noexcept;
-  void Attributes(ChildRange entries) const;
-  void Identifier(ExprId id, bool qualified);
-  void Queue(ExprId id, Role role) { pending_.push_back({id, role, {}}); }
-  void QueueRange(ChildRange entries, Role role,
-                  Projection projection = Projection::kDirect);
-  void CheckNext();
-  void Bindings(ExprId id, Role role, std::size_t min);
-  void Term(ExprId id);
-  void Sort(ExprId id);
-  void Pattern(ExprId id) const;
-  ChildRange Constructors(ExprId id) const;
-  void CheckDatatype(ExprId id) const;
-  void Excluded(ChildRange args, std::string_view head);
-  void OptionSetting(ChildRange args);
-  void Command(CommandKind kind, ChildRange args);
-
-  Syntax& syntax_;
-  std::vector<Cursor> pending_;
-};
-
-void Grammar::Need(bool condition, ExprId id, std::string_view message) const {
-  if (!condition) Fail(DiagnosticCode::kSyntax, syntax_.Span(id), message);
-}
-void Grammar::Type(ExprId id, TokenKind kind) const {
-  Need(syntax_.Type(id) == kind, id, "Unexpected token in this position");
-}
-void Grammar::Symbol(ExprId id) const {
-  Need(syntax_.IsSymbol(id), id, "Expected a symbol");
-}
-ChildRange Grammar::List(ExprId id, std::size_t min, std::size_t max) const {
-  Need(syntax_.List(id), id, "Expected a list");
-  const auto children = syntax_.Children(id);
-  Need(children.size() >= min && children.size() <= max, id,
-       "Wrong number of elements");
-  return children;
-}
-bool Grammar::AttributeValue(ExprId id) const noexcept {
-  return syntax_.Type(id) != TokenKind::kKeyword &&
-         syntax_.Type(id) != TokenKind::kReserved;
-}
-void Grammar::Attributes(ChildRange entries) const {
-  for (std::size_t i = 0; i < entries.size(); ++i) {
-    Type(entries[i], TokenKind::kKeyword);
-    if (i + 1 < entries.size() && AttributeValue(entries[i + 1])) ++i;
-  }
-}
-void Grammar::Identifier(ExprId id, bool qualified) {
-  if (syntax_.IsSymbol(id)) return;
-  auto children = List(id, 1);
-  if (qualified && syntax_.Is(children.front(), "as")) {
-    Need(children.size() == 3, id, "Expected an identifier and sort after as");
-    Queue(children[2], Role::kSort);
-    id = children[1];
-    if (syntax_.IsSymbol(id)) return;
-    children = List(id, 1);
-  }
-  Need(children.size() >= 3 && syntax_.Is(children.front(), "_"), id,
-       "Expected an indexed identifier");
-  Symbol(children[1]);
-  for (const auto index : children.subspan(2)) {
-    Need(syntax_.Type(index) == TokenKind::kNumeral || syntax_.IsSymbol(index),
-         index, "Expected a numeral or symbolic index");
-  }
-}
-void Grammar::QueueRange(ChildRange entries, Role role, Projection projection) {
-  if (!entries.empty())
-    pending_.push_back({kNoExpr, role, entries, 0, projection});
-}
-void Grammar::CheckNext() {
-  auto& cursor = pending_.back();
-  const auto role = cursor.role;
-  const auto projection = cursor.projection;
-  auto id = cursor.single;
-  if (id == kNoExpr) {
-    id = cursor.entries[cursor.next++];
-    if (cursor.next == cursor.entries.size()) pending_.pop_back();
-  } else {
-    pending_.pop_back();
-  }
-  switch (projection) {
-    case Projection::kDirect:
-      break;
-    case Projection::kSecond:
-      id = syntax_.Children(id)[1];
-      break;
-    case Projection::kDatatype:
-      QueueRange(Constructors(id), role, Projection::kConstructor);
-      return;
-    case Projection::kConstructor:
-      QueueRange(syntax_.Children(id).subspan(1), role, Projection::kSecond);
-      return;
-    case Projection::kRecursive: {
-      const auto parts = syntax_.Children(id);
-      Queue(parts[2], role);
-      QueueRange(syntax_.Children(parts[1]), role, Projection::kSecond);
-      return;
-    }
-  }
-  if (role == Role::kSort)
-    Sort(id);
-  else
-    Term(id);
-}
-void Grammar::Bindings(ExprId id, Role role, std::size_t min) {
-  const auto bindings = List(id, min);
-  for (auto entry : bindings | std::views::reverse) {
-    const auto fields = List(entry, 2, 2);
-    Symbol(fields[0]);
-  }
-  QueueRange(bindings, role, Projection::kSecond);
-}
-void Grammar::Sort(ExprId id) {
-  if (!syntax_.List(id)) {
-    Identifier(id, false);
-    return;
-  }
-  const auto children = List(id, 1);
-  if (syntax_.Is(children.front(), "_")) {
-    Identifier(id, false);
-  } else {
-    Need(children.size() >= 2, id, "A sort application needs an argument");
-    QueueRange(children.subspan(1), Role::kSort);
-    Identifier(children.front(), false);
-  }
-}
-void Grammar::Pattern(ExprId id) const {
-  if (syntax_.Is(id, "_") || syntax_.IsSymbol(id)) return;
-  const auto fields = List(id, 2);
-  Symbol(fields.front());
-  for (auto field : fields.subspan(1))
-    if (!syntax_.Is(field, "_")) Symbol(field);
-}
-void Grammar::Term(ExprId id) {
-  if (!syntax_.List(id)) {
-    const auto token = syntax_.Type(id);
-    if (token < TokenKind::kNumeral) Symbol(id);
-    return;
-  }
-  const auto children = List(id, 1);
-  const auto head = children.front();
-  const auto reserved = [&](std::string_view name) {
-    return syntax_.Is(head, name);
-  };
-  if (reserved("_") || reserved("as")) {
-    Identifier(id, true);
-  } else if (reserved("let")) {
-    Need(children.size() == 3, id, "Expected bindings and a body after let");
-    Queue(children[2], Role::kTerm);
-    Bindings(children[1], Role::kTerm, 1);
-  } else if (reserved("match")) {
-    Need(children.size() == 3, id,
-         "Expected a scrutinee and cases after match");
-    const auto cases = List(children[2], 1);
-    for (auto entry : cases | std::views::reverse) {
-      const auto fields = List(entry, 2, 2);
-      Pattern(fields[0]);
-    }
-    QueueRange(cases, Role::kTerm, Projection::kSecond);
-    Queue(children[1], Role::kTerm);
-  } else if (reserved("!")) {
-    Need(children.size() >= 3, id, "Expected a term and attributes after !");
-    Attributes(children.subspan(2));
-    Queue(children[1], Role::kTerm);
-  } else if (reserved("forall") || reserved("exists") || reserved("lambda")) {
-    Need(children.size() == 3, id, "Expected typed bindings and a body");
-    Queue(children[2], Role::kTerm);
-    Bindings(children[1], Role::kSort, 1);
-  } else {
-    // Zero-argument application admission depends on the resolved head.
-    QueueRange(children.subspan(1), Role::kTerm);
-    Identifier(head, true);
-  }
-}
-ChildRange Grammar::Constructors(ExprId id) const {
-  const auto body = syntax_.Children(id);
-  return !body.empty() && syntax_.Is(body.front(), "par")
-             ? syntax_.Children(body[2])
-             : body;
-}
-void Grammar::CheckDatatype(ExprId id) const {
-  auto ctors = List(id, 0);
-  if (!ctors.empty() && syntax_.Is(ctors.front(), "par")) {
-    Need(ctors.size() == 3, id,
-         "Expected sort parameters and constructors after par");
-    for (auto name : List(ctors[1], 1)) Symbol(name);
-    ctors = List(ctors[2], 0);
-  }
-  for (auto ctor : ctors | std::views::reverse) {
-    const auto fields = List(ctor, 1);
-    Symbol(fields.front());
-    for (auto field : fields.subspan(1) | std::views::reverse) {
-      const auto pair = List(field, 2, 2);
-      Symbol(pair[0]);
-    }
-  }
-}
-void Grammar::OptionSetting(ChildRange args) {
-  Need(!args.empty() && args.size() <= 2, 0,
-       "Expected an option and its setting");
-  Type(args[0], TokenKind::kKeyword);
-  const auto* option = FindOption(syntax_.Raw(args[0]));
-  if (!option) {
-    Attributes(args);
-    return;
-  }
-  Need(args.size() == 2, 0, "Missing option setting");
-  switch (option->kind) {
-    case OptionKind::kBoolean:
-      Need(syntax_.Is(args[1], "true") || syntax_.Is(args[1], "false"), args[1],
-           "Expected true or false");
-      break;
-    case OptionKind::kNumeral:
-      Type(args[1], TokenKind::kNumeral);
-      break;
-    case OptionKind::kString:
-      Type(args[1], TokenKind::kString);
-      break;
-  }
-}
-void Grammar::Excluded(ChildRange args, std::string_view head) {
-  if (syntax_.Type(syntax_.Children(0).front()) != TokenKind::kReserved) return;
-  if (head == "define-fun-rec") {
-    Command(CommandKind::kDefineFun, args);
-    return;
-  }
-  if (head == "define-funs-rec") {
-    Need(args.size() == 2, 0,
-         "Expected recursive declarations and their bodies");
-    const auto declarations = List(args[0], 1);
-    const auto bodies = List(args[1], declarations.size(), declarations.size());
-    QueueRange(bodies, Role::kTerm);
-    for (auto declaration : declarations | std::views::reverse) {
-      const auto parts = List(declaration, 3, 3);
-      Symbol(parts[0]);
-      for (auto entry : List(parts[1], 0) | std::views::reverse)
-        Symbol(List(entry, 2, 2)[0]);
-    }
-    QueueRange(declarations, Role::kSort, Projection::kRecursive);
-    return;
-  }
-  if (head == "push" || head == "pop" || head == "declare-sort-parameter" ||
-      head == "check-sat-assuming") {
-    Need(args.size() == 1, 0, "Expected one command argument");
-    if (head == "declare-sort-parameter")
-      Symbol(args[0]);
-    else if (head == "check-sat-assuming")
-      QueueRange(List(args[0], 0), Role::kTerm);
-    else
-      Type(args[0], TokenKind::kNumeral);
-    return;
-  }
-  Need(args.empty(), 0, "This command takes no arguments");
-}
-void Grammar::Command(CommandKind kind, ChildRange args) {
-  const auto arity = [&](std::size_t count) {
-    Need(args.size() == count, 0, "Wrong number of command arguments");
-  };
-  switch (kind) {
+GrammarRole CommandSlot(const GrammarCommand& command, std::size_t index) {
+  if (index == 0) return kCommandName;
+  --index;
+  switch (command.shape) {
     case CommandKind::kSetLogic:
-      arity(1);
-      Symbol(args[0]);
-      break;
+      return Slot(index, {kSymbol});
     case CommandKind::kSetInfo:
-      Need(!args.empty() && args.size() <= 2, 0, "Expected one attribute");
-      Type(args[0], TokenKind::kKeyword);
-      if (args.size() == 2)
-        Need(AttributeValue(args[1]), args[1], "Expected an attribute value");
-      break;
-    case CommandKind::kSetOption:
-      OptionSetting(args);
-      break;
-    case CommandKind::kGetInfo:
-    case CommandKind::kGetOption:
-      arity(1);
-      Type(args[0], TokenKind::kKeyword);
-      break;
-    case CommandKind::kEcho:
-      arity(1);
-      Type(args[0], TokenKind::kString);
-      break;
-    case CommandKind::kDeclareSort:
-      arity(2);
-      Symbol(args[0]);
-      Type(args[1], TokenKind::kNumeral);
-      break;
-    case CommandKind::kDeclareFun:
-      arity(3);
-      Symbol(args[0]);
-      Queue(args[2], Role::kSort);
-      QueueRange(List(args[1], 0), Role::kSort);
-      break;
-    case CommandKind::kDeclareConst:
-      arity(2);
-      Symbol(args[0]);
-      Queue(args[1], Role::kSort);
-      break;
-    case CommandKind::kDefineSort:
-      arity(3);
-      Symbol(args[0]);
-      for (auto param : List(args[1], 0)) Symbol(param);
-      Queue(args[2], Role::kSort);
-      break;
-    case CommandKind::kDefineFun:
-      arity(4);
-      Symbol(args[0]);
-      Queue(args[3], Role::kTerm);
-      Queue(args[2], Role::kSort);
-      Bindings(args[1], Role::kSort, 0);
-      break;
-    case CommandKind::kDefineConst:
-      arity(3);
-      Symbol(args[0]);
-      Queue(args[2], Role::kTerm);
-      Queue(args[1], Role::kSort);
-      break;
-    case CommandKind::kDeclareDatatype:
-      arity(2);
-      Symbol(args[0]);
-      CheckDatatype(args[1]);
-      QueueRange(Constructors(args[1]), Role::kSort, Projection::kConstructor);
-      break;
-    case CommandKind::kDeclareDatatypes: {
-      arity(2);
-      for (auto header : List(args[0], 0)) {
-        const auto parts = List(header, 2, 2);
-        Symbol(parts[0]);
-        Type(parts[1], TokenKind::kNumeral);
+      return Slot(index, {kKeyword, kAttributeValue});
+    case CommandKind::kSetOption: {
+      if (index == 0) return kKeyword;
+      if (index != 1) return kInvalid;
+      if (!command.option) return kAttributeValue;
+      switch (command.option->kind) {
+        case OptionKind::kBoolean:
+          return kBoolean;
+        case OptionKind::kNumeral:
+          return kNumeral;
+        case OptionKind::kString:
+          return kString;
       }
-      const auto bodies = List(args[1], 0);
-      for (auto datatype : bodies | std::views::reverse)
-        CheckDatatype(datatype);
-      QueueRange(bodies, Role::kSort, Projection::kDatatype);
-      break;
+      std::unreachable();
     }
+    case CommandKind::kGetOption:
+    case CommandKind::kGetInfo:
+      return Slot(index, {kKeyword});
+    case CommandKind::kEcho:
+      return Slot(index, {kString});
+    case CommandKind::kDeclareSort:
+      return Slot(index, {kSymbol, kNumeral});
+    case CommandKind::kDeclareFun:
+      return Slot(index, {kSymbol, kSorts, kSort});
+    case CommandKind::kDeclareConst:
+      return Slot(index, {kSymbol, kSort});
+    case CommandKind::kDefineSort:
+      return Slot(index, {kSymbol, kSymbols, kSort});
+    case CommandKind::kDefineFun:
+      return Slot(index, {kSymbol, kFormals, kSort, kTerm});
+    case CommandKind::kDefineConst:
+      return Slot(index, {kSymbol, kSort, kTerm});
+    case CommandKind::kDeclareDatatype:
+      return Slot(index, {kSymbol, kDatatype});
+    case CommandKind::kDeclareDatatypes:
+      return Slot(index, {kDatatypeHeaders, kDatatypes});
     case CommandKind::kAssert:
-      arity(1);
-      Queue(args[0], Role::kTerm);
-      break;
+      return Slot(index, {kTerm});
     case CommandKind::kGetValue:
-      arity(1);
-      QueueRange(List(args[0], 1), Role::kTerm);
-      break;
+      return Slot(index, {kValues});
     case CommandKind::kCheckSat:
     case CommandKind::kGetModel:
     case CommandKind::kExit:
-      arity(0);
-      break;
+      return kInvalid;
     case CommandKind::kUnsupported:
-      Excluded(args, syntax_.Raw(syntax_.Children(0).front()));
-      break;
+      if (command.excluded.empty()) return kOpaque;
+      if (command.excluded == "define-funs-rec")
+        return Slot(index, {kRecDeclarations, kRecBodies});
+      if (command.excluded == "declare-sort-parameter")
+        return Slot(index, {kSymbol});
+      if (command.excluded == "check-sat-assuming")
+        return Slot(index, {kTerms});
+      if (command.excluded == "push" || command.excluded == "pop")
+        return Slot(index, {kNumeral});
+      return kInvalid;
   }
+  std::unreachable();
 }
-void Grammar::Check() {
-  const auto children = List(0, 1);
-  const auto head = children.front();
-  Need(syntax_.Type(head) == TokenKind::kSymbol ||
-           syntax_.Type(head) == TokenKind::kReserved,
-       head, "Expected a command name");
-  const auto* spec = syntax_.Type(head) == TokenKind::kReserved
-                         ? GetCommand(syntax_.Spelling(head))
-                         : nullptr;
-  Need(spec || syntax_.Type(head) == TokenKind::kSymbol, head,
-       "Expected a command name");
-  const auto kind = spec ? spec->kind : CommandKind::kUnsupported;
-  syntax_.header = {kind, syntax_.Span(0)};
-  Command(kind, children.subspan(1));
-  while (!pending_.empty()) CheckNext();
-}
+
 }  // namespace
 
+GrammarRole SpecialChildRole(GrammarFrame& parent, const Token& token,
+                             const GrammarCommand& command) {
+  const auto index = parent.count++;
+  const auto spelling =
+      token.kind == TokenKind::kReserved ? token.spelling_id : kUnknownSpelling;
+  if (index == 0) parent.head = spelling;
+  switch (parent.role) {
+    case kCommand:
+      return CommandSlot(command, index);
+    case kTerm: {
+      switch (parent.head) {
+        case SpellingId::kLet:
+          return Slot(index, {kOpaque, kLetBindings, kTerm});
+        case SpellingId::kMatch:
+          return Slot(index, {kOpaque, kTerm, kCases});
+        case SpellingId::kForall:
+        case SpellingId::kExists:
+        case SpellingId::kLambda:
+          return Slot(index, {kOpaque, kNonemptyFormals, kTerm});
+        case SpellingId::kAnnotation:
+          if (index < 2) return Slot(index, {kOpaque, kTerm});
+          if (parent.expect_attribute || token.kind == TokenKind::kKeyword ||
+              token.kind == TokenKind::kReserved) {
+            parent.expect_attribute = false;
+            return kKeyword;
+          }
+          parent.expect_attribute = true;
+          return kAttributeValue;
+        case SpellingId::kUnderscore:
+          return index == 0 ? kOpaque : index == 1 ? kSymbol : kIndex;
+        case SpellingId::kAs:
+          return Slot(index, {kOpaque, kPlainIdentifier, kSort});
+        default:
+          return index == 0 ? kHead : kTerm;
+      }
+    }
+    case kSort:
+      if (parent.head != SpellingId::kUnderscore)
+        return index == 0 ? kPlainIdentifier : kSort;
+      return index == 0 ? kOpaque : index == 1 ? kSymbol : kIndex;
+    case kHead:
+    case kIdentifier:
+    case kPlainIdentifier:
+      if (parent.head == SpellingId::kAs && parent.role != kPlainIdentifier)
+        return Slot(index, {kOpaque, kPlainIdentifier, kSort});
+      if (parent.head != SpellingId::kUnderscore) return kInvalid;
+      return index == 0 ? kOpaque : index == 1 ? kSymbol : kIndex;
+    case kLetBindings:
+      return kLetBinding;
+    case kLetBinding:
+      return Slot(index, {kSymbol, kTerm});
+    case kNonemptyFormals:
+    case kFormals:
+      return kFormal;
+    case kFormal:
+      return Slot(index, {kSymbol, kSort});
+    case kCases:
+      return kBranch;
+    case kBranch:
+      return Slot(index, {kPattern, kTerm});
+    case kPattern:
+      return index == 0 ? kSymbol : kPatternSymbol;
+    case kSorts:
+      return kSort;
+    case kSymbols:
+    case kParameters:
+      return kSymbol;
+    case kValues:
+    case kTerms:
+      return kTerm;
+    case kDatatype:
+      if (parent.head == SpellingId::kPar)
+        return Slot(index, {kOpaque, kParameters, kConstructors});
+      return kConstructor;
+    case kConstructors:
+      return kConstructor;
+    case kConstructor:
+      return index == 0 ? kSymbol : kFormal;
+    case kDatatypeHeaders:
+      return kDatatypeHeader;
+    case kDatatypeHeader:
+      return Slot(index, {kSymbol, kNumeral});
+    case GrammarRole::kDatatypes:
+      return kDatatype;
+    case kRecDeclarations:
+      return kRecDeclaration;
+    case kRecDeclaration:
+      return Slot(index, {kSymbol, kFormals, kSort});
+    case kRecBodies:
+      return index < command.recursive_count ? kTerm : kInvalid;
+    case kAttributeValue:
+    case kOpaque:
+      return kOpaque;
+    default:
+      std::unreachable();
+  }
+}
+
+bool AcceptAtom(GrammarRole role, const Token& token) {
+  const auto kind = token.kind;
+  switch (role) {
+    case kTerm:
+      return Syntax::Symbol(kind) || kind >= TokenKind::kNumeral;
+    case kSort:
+    case kHead:
+    case kIdentifier:
+    case kPlainIdentifier:
+    case kSymbol:
+      return Syntax::Symbol(kind);
+    case kPattern:
+    case kPatternSymbol:
+      return Syntax::Symbol(kind) ||
+             (kind == TokenKind::kReserved &&
+              token.spelling_id == SpellingId::kUnderscore);
+    case kNumeral:
+      return kind == TokenKind::kNumeral;
+    case kIndex:
+      return kind == TokenKind::kNumeral || Syntax::Symbol(kind);
+    case kKeyword:
+      return kind == TokenKind::kKeyword;
+    case kString:
+      return kind == TokenKind::kString;
+    case kBoolean:
+      return kind == TokenKind::kSymbol &&
+             (token.raw == "true" || token.raw == "false");
+    case kCommandName:
+      return kind == TokenKind::kSymbol ||
+             (kind == TokenKind::kReserved && GetCommand(token.spelling_id));
+    case kAttributeValue:
+      return kind != TokenKind::kReserved && kind != TokenKind::kKeyword;
+    case kOpaque:
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool AcceptList(GrammarRole role) {
+  switch (role) {
+    case kSymbol:
+    case kPatternSymbol:
+    case kNumeral:
+    case kIndex:
+    case kKeyword:
+    case kString:
+    case kBoolean:
+    case kCommandName:
+    case kInvalid:
+      return false;
+    default:
+      return true;
+  }
+}
+
+std::size_t Minimum(const GrammarFrame& frame, const GrammarCommand& command) {
+  switch (frame.role) {
+    case kCommand: {
+      if (frame.count == 0) return 1;
+      if (command.shape == CommandKind::kSetInfo ||
+          (command.shape == CommandKind::kSetOption && !command.option))
+        return 2;
+      if (command.shape == CommandKind::kUnsupported &&
+          command.excluded.empty())
+        return 1;
+      std::size_t count = 1;
+      while (CommandSlot(command, count) != kInvalid) ++count;
+      return count;
+    }
+    case kTerm:
+      switch (frame.head) {
+        case SpellingId::kUnderscore:
+        case SpellingId::kAs:
+        case SpellingId::kLet:
+        case SpellingId::kMatch:
+        case SpellingId::kAnnotation:
+        case SpellingId::kForall:
+        case SpellingId::kExists:
+        case SpellingId::kLambda:
+          return 3;
+        default:
+          return 1;
+      }
+    case kSort:
+      return frame.head == SpellingId::kUnderscore ? 3 : 2;
+    case kHead:
+    case kIdentifier:
+    case kPlainIdentifier:
+    case kRecDeclaration:
+      return 3;
+    case kLetBinding:
+    case kFormal:
+    case kPattern:
+    case kBranch:
+    case kDatatypeHeader:
+      return 2;
+    case kDatatype:
+      return frame.head == SpellingId::kPar ? 3 : 0;
+    case kLetBindings:
+    case kNonemptyFormals:
+    case kCases:
+    case kValues:
+    case kParameters:
+    case kConstructor:
+    case kRecDeclarations:
+      return 1;
+    case kRecBodies:
+      return command.recursive_count;
+    default:
+      return 0;
+  }
+}
+
+void ReadCommandName(GrammarCommand& command, SpellingId spelling) {
+  if (const auto* spec = GetCommand(spelling)) {
+    command.kind = spec->kind;
+    command.shape = spec->kind;
+    if (spec->kind == CommandKind::kUnsupported) {
+      if (spec->spelling == "define-fun-rec")
+        command.shape = CommandKind::kDefineFun;
+      else
+        command.excluded = spec->spelling;
+    }
+  }
+}
+
+std::optional<CommandHeader> ReadGrammar(Scanner& scanner) {
+  Token first;
+  if (!BeginCommand(scanner, first)) return std::nullopt;
+  auto& frames = scanner.Frames();
+  struct ResetFrames {
+    // NOLINTNEXTLINE(readability-identifier-naming): Stack cleanup.
+    std::vector<GrammarFrame>& frames;
+    ~ResetFrames() { ClearScratch(frames); }
+  } reset{frames};
+  GrammarCommand command;
+  PushFrame(scanner, frames, kCommand, first);
+  for (;;) {
+    const auto token = ScanCommandToken(scanner);
+    auto& parent = frames.back();
+    if (token.kind == TokenKind::kRight) {
+      auto span = parent.where;
+      span.end = token.where.end;
+      if (!Complete(parent, command))
+        Fail(DiagnosticCode::kSyntax, span, "Wrong number of elements");
+      ClosedGrammarFrame(parent, command);
+      frames.pop_back();
+      if (frames.empty()) return CommandHeader{command.kind, span};
+      continue;
+    }
+    const auto role = NextRole(parent, token, command);
+    if (role == kInvalid && parent.role == kCommand)
+      Fail(DiagnosticCode::kSyntax, parent.where,
+           "Wrong number of command arguments");
+    if (token.kind == TokenKind::kLeft) {
+      if (!ListAllowed(role))
+        Fail(DiagnosticCode::kSyntax, token.where, "Unexpected list");
+      PushFrame(scanner, frames, role, token);
+    } else {
+      if (!AtomAllowed(role, token))
+        Fail(DiagnosticCode::kSyntax, token.where,
+             "Unexpected token in this position");
+      ReadGrammarAtom(parent, role, token, command);
+    }
+  }
+}
+
 SpellingId ClassifyReserved(std::string_view word) noexcept {
-  return LookupSpelling(kReservedSpellings, kSpelling, kReservedBuckets, word);
+  const auto ordinal =
+      LookupSpelling(kReservedSpellings, kSpelling, kReservedBuckets, word);
+  if (!ordinal) return kUnknownSpelling;
+  const auto index = static_cast<std::size_t>(ordinal - 1);
+  if (index < kCommands.size())
+    return static_cast<SpellingId>(
+        std::to_underlying(SpellingId::kCommandBase) + index);
+  return kReservedIds[index - kCommands.size()];
 }
 bool IsReservedWord(std::string_view word) noexcept {
   return ClassifyReserved(word) != kUnknownSpelling;
@@ -496,6 +466,5 @@ const Option* FindOption(std::string_view name) noexcept {
   const auto found = std::ranges::find(kOptions, name, &Option::name);
   return found == kOptions.end() ? nullptr : &*found;
 }
-void ValidateSyntax(Syntax& syntax) { Grammar(syntax).Check(); }
 
 }  // namespace dandelion::frontend::detail

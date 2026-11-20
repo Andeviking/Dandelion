@@ -1,7 +1,8 @@
 # Frontend Parser Benchmark Design
 
-**Status.** Proposed targets, workloads, and tooling. The suite measures how
-the implemented frontend turns SMT-LIB bytes into a typed query. It uses the
+**Status.** The frontend workload uses the Phase 2 fused measurement and
+inspection schema 2. The Phase 1 section records the previous adapter. The suite
+measures how the frontend turns SMT-LIB bytes into a typed query. It uses the
 single-query [frontend protocol](../frontend/semantic-interfaces.md) and its
 [logic profiles](../frontend/logic-profile.md). Implement against the
 [test-first design](../testing/benchmark.md#frontend-parser-benchmarks).
@@ -34,12 +35,12 @@ struct MemorySnapshot {
 struct ParseStats {
   std::uint64_t bytes = 0;
   std::uint64_t commands = 0;
+  std::uint64_t committed_end_offset = 0;
   std::uint64_t assertions = 0;
   std::uint64_t definitions = 0;
   std::uint64_t max_command_bytes = 0;
   std::uint64_t reader_calls = 0;
-  std::uint64_t next_syntax_ns = 0;
-  std::uint64_t apply_ns = 0;
+  std::uint64_t read_command_ns = 0;
   std::uint64_t teardown_ns = 0;
 };
 
@@ -49,8 +50,6 @@ struct ParsedQuery {
   std::optional<frontend::DiagnosticCode> diagnostic_code;
   std::optional<frontend::SourceSpan> diagnostic_span;
   ParseStats stats;
-  std::uint64_t applied_commands = 0;
-  std::uint64_t syntax_end_offset = 0;
   std::shared_ptr<const frontend::QueryContext> query;
   std::optional<frontend::Session> session;
 
@@ -64,7 +63,6 @@ struct InspectReport : ParseStats, MemorySnapshot {
   std::optional<frontend::SourceSpan> diagnostic_span;
   std::string logic;
   std::uint64_t tokens = 0;
-  std::uint64_t applied_commands = 0;
   std::uint64_t checks = 0;
   std::uint64_t user_sorts = 0;
   std::uint64_t user_functions = 0;
@@ -90,11 +88,16 @@ struct InspectReport : ParseStats, MemorySnapshot {
 
 std::expected<std::string, std::error_code> LoadFile(
     const std::filesystem::path& path);
-ParsedQuery ParseFromText(std::string_view input, bool measure_phases = false);
+ParsedQuery ParseFromText(std::string_view input, bool measure_phases = false,
+                          bool canonicalize_commutative = false,
+                          bool capture_source_records = false);
 ParsedQuery ParseFromReader(std::string_view input, ReaderMode mode,
-                           bool measure_phases = false);
+                            bool measure_phases = false,
+                            bool canonicalize_commutative = false,
+                            bool capture_source_records = false);
 InspectReport Inspect(std::string_view input,
-                      std::optional<ReaderMode> mode = std::nullopt);
+                      std::optional<ReaderMode> mode = std::nullopt,
+                      bool canonicalize_commutative = false);
 std::string InspectToJson(const InspectReport& report);
 MemorySnapshot ReadProcessMemory();
 ```
@@ -107,6 +110,12 @@ move-only and retains the session for inspection of either the sealed query or
 the committed prefix. Calls to `Teardown` release the session and the query
 owner. A second call leaves the observation from the first release intact.
 Any caller-held query copies must also be dropped for a teardown measurement.
+The optional canonicalization argument selects the frontend's commutative
+operand canonicalization for either adapter. It defaults to false. The capture
+option defaults to false and enables source records when requested. Timed
+parsers use default compatible metadata and leave source capture off.
+`Inspect` opts into source capture to report occurrence counts through
+the existing schema, independently of test-only frontend statistics.
 
 Reader scenarios copy from the same immutable byte buffer used by the text
 scenario. The fixed modes cap each copy at 65,536 and 4,096 bytes respectively.
@@ -115,7 +124,11 @@ at 1 in each session. Each copy is further capped by the destination size and
 remaining source bytes. A zero return marks EOF. Count all reader callbacks,
 including EOF when requested. Text has zero callbacks.
 
-### Parse and inspection boundaries
+### Phase 1 parse and inspection boundaries
+
+This section records the split reader and schema 1. The
+[Phase 2 measurement contract](#phase-2-fused-measurement) defines the
+current adapters and inspection report.
 
 1. Create a fresh `frontend::Session`. Alternate `NextSyntax` and `Apply`
    and keep the `QueryContext` returned by `check-sat`. Process through EOF
@@ -131,19 +144,25 @@ including EOF when requested. Text has zero callbacks.
    `max_command_bytes` is the largest half-open command span, including
    internal trivia and excluding leading and trailing trivia between commands.
    `syntax_end_offset` is the end of the last complete header.
-   `applied_commands` counts successful `Apply` returns. `assertions` and
-   `definitions` count committed assertion occurrences and retained term
-   definitions (`define-fun` and `define-const`). `define-sort` contributes
-   to the command counts. Copy the first diagnostic's code, message, and
+   `applied_commands` counts successful `Apply` returns. `assertions` is
+   the size of the committed `GetAssertions()` span. Preserve the
+   `definitions` manifest and report count by counting successful
+   `define-fun` and `define-const` applications of the command API,
+   including both nullary spellings. Semantic template enumeration uses
+   `GetDefinitionCount()` and `GetDefinition(ordinal)` and counts only
+   parameterized definitions. `define-sort` contributes to command counts. Copy the first diagnostic's code, message, and
    source span while its storage is valid. Stop on that failure and use
    `GetPrefix()` for the still-committed records. A missing check at normal
    termination is `invalid_input` with a benchmark diagnostic.
 3. `Inspect` uses the text adapter by default and enables phase timing. Sample
    the retained RSS and manager storage at the parse boundary, before copying
-   graph roots or allocating traversal state. For query counts, use the
-   corresponding `QueryContext` spans, with `checks` set to one when the
-   sealed query exists. Take `metadata` from the session so it includes all
-   committed `set-info` occurrences, including pre-check failure prefixes.
+   graph roots or allocating traversal state. Use the `GetUserSorts()`,
+   `GetFunctions()` and `GetDatatypeGroups()` spans for signature counts,
+   with `checks` set to one when the sealed query exists. Read
+   `named_terms`, `annotations` and `metadata` from
+   `Session::GetSourceRecords()` before mutation or teardown. This counts
+   all committed occurrences, including those in a pre-check failure prefix
+   or post-check metadata.
    Obtain storage via `NodeManager::Attach(query.GetManager())` or the same
    operation on the prefix, then `GetStorageStats()`.
 4. Count `tokens` in an untimed, constant-space pass over the bytes through
@@ -154,19 +173,24 @@ including EOF when requested. Text has zero callbacks.
    Count the offending command's tokens when syntax succeeded and `Apply`
    failed. The pass supplies a measurement denominator without a second
    semantic parse or timing instrumentation in the scanner.
-5. Use one iterative `DagWalker` over the concatenation of assertion terms,
-   definition bodies, named terms, and annotation occurrence terms, in their
-   respective recorded orders. `roots` counts occurrences, including repeated
+5. Use one iterative `DagWalker` over the assertion Node span, all
+   definition bodies in source definition order, then captured named terms
+   and annotation occurrence terms. For parameterized definitions take the
+   body from `GetDefinition(ordinal)` using the source definition record's
+   ordinal. For the two nullary forms take the direct body from the
+   captured definition record. `roots` counts occurrences, including repeated
    roots. Count one `kNodeEnter` per unique node and one `kEdgeEnter` per
    ordered child slot, including repeated edges to a shared child. Root
    events contribute no edges. Compute each node's longest path to a leaf
    on `kNodeExit` from already computed child depths. A leaf has depth one.
    Graph `depth` is the maximum root depth, and `max_fanout` is the maximum
    child-slot count. Both are zero for an empty graph. The walk takes work
-   proportional to reachable nodes, edges, and root occurrences. Definition
-   applications retain their declaration and actuals. Bodies enter the walk
-   as separate roots. Sorts and declaration metadata have their own manager
-   accounting. [DAG traversal](../node/implementation.md#7-dag-traversal-and-caches)
+   proportional to reachable nodes, edges, and root occurrences.
+   Parameterized calls retain their declaration and actuals. Nullary and
+   named alias uses contribute their body directly. Each definition body
+   also enters the inspection walk as an occurrence root. Sorts and
+   declaration metadata have their own manager accounting.
+   [DAG traversal](../node/implementation.md#7-dag-traversal-and-caches)
 6. Release walker, roots, and attached manager before teardown. Copy the
    report data before dropping the session and query. The caller owns the
    resident input buffer throughout `Inspect`.
@@ -215,26 +239,32 @@ that sample from throughput calculation.
 | `reader_64k` | Same lifecycle using `kMemory64K`. |
 | `reader_4k` | Same lifecycle using `kMemory4K`. |
 | `reader_irregular` | Same lifecycle using `kMemoryIrregular`. |
-| `phases` | Text lifecycle with separate accumulated wall nanoseconds for `NextSyntax`, `Apply`, and teardown. |
+| `phases` | Text lifecycle with accumulated wall nanoseconds for `ReadCommand` and teardown. |
 | `teardown` | Release retained text-parse state. Create and validate fresh state with Google Benchmark timing paused before each iteration. |
 
 Load input once per process outside the benchmark loop. Report Google
 Benchmark wall and CPU time per iteration. The end-to-end scope includes
 session creation and destruction from resident bytes. In `phases`, measure
-each call with a monotonic clock, including the terminal `NextSyntax` call,
-and report per-iteration means `next_syntax_ns`, `apply_ns`, and `teardown_ns`.
+each `ReadCommand` call with a monotonic clock, including boundary EOF
+when reached, and report per-iteration means `read_command_ns` and
+`teardown_ns`.
 Setup, loop overhead, and clock instrumentation leave a residual in the
 end-to-end time. Untimed phase fields in `ParseStats` remain zero. Use the
 unprofiled adapter scenarios for rate comparisons and the `phases` scenario
 for attribution. The runner joins successful inspection counts with wall
-seconds per iteration to compute input MiB/s, lexical tokens/s, and unique
-reachable nodes/s for the four adapters. A teardown-only run has no parsing
+seconds per iteration to compute input MiB/s, lexical tokens/s, and
+nodes reachable in the inspection run per second for the four adapters. The node denominator
+includes captured occurrence roots even when equivalent timed queries
+release alias-only roots at seal. A teardown-only run has no parsing
 rate. The runner also records whole-child elapsed and CPU times, whose scope
 includes load and process overhead. Use separate Release, tests-off,
 sanitizers-off builds for measurements and retain raw samples and settings.
 
 Run a fresh inspect child per input to observe the four RSS boundaries on
-Linux. `ReadProcessMemory` extracts `VmRSS` and `VmHWM` in KiB from
+Linux. Its phase times, graph and retained memory describe the capture-on
+inspection run. Use capture-off timed children for default-path timing and
+their separately recorded process peak for default-path RSS comparisons.
+`ReadProcessMemory` extracts `VmRSS` and `VmHWM` in KiB from
 `/proc/self/status`, populating `retained_rss_kib` and `peak_rss_kib` for that
 call. It leaves missing or malformed fields unavailable. `Inspect` uses
 those samples to assemble the lifecycle.
@@ -257,6 +287,64 @@ peak RSS with GNU `time` `%M` for each child and labels it separately. In
 inspection children that whole-process peak can include traversal scratch and
 serialization. For comparable parser peaks use the same scenario, lifetime,
 and execution mode across runs.
+
+## Phase 2 fused measurement
+
+The timed and inspection adapters drive
+`Session::ReadCommand` to EOF, `exit`, or the first diagnostic, keeping
+the sealed query and counting committed descriptors by kind. Keep
+capture off in timed runs and enable it for occurrence inspection.
+Classify a valid model- or result-dependent descriptor, or a
+`kModelDependent` diagnostic, as `model_dependent`. Preserve state and
+syntax diagnostics. The parser benchmark provides no engine or model.
+Measure the same resident text and Reader adapters and the same teardown
+boundary. The `phases` scenario reports aggregate `read_command_ns`
+including EOF reads when applicable, and `teardown_ns`. Timed scopes
+exclude the diagnostic copy and graph inspection and include the same
+setup and teardown obligations as the corresponding Phase 1 lifecycle.
+There are no separate syntax and application timers on the fused loop.
+
+Use inspection schema version 2. `commands` counts successful
+`ReadCommand` descriptors, including `exit`. This count replaces
+`applied_commands`. `committed_end_offset` is the end of the
+last committed descriptor, or zero when there is none. Count tokens in
+an untimed pass through that offset and derive `max_command_bytes`
+from committed descriptor spans. A well-shaped command that fails
+semantics contributes only its diagnostic, and inspection still sees
+the committed prefix. Keep `bytes` as the full supplied input size.
+Record both schema versions with their parser revision, and compare
+counts and rates on matching successful scopes. Keep the definition,
+assertion, graph, manager and occurrence oracles above.
+
+Use this comparison to isolate the design hypotheses.
+
+- Hold inputs, compiler/build flags, CPU placement, Reader chunking,
+  capture and canonicalization mode constant. Use separate process runs
+  for peak RSS and instrumented attribution. Report matched successes,
+  diagnostics and measurement failures with the denominators used.
+- Include declaration-heavy and alias-heavy inputs, deep unary
+  chains, wide applications and parallel lets, and trivia-heavy inputs
+  with one-byte and ordinary refill boundaries. Include mutual
+  datatypes and concrete FP rationals in generated coverage. Validate
+  ordered roots, signatures and model-dependent outcomes before
+  comparing rates.
+- In an instrumented build record peak grammar depth, live operand
+  slots, spelling scratch and retained source bytes. Measure staging
+  overlay creation and entries, candidate FP and datatype scratch,
+  and Node hits/misses, edge retains and ownership transfers. Include
+  a wide assertion with mostly hits and a wide assertion with mostly
+  misses. Evaluate the sparse overlay on plain commands and commands
+  using `:named` or datatype headers. Keep these observations distinct
+  from allocator charges and process RSS.
+- For selected matched inputs report lifecycle wall/CPU time and
+  peak/retained RSS alongside structural observations. Historical
+  split-reader data, including wide-command arena costs, continue to
+  describe their original builds.
+
+The fused path is expected to reduce whole-command scratch, retain
+traffic on misses and fixed-response text allocation. The
+[Phase 2 benchmark case](../testing/frontend.md#phase-2-test-design)
+checks report semantics. Performance claims require new measurements.
 
 ## Generated workloads
 
@@ -282,7 +370,7 @@ crossings where valid. [Frontend signatures and compatibility extensions](../fro
 | `skewed_vs_balanced` | Pair binary trees with the same ordered leaves and operation count. Compare a spine against balanced nesting. |
 | `wide_flat` | Use a single wide application with distinct children. Vary operand count independently of nesting depth. |
 | `diamond_dag` | At each level build two different parents of a shared child and combine them. Use `let` to encode sharing with linear written size. |
-| `sharing_mechanisms` | Compare repeated spelling, `let`, named aliases, and retained `define-fun` calls. Keep separately recorded input and typed graph sizes since definition calls and bodies add nodes. |
+| `sharing_mechanisms` | Compare repeated spelling, `let`, direct named and nullary aliases, and parameterized `define-fun` calls. Record input and typed graph sizes separately. |
 | `shadowing_symtab` | Vary declared symbol count and lexical shadow depth. Include parallel `let` RHS lookups and repeated references to outer bindings. |
 | `command_partition` | Compare one command containing many assertions' worth of terms with many short `assert` commands over the same ordered terms. Record the extra conjunction root and changed syntax span sizes. |
 | `payload_trivia_boundary` | Vary exact literal size, long quoted metadata, UTF-8, CRLF, and comments around 4 KiB and 64 KiB read boundaries. Include pairs padded with trivia to move a split while preserving the typed query. |
@@ -361,6 +449,15 @@ first child for that case. Use a fresh `--inspect` child once per case and
 fresh timed children per scenario and sample. Evaluate child status and both
 JSON schemas, including Google Benchmark error and skip fields. Keep an
 inspection failure and the associated unmeasured samples in the results.
+The optional `--canonicalize` flag enables commutative canonicalization for
+both the inspect and every timed child. It is off by default; when enabled,
+record it in settings and identify it in the report. The benchmark executable
+also accepts the flag directly, including with `--inspect` and reader scenarios.
+Schema 2 retains the unchanged schema 1 fields, including bytes, assertions,
+definitions, graph and occurrence counts, in both canonicalization modes.
+Its `commands` counts committed descriptors, replacing the schema 1 syntax
+count and `applied_commands`; `committed_end_offset` replaces
+`syntax_end_offset`. See the fused measurement contract above.
 
 - Intersect online logical CPUs with `os.sched_getaffinity(0)`. Read Linux
   topology and choose one eligible logical CPU per physical core using the

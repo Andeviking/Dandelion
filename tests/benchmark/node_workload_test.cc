@@ -3,6 +3,9 @@
 import std;
 import dandelion.node;
 import dandelion.node_workload;
+import dandelion.util.numeric;
+
+#include "../node/node_test_peer.h"
 
 namespace dandelion::node_bench {
 namespace {
@@ -35,7 +38,10 @@ end
   const auto a = roots[0].Borrow().GetChildren()[0];
   const auto b = roots[1].Borrow().GetChildren()[0];
   EXPECT_EQ(a, b);
-  EXPECT_EQ(a.GetValue()->GetInteger()->ToDecimal(), "165");
+  const auto bits = a.GetValue()->GetBitVector();
+  ASSERT_TRUE(bits);
+  EXPECT_EQ(bits->Width(), 8);
+  EXPECT_EQ(bits->TryUint64(), 165);
   EXPECT_EQ(roots[1].Borrow().GetIndices()[0].ToDecimal(), "7");
   EXPECT_EQ(roots[1].Borrow().GetIndices()[1].ToDecimal(), "4");
   const auto live = replay.GetManager().GetStorageStats().value();
@@ -265,10 +271,74 @@ end
   const auto constant_array = constructor.GetChildren()[0];
   EXPECT_EQ(constant_array,
             select.GetChildren()[0].GetChildren()[0].GetChildren()[0]);
-  EXPECT_EQ(constant_array.GetChildren()[0].GetValue()->GetFpCategory(),
-            FpCategory::kNegativeZero);
-  EXPECT_EQ(first_uf.GetChildren()[1].GetValue()->GetFpCategory(),
-            FpCategory::kNaN);
+  const auto zero = constant_array.GetChildren()[0];
+  const auto format = zero.GetSort().GetFpFormat();
+  ASSERT_TRUE(format);
+  EXPECT_EQ(format->ExponentWidth(), 8);
+  EXPECT_EQ(format->SignificandWidth(), 24);
+  const auto zero_value = zero.GetValue()->GetFloatingPoint();
+  ASSERT_TRUE(zero_value);
+  EXPECT_EQ(zero_value->Format(), *format);
+  EXPECT_EQ(zero_value->Category(), numeric::FpCategory::kNegativeZero);
+  const auto nan_value =
+      first_uf.GetChildren()[1].GetValue()->GetFloatingPoint();
+  ASSERT_TRUE(nan_value);
+  EXPECT_EQ(nan_value->Format(), *format);
+  EXPECT_EQ(nan_value->Category(), numeric::FpCategory::kNaN);
+}
+
+TEST(NodeWorkloadTest, ReplaysWideBitVectorsAndFiniteFloatingPointBits) {
+  const auto workload = Read(R"(dandelion-node 1 graph
+sort 1 bv 65
+sort 2 fp 15 113
+make 0 1 kBvValue 0 36893488147419103231
+make 1 2 kFpValue 0 18446744073709551617
+roots 0 1
+end
+)");
+  Replay replay(workload, true);
+  replay.Run();
+  const auto roots = replay.TakeRoots();
+  ASSERT_EQ(roots.size(), 2);
+  const auto bv = roots[0].Borrow().GetValue()->GetBitVector();
+  ASSERT_TRUE(bv);
+  EXPECT_EQ(bv->Width(), 65);
+  EXPECT_EQ(bv->Chunk(0), std::numeric_limits<std::uint64_t>::max());
+  EXPECT_EQ(bv->Chunk(1), 1);
+  const auto fp = roots[1].Borrow().GetValue()->GetFloatingPoint();
+  ASSERT_TRUE(fp);
+  EXPECT_EQ(fp->Format().ExponentWidth(), 15);
+  EXPECT_EQ(fp->Format().SignificandWidth(), 113);
+  EXPECT_EQ(fp->Category(), numeric::FpCategory::kFiniteBits);
+  const auto fp_bits = fp->FiniteBits();
+  ASSERT_TRUE(fp_bits);
+  EXPECT_EQ(fp_bits->Width(), 128);
+  EXPECT_EQ(fp_bits->Chunk(0), 1);
+  EXPECT_EQ(fp_bits->Chunk(1), 1);
+}
+
+TEST(NodeWorkloadTest, CanonicalizesNanEncodingsAndPreservesSignedZeros) {
+  const auto workload = Read(R"(dandelion-node 1 graph
+sort 1 fp 2 3
+make 0 1 kFpValue 0 nan
+make 1 1 kFpValue 0 13
+make 2 1 kFpValue 0 0
+make 3 1 kFpValue 0 16
+roots 0 1 2 3
+end
+)");
+  Replay replay(workload, true);
+  replay.Run();
+  const auto roots = replay.TakeRoots();
+  ASSERT_EQ(roots.size(), 4);
+  EXPECT_EQ(roots[0], roots[1]);
+  EXPECT_NE(roots[2], roots[3]);
+  EXPECT_EQ(roots[0].Borrow().GetValue()->GetFloatingPoint()->Category(),
+            numeric::FpCategory::kNaN);
+  EXPECT_EQ(roots[2].Borrow().GetValue()->GetFloatingPoint()->Category(),
+            numeric::FpCategory::kPositiveZero);
+  EXPECT_EQ(roots[3].Borrow().GetValue()->GetFloatingPoint()->Category(),
+            numeric::FpCategory::kNegativeZero);
 }
 
 TEST(NodeWorkloadTest, RejectsInvalidInputAndLiveTemporaries) {
@@ -385,7 +455,7 @@ end
   EXPECT_EQ(node.GetRationalParameter()->Denominator().ToDecimal(), "3");
   ASSERT_EQ(node.GetChildren().size(), 1);
   EXPECT_EQ(node.GetChildren()[0].GetValue()->GetRoundingMode(),
-            RoundingMode::kRne);
+            numeric::RoundingMode::kRne);
   ASSERT_EQ(node.GetIndices().size(), 2);
   EXPECT_EQ(node.GetIndices()[0].ToDecimal(), "8");
   EXPECT_EQ(node.GetIndices()[1].ToDecimal(), "24");
@@ -420,6 +490,148 @@ TEST(NodeWorkloadTest, ReportsDiagnosticCategoryAndPhysicalRecordLine) {
         "undefined declaration instance ID 9");
   check(header + "make 0 2 kBoolValue 0 1" + tail,
         "result sort differs from capture");
+}
+
+TEST(NodeWorkloadTest, RejectsOutOfRangeAndWrongSortPackedLiterals) {
+  const std::string header =
+      "dandelion-node 1 graph\nsort 1 bv 8\n"
+      "sort 2 fp 2 3\nsort 3 int\n";
+  for (const std::string_view record : {
+           "make 0 1 kBvValue 0 -1",
+           "make 0 1 kBvValue 0 256",
+           "make 0 2 kFpValue 0 -1",
+           "make 0 2 kFpValue 0 32",
+           "make 0 3 kBvValue 0 0",
+           "make 0 3 kFpValue 0 0",
+           "make 0 3 kFpValue 0 nan",
+       }) {
+    SCOPED_TRACE(record);
+    const auto workload =
+        Read(header + std::string(record) + "\nroots 0\nend\n");
+    Replay replay(workload);
+    try {
+      replay.Run();
+      ADD_FAILURE() << "Expected workload diagnostic";
+    } catch (const std::runtime_error& error) {
+      EXPECT_TRUE(std::string_view(error.what()).starts_with("Line 5: "))
+          << error.what();
+    }
+    EXPECT_EQ(replay.GetManager().GetStorageStats()->live_nodes, 0);
+  }
+}
+
+TEST(NodeWorkloadTest, FoldsPrebuiltNumericDagAndRebuildsSymbolicParents) {
+  auto manager = NodeManager::Create().value();
+  auto roots = BuildFoldingDag(manager);
+  ASSERT_EQ(roots.size(), 15);
+  const auto expected_shape = Walk(roots);
+  EXPECT_EQ(expected_shape.Nodes(), 96);
+  EXPECT_EQ(expected_shape.Edges(), 157);
+  EXPECT_EQ(expected_shape.Depth(), 65);
+
+  const auto mul = roots[0].Borrow();
+  const auto sub = roots[1].Borrow();
+  EXPECT_EQ(mul.GetKind(), Kind::kIntMul);
+  EXPECT_EQ(sub.GetKind(), Kind::kIntSub);
+  const auto shared = mul.GetChildren()[0];
+  EXPECT_EQ(shared.GetKind(), Kind::kIntAdd);
+  EXPECT_EQ(mul.GetChildren()[1], shared);
+  EXPECT_EQ(sub.GetChildren()[0], shared);
+
+  const auto initial = manager.GetStorageStats().value();
+  {
+    const auto folded = FoldDag(manager, roots);
+    ASSERT_EQ(folded.size(), roots.size());
+    for (std::size_t i = 0; i < roots.size(); ++i) {
+      EXPECT_EQ(folded[i].Borrow().GetSort(), roots[i].Borrow().GetSort()) << i;
+    }
+    const auto integer = [](NodeView node) {
+      return node.GetValue().value().GetInteger().value().TryInt64();
+    };
+    EXPECT_EQ(integer(folded[0].Borrow()), 169);
+    EXPECT_EQ(integer(folded[1].Borrow()), 7);
+    const auto mixed_int = folded[2].Borrow();
+    EXPECT_NE(folded[2], roots[2]);
+    EXPECT_EQ(mixed_int.GetKind(), Kind::kIntAdd);
+    EXPECT_EQ(mixed_int.GetChildren()[0], roots[2].Borrow().GetChildren()[0]);
+    EXPECT_EQ(mixed_int.GetChildren()[1], folded[1].Borrow());
+    const auto div = folded[3].Borrow();
+    EXPECT_EQ(div.GetKind(), Kind::kIntDiv);
+    EXPECT_EQ(div.GetChildren()[0], folded[1].Borrow());
+    EXPECT_EQ(integer(div.GetChildren()[1]), 0);
+    EXPECT_EQ(integer(folded[4].Borrow()), 64);
+    EXPECT_EQ(folded[5], roots[5]);
+
+    const auto bits = [](NodeView node) {
+      return node.GetValue().value().GetBitVector().value().TryUint64();
+    };
+    EXPECT_EQ(folded[6].Borrow().GetSort().GetWidth(), 4);
+    EXPECT_EQ(bits(folded[6].Borrow()), 0xa);
+    EXPECT_EQ(folded[7].Borrow().GetSort().GetWidth(), 8);
+    EXPECT_EQ(bits(folded[7].Borrow()), 0xa3);
+    const auto extract = folded[8].Borrow();
+    EXPECT_NE(folded[8], roots[8]);
+    EXPECT_EQ(extract.GetKind(), Kind::kBvExtract);
+    ASSERT_EQ(extract.GetIndices().size(), 2);
+    EXPECT_EQ(extract.GetIndices()[0].ToDecimal(), "5");
+    EXPECT_EQ(extract.GetIndices()[1].ToDecimal(), "2");
+    const auto concat = extract.GetChildren()[0];
+    EXPECT_EQ(concat.GetKind(), Kind::kBvConcat);
+    EXPECT_EQ(concat.GetChildren()[0], folded[7].Borrow());
+    EXPECT_EQ(concat.GetChildren()[1],
+              roots[8].Borrow().GetChildren()[0].GetChildren()[1]);
+    EXPECT_EQ(integer(folded[9].Borrow()), -1);
+
+    const auto fp = [](NodeView node) {
+      return node.GetValue()
+          .value()
+          .GetFloatingPoint()
+          .value()
+          .FiniteBits()
+          .value()
+          .TryUint64();
+    };
+    EXPECT_EQ(fp(folded[10].Borrow()), 0b00100);  // 9/8 rounds to 1 (RNE).
+    EXPECT_EQ(fp(folded[11].Borrow()), 0b00101);  // 9/8 rounds to 5/4 (RTP).
+    EXPECT_EQ(fp(folded[12].Borrow()), 0b00110);  // 5/4 + 1/4 = 3/2.
+    const auto mixed_fp = folded[13].Borrow();
+    EXPECT_NE(folded[13], roots[13]);
+    EXPECT_EQ(mixed_fp.GetKind(), Kind::kFpAdd);
+    EXPECT_EQ(mixed_fp.GetChildren()[0], roots[13].Borrow().GetChildren()[0]);
+    EXPECT_EQ(mixed_fp.GetChildren()[1], roots[13].Borrow().GetChildren()[1]);
+    EXPECT_EQ(mixed_fp.GetChildren()[2], folded[12].Borrow());
+    EXPECT_EQ(folded[14], roots[14]);  // FP min on opposite zeros has choices.
+
+    EXPECT_EQ(FoldDag(manager, roots), folded);
+    EXPECT_EQ(mul.GetChildren()[0], shared);
+    EXPECT_EQ(Walk(roots).Nodes(), expected_shape.Nodes());
+    EXPECT_GT(manager.GetStorageStats()->node_bytes, initial.node_bytes);
+  }
+  EXPECT_EQ(manager.GetStorageStats()->live_nodes, initial.live_nodes);
+  EXPECT_EQ(manager.GetStorageStats()->node_bytes, initial.node_bytes);
+  roots.clear();
+  EXPECT_EQ(manager.GetStorageStats()->live_nodes, 0);
+  EXPECT_EQ(manager.GetStorageStats()->node_bytes, 0);
+}
+
+TEST(NodeWorkloadTest, FoldResourceFailureReleasesMemoAndPreservesInputs) {
+  auto manager = NodeManager::Create().value();
+  const auto roots = BuildFoldingDag(manager);
+  const auto initial = manager.GetStorageStats().value();
+  NodeTestPeer::SetSizeLimit(manager, 1);
+  try {
+    (void)FoldDag(manager, roots);
+    ADD_FAILURE() << "Expected the folded Int allocation to fail";
+  } catch (const std::runtime_error& error) {
+    EXPECT_TRUE(
+        std::string_view(error.what()).starts_with("Node resource limit"))
+        << error.what();
+  }
+  NodeTestPeer::SetSizeLimit(manager, std::numeric_limits<std::size_t>::max());
+  EXPECT_EQ(manager.GetStorageStats()->live_nodes, initial.live_nodes);
+  EXPECT_EQ(manager.GetStorageStats()->node_bytes, initial.node_bytes);
+  EXPECT_EQ(roots.front().Borrow().GetKind(), Kind::kIntMul);
+  EXPECT_EQ(FoldDag(manager, roots).size(), roots.size());
 }
 
 }  // namespace dandelion::node_bench

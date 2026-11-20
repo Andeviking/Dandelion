@@ -1,157 +1,123 @@
-# Numeric Implementation and Migration Plan
+# Numeric Implementation and Migration
 
-Status: **proposed baseline for review**, not an implemented change. Each
-phase covers its complete scoped behavior, not merely the easy examples. The
-interfaces and error mapping below are design obligations; final method
-spellings can follow the project style guide without changing semantics.
+**Status.** The standalone target and module, the numeric test suite,
+and the Node, frontend, and benchmark migrations are implemented.
 
-## Files, modules and build boundaries
+## Build and module layout
 
-The four types must have separate substantive implementations:
+The C++23 static library `dandelion_util` under `src/util/` provides
+one named module, `dandelion.util.numeric`. The primary interface
+re-exports the five interface partitions. Each type's `.cc` unit
+implements its substantive operations.
 
-```text
-src/util/
-  integer.cppm          integer.cc
-  bitvector.cppm        bitvector.cc
-  rational.cppm         rational.cc
-  floating_point.cppm   floating_point.cc
-  numeric_error.cppm    [small implementation file if needed]
-src/node/
-  node_contracts.cppm   [reference-limit implementation if needed]
-  numeric.cppm          [compatibility re-export during migration]
-```
-
-Each `.cppm` owns its type and each `.cc` owns its substantive operations;
-additional clearly scoped helper files are allowed. A common file may define
-small error types or exact-rounding helpers, but it must not house the bulk of
-all four implementations while the named files are shells. The private FP
-rounding algorithm may live in a separate FP-specific implementation unit.
-Proposed imports are `integer -> node_contracts` only for legacy signatures;
-`bitvector -> integer`; `rational -> integer`; `floating_point -> bitvector,
-rational`; and `node -> numeric compatibility + floating_point`. New
-computation errors are independent of NodeManager. This is an acyclic module
-graph, not a demand for four libraries or four CMake targets.
-
-`node_contracts` is a small dependency-free historical-compatibility module
-owning the existing `NodeError`, `ErrorCode`, `ResourceKind`, `Result`, and
-`ReferenceLimit` declarations. The last is node reference-count machinery,
-not a numeric failure. Keeping this lower module preserves the existing
-`Integer::ParseDecimal` and `Rational::Make` return types without making util
-depend on NodeManager. `dandelion.numeric` re-exports it and the moved Integer
-and Rational modules, so existing `import dandelion.numeric` and
-`import dandelion.node` consumers continue to see the same names. A separate
-`NumericError`/`NumericResult` belongs to new calculation interfaces. Node
-factories continue to translate their own checked errors to existing
-`NodeError` values, including `kResourceLimit/kCppAllocation` and
-`kResourceLimit/kSize`; the solver boundary handles actual inability to
-compute and any explicitly requested cancellation according to its result
-contract. Do not add fictitious
-resource enumerators to today's implemented API in documentation or reuse a
-node operand index for a numeric allocation error.
-
-Named C++ module entity attachment, re-exports, test-only peers, GMP visibility
-and static-link propagation need a real GCC and Clang build check. Avoid
-defining the same entity in two named modules during a staged migration.
-Choose one or a small number of CMake targets according to actual consumers;
-module files and libraries are different concepts. Register public module
-file sets and private implementation sources as appropriate, retain GMP as a
-private implementation dependency, no SAT dependency, and preserve sanitized
-static-library runtime link propagation. Follow [cmake.md](../cmake.md); no
-CMake change is made by this proposal.
-
-## Migration and compatibility gates
-
-1. **Before source edits**, update or extend [the numeric test design](../testing/util.md)
-   for the exact scoped behavior and add all required GoogleTest cases. Run
-   them and record missing-interface compile failures or real failing tests.
-   Do not remove, disable, modify or weaken existing or new cases while any
-   required case fails. Correct an independently demonstrated incorrect test
-   only under AGENTS.md's exception, recording the evidence.
-2. Move the declarations and definitions currently in `src/node/numeric.cppm`
-   and `numeric.cc` to their owning modules and compatibility re-export;
-   isolate the node-only error/reference declarations. Preserve the existing
-   decimal grammar, exact compare/hash/chunks, `IntegerView` and
-   `RationalView` interfaces, private GMP, test-only numeric allocation
-   hooks, small canonical representation, strong assignment, `noexcept` moves
-   and moved-from values. Run all existing node tests unchanged. This move is
-   a source/module migration, not evidence of new arithmetic.
-3. Add complete scoped tests first, then Integer arithmetic and Rational
-   operations. Add BV tests first, then the standalone width-bearing value
-   and its checked operations. Each type's failures must be atomic; no fake
-   return values or test disables while code is incomplete.
-4. Add tests first, then FP format/value classification and all concrete
-   operations with explicit outcome categories. No new backend is installed.
-   Test format boundaries and actual representation failures, not only
-   standard machine formats; do not introduce discretionary numeric quotas.
-5. Add borrowed node adapters and integration tests first, then the adapter.
-   Continue storing the existing payloads initially: preserve `GetInteger`
-   for both Int and BV, `GetFpCategory`, `GetFpBits` only for finite bits,
-   exact Rational payload, source lifetime and node hash/identity. Validate
-   format or width against the associated sort before publishing an owning
-   value to a node. Keep `MakeBvValue`, `MakeFpBits`, `MakeFpSpecial`, and
-   their current errors. The checked adapters must not retain node references
-   accidentally or expose a view into a temporary.
-6. Introduce rewriter, symbolic FP encoding, theory coordination and model
-   callers only under their own designs and tests. They must preserve
-   underspecified function congruence and original-query model recovery.
-   A complete numeric layer does not establish those solver obligations.
-
-The new common outcome type and optional view/factory overloads expand the
-API but do not change existing Node observable semantics. Moving the existing
-module entities and `RoundingMode` can break source imports or C++ module
-attachment if done carelessly: the compatibility re-exports are mandatory,
-and any unavoidable incompatibility requires an explicit reviewed contract
-change. If a later change replaces BV/FP node payload storage, then update
-`docs/node/design.md`, `operators.md`, `implementation.md`,
-`docs/testing/node.md` and inventory, source adapters, and affected callers
-in the same tested change; preserve literal accessors and interning unless a
-new contract is explicitly approved. This proposal does not make that change.
-
-## Acceptance and open choices
-
-The gate is complete applicable [numeric tests](../testing/util.md), existing
-node tests unchanged, GCC and Clang builds, GCC ASan/UBSan, release behavior,
-and documented failure/unsupported/unknown results. Run CTest discovery with
-`--no-tests=error`; record unavailable configurations separately. The node
-test suite alone checks typing, value ownership and structural identity, not
-all new numeric or solver semantics. Performance needs representative future
-measurements with source versions, compilers, configurations, seed and workload;
-no speedup is asserted here.
-
-Review before implementation: exact method names and error enum layout;
-the cost of `Integer`-backed BV64; concrete FP
-algorithm optimizations and any future MPFR or symbolic SymFPU dependency;
-the eventual symbolic encoding and model-choice interfaces. None of these
-may change the defined values, required operator semantics, or existing node
-contracts by default. The existing 32-bit BV width and FP format bounds are
-retained; they are implementation boundaries, not general SMT-LIB limits or
-discretionary computation budgets.
-
-| Unresolved decision and reason | Impact, decision gate, and fallback |
+| File | Module unit and responsibility |
 | --- | --- |
-| The exact result/error API spelling and module re-export mechanics need supported-toolchain compilation, particularly existing `Result` and test-peer visibility. | Affects numeric callers and node source compatibility, not mathematical values. Before moving code, add compatibility tests and compile an isolated GCC/Clang module probe; preserve the current module until a compatible migration passes. Any proposed source contract break requires explicit review. |
-| The exact FP baseline still needs implementation-level correctness arguments for each special case, midpoint, subnormal, overflow and sqrt scaling; shortcuts need separate proofs. No complete evaluator exists to validate. | FP concrete arithmetic must not be called implementation-ready until those arguments and the complete test-first cases are reviewed. Use the exact Integer/Rational baseline with resource failure; disable no tests and retain terms or return `unknown` until an operation is established. |
-| Symbolic FP encoding and the representation of model choices require a separate theory/model design and dependency evaluation. | All FP symbolic operators and equal-argument congruence are affected. Decide before claiming symbolic FP support; an exact encoding or another sound procedure must establish the result, otherwise return `unknown`. The concrete value layer alone is not that procedure. |
-| Inline unsigned BV storage or MPFR may improve particular costs, but no Dandelion workload measurements exist. | These do not block the selected Integer-backed BV and exact FP baselines. Reconsider only with versioned correctness, ownership and representative performance evidence; any replacement must preserve the same contracts. |
+| `numeric.cppm` | Primary interface declaring `export module dandelion.util.numeric` |
+| `error.cppm` | `:error`, containing the fixed-size error and expected alias |
+| `integer.cppm`, `integer.cc` | `:integer` interface and exact signed arithmetic |
+| `rational.cppm`, `rational.cc` | `:rational` interface and exact fraction arithmetic |
+| `bitvector.cppm`, `bitvector.cc` | `:bitvector` interface and finite-width arithmetic |
+| `floating_point.cppm`, `floating_point.cc` | `:floating_point` interface, representation, and concrete evaluation |
+| `internal.cppm` | Private `:internal` implementation partition for shared backend and capacity helpers |
 
-## Architecture review record
+The primary interface imports each public partition. `:integer` imports
+`:error`. `:rational` and `:bitvector` import `:integer` and any error
+declarations they use. `:floating_point` imports the public partitions
+whose types appear in its interface, including `:bitvector` and
+`:rational`. Only implementation units import `:internal`. Use opaque
+declarations attached to the numeric module for backing type names
+needed in interface layouts. Where implementation units use GMP headers,
+include them through a global module fragment. GMP declarations,
+allocation helpers, and test fault controls stay out of the visible
+production interface.
 
-Two design passes were made for this proposal. The requirements pass traced
-all 95 numeric/RM node kinds to concrete operations, checked the present
-`uint32_t` sort limits and exact indices, and separated existing literal
-representation from planned evaluation. The challenge pass compared ownership,
-failure and oracle dependencies: in particular, a new inline BV representation
-would not automatically provide the existing borrowed `IntegerView`, so the
-selected bridge keeps the current payload; and two SymFPU-based solvers do
-not provide independent evidence. These decisions and the test matrix were
-updated together.
+Register the primary and interface partitions in a public
+`CXX_MODULES` file set and `:internal` in a private file set.
+Register implementation units as private ordinary sources. Apply
+the project's owned-source checks, verified `import std` support,
+and static-library sanitizer policy. Verify the layouts on the
+supported GCC and Clang 64-bit configurations. The size requirements
+are implementation contracts on those targets and carry no external
+binary compatibility promise. [CMake standards](../cmake.md#4-c-modules-and-import-std),
+[C++ style](../cpp-style.md)
 
-Representative flows were traced: an arbitrary integer index is validated
-before width narrowing, an Int-to-BV conversion computes a residue while a
-literal is range-checked, and a borrowed BV node view dies with its owner;
-a closed Rational payload with symbolic RM stays an operation node until a
-concrete RM is known; an opposite-zero min or invalid FP-to-BV result reaches
-the model as a choice, preserving equal-argument congruence. At every flow a
-checked size or allocation failure leaves existing values and nodes intact; GMP
-limb OOM remains a separate fatal limitation. This review is design evidence,
-not an implementation proof. The decision gates in the table remain open.
+Link GMP 6.3 or newer with
+`target_link_libraries(dandelion_util PRIVATE GMP::GMP)`. Util owns the
+direct GMP dependency for both the numeric and node libraries. The final
+executable may receive GMP through CMake's link-only propagation for
+static libraries. Consumer compilation does not require GMP headers
+or its compile options. Node links to util with the module usage
+requirements it exposes. Standalone util consumers need no node,
+frontend, SAT, or MPFR target. Existing build-time dependency validation
+belongs to the GMP provider. MPFR can be linked privately into an
+optional reference test executable. [CMake dependency policy](../cmake.md#51-dependency-sources-and-network-policy)
+
+## Node and frontend entry points
+
+Node accepts checked numeric views. On a miss, it copies the canonical
+payload into the node block. On a hit, it retains the existing node.
+Integer, bit-vector, floating-point and rational views support borrowed
+read-only storage, including the inline payload of a live node. A view
+can make an independent owning copy. Util adapts borrowed integer
+magnitudes to GMP through a read-only stack descriptor. The supported ABI
+uses a native `uint64_t` GMP limb with 64 usable bits. Node owns its
+diagnostics and translates failures from util at the factory boundary.
+[Typed Node values](../node/design.md#10-phase-1c-numeric-boundary-and-typed-literals)
+
+The frontend constructs numeric nodes through typed Node factories and
+calls `numeric::RoundRationalToFp` directly when rendering concrete
+rational-to-FP conversions. The frontend associates source ranges with
+diagnostics. Interpretation of concrete FP outcomes across a query belongs
+to the solver and model layers.
+[Frontend semantic interfaces](../frontend/semantic-interfaces.md)
+
+## Implementation order and acceptance
+
+1. Add the applicable [numeric GoogleTest cases](../testing/util.md)
+   before implementing the scoped behavior. Record missing-interface
+   compile failures and real failing cases. Apply the test preservation
+   rule and its independent-evidence exception from [AGENTS.md](../../AGENTS.md).
+2. Establish the target, public error and value interfaces, capacity
+   checks, and narrow private fault controls. Compile positive and
+   negative dependency probes with GCC and Clang. Implement Integer
+   ownership and arithmetic, then Rational and BitVector. Run the
+   complete applicable test matrix at each step, including transitions
+   between inline and wide storage.
+3. Implement FP format, construction, identity, and outcome checks,
+   then the exact rounding kernel and all FP operations. Use the tiny
+   enumerators and targeted wide-format checks. Use the same util FP
+   kernel in standalone callers and frontend rendering.
+4. Complete Node and frontend migration with typed API tests. Keep the
+   direct GMP link in util. The util tests check the GMP runtime version,
+   exact arithmetic, and fatal OOM. Build the fatal OOM subprocess
+   without sanitizer instrumentation so its address-space
+   bound measures the intended GMP allocation.
+5. Accept only after standalone import/link checks, the complete
+   numeric suite, affected node and frontend suites, and the
+   supported compiler, sanitizer, and release checks in the test
+   design. Record configuration-specific results, including any
+   unavailable optional reference oracle. Rewriters and symbolic
+   theory/model consumers have separate correctness and acceptance
+   obligations. [Numeric acceptance](../testing/util.md#build-and-acceptance)
+
+## Design review
+
+The requirements pass traced the selected Int, BV, and FP inventory
+to concrete operators and identified which shape checks, fold rules,
+literal diagnostics, and interpretation choices belong to callers.
+The interaction pass verified the dependency direction for three
+representative paths. Borrowed node bits enter a checked standalone
+BV construction and the owning result can outlive the node.
+Rational-to-FP rendering uses the util kernel and the frontend's source
+diagnostics. Opposite-zero min/max and out-of-range FP-to-BV
+pass allowed outcomes to the model without committing to an
+interpretation. A failed preparation on either side leaves prior
+values and published nodes intact.
+
+The representation review identified the need for an explicit zero
+denominator tag separate from the Rational pointer storage and for
+GMP capacity checks beyond the public index type width. The semantic
+review identified integral rounding overflow in tiny FP formats
+whose top binade includes fractions. The implementation gates cover
+these cases and the evidence for the selected algorithms. Runtime
+performance remains to be measured. [Numeric research](research.md)

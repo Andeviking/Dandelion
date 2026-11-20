@@ -42,6 +42,7 @@ struct Options {
   std::optional<std::filesystem::path> input;
   std::vector<Scenario> scenarios;
   bool inspect = false;
+  bool canonicalize = false;
   // NOLINTEND(readability-identifier-naming)
 };
 
@@ -87,6 +88,10 @@ Options ParseOptions(int& argc, char** argv) {
     } else if (argument == "--inspect") {
       if (options.inspect) throw std::runtime_error("Specify --inspect once");
       options.inspect = true;
+    } else if (argument == "--canonicalize") {
+      if (options.canonicalize)
+        throw std::runtime_error("Specify --canonicalize once");
+      options.canonicalize = true;
     } else {
       argv[remaining++] = argv[index];
     }
@@ -106,14 +111,15 @@ Options ParseOptions(int& argc, char** argv) {
 }
 
 void RunWorkload(benchmark::State& state, std::string_view input,
-                 const Scenario& scenario) {
+                 const Scenario& scenario, bool canonicalize) {
   ParseStats totals;
   for (auto iteration : state) {
     (void)iteration;
     if (scenario.teardown_only) state.PauseTiming();
-    auto parsed = scenario.reader_mode
-                      ? ParseFromReader(input, *scenario.reader_mode)
-                      : ParseFromText(input, scenario.measure_phases);
+    auto parsed =
+        scenario.reader_mode
+            ? ParseFromReader(input, *scenario.reader_mode, false, canonicalize)
+            : ParseFromText(input, scenario.measure_phases, canonicalize);
     if (parsed.status != "ok") {
       state.SkipWithError(parsed.diagnostic_message);
       return;
@@ -121,8 +127,7 @@ void RunWorkload(benchmark::State& state, std::string_view input,
     if (scenario.teardown_only) state.ResumeTiming();
     parsed.Teardown(scenario.measure_phases);
     if (scenario.measure_phases) {
-      totals.next_syntax_ns += parsed.stats.next_syntax_ns;
-      totals.apply_ns += parsed.stats.apply_ns;
+      totals.read_command_ns += parsed.stats.read_command_ns;
       totals.teardown_ns += parsed.stats.teardown_ns;
     }
   }
@@ -135,27 +140,26 @@ void RunWorkload(benchmark::State& state, std::string_view input,
       state.counters[name] = benchmark::Counter(
           static_cast<double>(total), benchmark::Counter::kAvgIterations);
     };
-    report("next_syntax_ns", totals.next_syntax_ns);
-    report("apply_ns", totals.apply_ns);
+    report("read_command_ns", totals.read_command_ns);
     report("teardown_ns", totals.teardown_ns);
   }
 }
 
 void RegisterWorkload(const std::string& name, const Scenario& scenario,
-                      std::string_view input,
+                      std::string_view input, bool canonicalize,
                       std::string_view load_error = {}) {
-  benchmark::RegisterBenchmark(name,
-                               [scenario, input, load_error](auto& state) {
-                                 if (!load_error.empty()) {
-                                   state.SkipWithError(std::string(load_error));
-                                   return;
-                                 }
-                                 try {
-                                   RunWorkload(state, input, scenario);
-                                 } catch (const std::exception& error) {
-                                   state.SkipWithError(error.what());
-                                 }
-                               });
+  benchmark::RegisterBenchmark(
+      name, [scenario, input, canonicalize, load_error](auto& state) {
+        if (!load_error.empty()) {
+          state.SkipWithError(std::string(load_error));
+          return;
+        }
+        try {
+          RunWorkload(state, input, scenario, canonicalize);
+        } catch (const std::exception& error) {
+          state.SkipWithError(error.what());
+        }
+      });
 }
 
 InspectReport LoadFailure(const std::error_code& error,
@@ -182,7 +186,8 @@ int main(int argc, char** argv) {
     if (benchmark::ReportUnrecognizedArguments(argc, argv)) return 1;
 
     if (!options.input) {
-      RegisterWorkload("frontend/smoke/builtin", kScenarios[0], kBuiltinInput);
+      RegisterWorkload("frontend/smoke/builtin", kScenarios[0], kBuiltinInput,
+                       options.canonicalize);
       const auto matched = benchmark::RunSpecifiedBenchmarks();
       benchmark::Shutdown();
       return matched > 0 ? 0 : 1;
@@ -197,7 +202,7 @@ int main(int argc, char** argv) {
       const auto mode = options.scenarios.empty()
                             ? std::nullopt
                             : options.scenarios.front().reader_mode;
-      const auto report = input ? Inspect(*input, mode)
+      const auto report = input ? Inspect(*input, mode, options.canonicalize)
                                 : LoadFailure(input.error(), load_error);
       std::cout << InspectToJson(report) << '\n';
       benchmark::Shutdown();
@@ -208,9 +213,10 @@ int main(int argc, char** argv) {
                                ? std::span<const Scenario>(kScenarios)
                                : std::span<const Scenario>(options.scenarios);
     for (const auto& scenario : scenarios) {
-      RegisterWorkload(
-          std::format("frontend/parse/{}", scenario.name), scenario,
-          input ? std::string_view(*input) : std::string_view{}, load_error);
+      RegisterWorkload(std::format("frontend/parse/{}", scenario.name),
+                       scenario,
+                       input ? std::string_view(*input) : std::string_view{},
+                       options.canonicalize, load_error);
     }
     const auto matched = benchmark::RunSpecifiedBenchmarks();
     benchmark::Shutdown();

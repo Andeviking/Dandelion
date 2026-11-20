@@ -1,6 +1,10 @@
 # Node System Testing
 
-Status: **implemented test suite and coverage requirements**. See the
+The first-version, Phase 1 and Phase 2 Node suites are implemented and have
+recorded verified runs. The cases below retain their test design and
+acceptance requirements. The review did not independently verify the current
+tree or completeness of every subcase. [Phase 1C](#phase-1c-typed-literals-and-inline-numeric-payloads)
+covers the numeric boundary and payloads. See the first-version
 [feature inventory](node-inventory.md) and [acceptance record](node-acceptance.md).
 This document applies the [common testing strategy](README.md) and
 [AGENTS.md](../../AGENTS.md) test-first requirements to the full
@@ -93,9 +97,13 @@ structurally equal recipes need not share one.
 - **N-BV-01**: on BV8 `x`, extract `(3,0)` and `(7,4)` both return BV4 but
   have different indices and node identities; repeating either construction
   shares. `(8,0)` and `(3,4)` report invalid parameters.
-- **N-BV-02**: frontend `(_ bv256 8)` is invalid, not BV8 zero. BV65
-  `2^64` is exact; matching `#b` and `(_ bvN 65)` spellings denote the same
-  width/value. BV64 with value `2^64` is invalid.
+- **N-BV-02**: the frontend reduces `(_ bvN w)` modulo `2^w`, so
+  `(_ bv256 8)` and `#x00` produce the same BV8 zero. Exact Node value
+  construction requires `0 <= v < 2^w`. A typed BV65 value of `2^64`
+  remains exact and matches equivalent `#b` and `(_ bvN 65)` spellings.
+  Preparing that value with `BitVector::FromIntegerExact` at width 64
+  fails. Passing the BV65 view to `MakeBvValue` with a BV64 sort reports
+  `kSortMismatch`.
 - **N-IDX-01**: `(_ divisible 18446744073709551617)` retains the complete
   positive index. BV8 rotations by that amount and by 1 have different node
   keys; their semantic equivalence is independently justified modulo 8.
@@ -281,30 +289,29 @@ instrumentation remains outside the Release timings.
 
 The Phase A1 test design covers `RootRange` and the static
 `NodeManager::ReleaseRoots(const ManagerRef&, std::span<const RootRange>)`
-overload. These cases require the Phase B API before they can compile.
+overload using the typed, private `RootRange` contract.
 
 - **N-RANGE-01** checks that `RootRange::From` is `noexcept` and projects
   exactly the selected `Node` member at each index. Use two records of each
   type, `EntryA` with `term` and `EntryB` with `tag` followed by `body`.
-  Check the descriptor's context and count and compare callback results
-  with the actual member addresses. Check that the static release overload
-  is `noexcept`.
+  Verify release clears exactly the selected members and leaves other fields
+  intact, including for `span<Node>`. Check that arbitrary callbacks cannot
+  be supplied and that the static release overload is `noexcept`.
 - **N-RANGE-02** checks validation before any handle is consumed. Require
   `kNullObject` for a default `ManagerRef`, with both an empty batch and a
-  live root. Require `kInvalidParameter` when a nonempty descriptor with a
-  null callback follows a valid range. Require `kForeignManager` when a
+  live root. Require `kForeignManager` when a
   foreign handle follows a local handle in the second range, even if the
   foreign node has the same numeric ID as a local node. Check that the
   supplied IDs and reference counts are unchanged after rejection.
-- **N-RANGE-03** covers an empty batch, a default zero-count descriptor,
-  a descriptor from an empty record span, and null node handles. A live
+- **N-RANGE-03** covers an empty batch, a range from an empty node span,
+  a range from an empty record span, and null node handles. A live
   node outside those ranges keeps its identity, and reclamation and
   allocation counts stay unchanged.
 - **N-RANGE-04** distributes owning handles to one parent across both
   record types. That parent has two edges to a leaf, and a second parent
   has one edge to the same leaf. Include a null handle in each range, the
   leaf's only direct owner, and a copy of the second parent's external
-  owner. Place a zero-count descriptor between the two populated ranges.
+  owner. Place an empty range between the two populated ranges.
   All submitted handles clear and scalar tags are preserved. Only the
   first parent retires. The remaining parent keeps the leaf alive through
   its single edge, and interning the retired parent yields a new ID.
@@ -343,6 +350,287 @@ overload. These cases require the Phase B API before they can compile.
   The existing tests cover long domains, embedded zeroes in names, fresh
   constants, and substituted datatype signatures.
 
+### Phase 1 construction and rollback
+
+The following GoogleTest cases specify the Phase 1 construction paths. Use public factories and typed queries for the contract
+checks. Use private test-peer instrumentation for hash, probe, inference,
+cache, and failure checks. Keep all nodes involved in identity comparisons
+live, and run collision cases in a fresh manager with collisions forced
+before constructing any node.
+
+- **N-REBUILD-01** — Rebuild `bvsub(x,y)` with its original ordered children.
+  Use an attached facade in one call to cover shared manager state.
+  Repeat with a BV literal and a nullary `kApply` using empty spans. Assert
+  the same live identity, one additional owner, and unchanged child and
+  state reference counts. Hash computations, table probes, allocation
+  attempts, builtin shape checks, type evaluations, and the next `NodeId`
+  must stay unchanged. Fail the result retain and expect
+  `kResourceLimit/kReferenceCount` with the original and counts intact.
+- **N-REBUILD-02** — Exercise both a changed-child miss and a repeat hit in
+  each row below. Check the stated result type and payload, exact replacement
+  sequence, and distinct identity from the original. Compare the live result
+  with ordinary checked construction of the same term. Also prebuild an
+  ordinary target before rebuilding in a separate case, so reuse works in
+  either direction. Run the key comparisons under natural hashes and forced
+  collisions. Assert that rebuild adds no builtin shape or type evaluations
+  and leaves the input untouched. Drop the original after success and confirm
+  the rebuilt node still exposes its exact payload and owns its new children.
+
+  | Original and change | Expected result |
+  | --- | --- |
+  | `bvsub(x,y)` for distinct BV8 nodes, replace with `[y,x]` | `kBvSub` of BV8 with ordered children `[y,x]`. |
+  | `((_ extract 5 2) x)` on BV8, replace `x` with `y` | `kBvExtract` of BV4 with indices `[5,2]`. Keep `extract 6 3` over `y` live to distinguish equal result widths and different index keys. |
+  | `((_ rotate_left 18446744073709551617) x)` on BV8, replace `x` with `y` | BV8 with the exact index `2^64+1`. A rotate by 1 with the same child has a distinct key. |
+  | Const array qualified by `Array Int BV8`, replace its element `x` with `y` | `kArrayConst` with the original qualified array sort. A const array qualified by `Array Bool BV8` over `y` has a distinct key. |
+  | `to_fp` from exact rational `2/3` with format indices `[8,24]`, replace RNE with RTZ | `kFpFromRational` of FP(8,24), same format indices, exact rational `2/3`, and RTZ as its sole child. Keep the corresponding `3/4` conversion live as a distinct key. |
+  | Apply `cons` instantiated at `List<BV8>` to `[x,nil]`, replace with `[y,nil]` | `kApply` with the same concrete `DeclInstanceId`, type arguments, and `List<BV8>` result. A different declaration of the same concrete signature over `[y,nil]` has a distinct key. |
+
+- **N-REBUILD-03** — Give a binary BV8 original too few and too many
+  replacements, expecting `kInvalidArity`. Replace the second child with BV4,
+  expecting `kSortMismatch` at operand 1. Try a null original, a null
+  replacement, a foreign original, and a foreign replacement of the same
+  apparent width. Expect `kNullObject` or `kForeignManager` as appropriate,
+  with the operand position for replacement errors. Include a nonempty
+  span for a nullary original. No failure publishes a node, changes a
+  reference count, or consumes an ID.
+- **N-REBUILD-04** — On a changed-child miss for a rational FP conversion
+  with exact payload `18446744073709551617/3`, inject each project-controlled
+  allocation and retain failure through candidate publication. Verify
+  the corresponding `kResourceLimit` detail, the original payload and
+  references, and unchanged live counts and next ID after every failure.
+  A clean retry must publish at that ID with the original payload.
+- **N-WORD-INDEX-01** — Construct extracts of a BV8 child with `[7,4]` and
+  `[6,3]`, rotations with indices 0, 1, `UINT32_MAX`, `UINT32_MAX+1`, and
+  `UINT64_MAX`, and `divisible` with `UINT64_MAX` over an Int child.
+  Use fixed caller word arrays and exact `Integer` values independently.
+  Check result types (BV4, BV8, and Bool respectively), observable indices,
+  identity across APIs in both insertion orders, and distinct live keys for
+  unequal indices under forced collisions. With the same rotation child,
+  keep a general-factory rotation by `2^64+1` live and distinct from the
+  word rotation by 1. An exact hit requires no candidate allocation.
+- **N-WORD-INDEX-02** — Compare both factories with a one-index extract,
+  an inverted extract interval, an endpoint outside BV8, a zero repeat,
+  a missing const-array qualifier, and a missing rational for rational FP
+  conversion. Each returns `kInvalidParameter`. An extension of BV8 by
+  `UINT64_MAX` returns `kResourceLimit/kSize`. Cover `kInvalidKind` with
+  `kInvalid`, `kInvalidArity` with two extract operands, `kSortMismatch`
+  with a Bool extract operand, and `kNullObject` or `kForeignManager` with
+  the corresponding extract child. `kBvNot` with an empty index span
+  follows ordinary builtin rules. A nonempty index span for that kind
+  returns `kInvalidParameter`. Keep colliding valid keys live and check
+  that rejected inputs publish no node and consume no ID.
+- **N-BV-WORD-01** — At width 1, accept 0 and 1 and reject 2. At width 8,
+  accept 255 and reject 256. At width 63, accept `2^63-1` and reject
+  `2^63`. At widths 64 and 65, accept `UINT64_MAX`. Verify exact
+  magnitudes and equality with the corresponding `MakeBvValue` node
+  in both insertion orders, including exact decimal integers above
+  `INT64_MAX`. Equal words at different widths and distinct words at one
+  width remain distinct under forced collisions. Reject overflow with
+  `kInvalidLiteral`, Bool sorts with `kSortMismatch`, and null and foreign
+  sorts with the corresponding view errors. Rejected inputs leave live
+  nodes and the next ID unchanged.
+- **N-BV-WIDTH-01** — In separate fresh managers, infer BV8 through an
+  extract from BV16 before requesting BV8 explicitly, and request BV8
+  explicitly before inferring it. Use different extract keys that yield
+  BV8 to force inference when measuring the warm path. Verify that the word
+  and exact-width overloads and an attached facade share the same
+  `SortId`. Intern a different sequence of sorts in a separate state
+  and verify its BV8 view belongs to that state. With the private peer,
+  check that warm cached requests skip generic sort-table lookup.
+  Check width 1 remains distinct from Bool,
+  width 64 is cached, and width 65 and `UINT32_MAX` use the ordinary
+  interner and match the exact-width overload. Zero yields
+  `kInvalidParameter`. `UINT32_MAX+1`, `UINT64_MAX`, and a concat of a
+  BV(`UINT32_MAX`) symbolic term with BV1 yield `kResourceLimit/kSize`
+  before narrowing. Failure publishes no invalid sort or node.
+- **N-BV-WIDTH-02** — Fail first-use sort allocation for a cacheable width,
+  verify the slot stays empty and the next sort identity is available, and
+  retry through the other lookup path to populate it. Fail the public
+  owning-sort retain with a warm slot, expecting
+  `kResourceLimit/kReferenceCount`. After clearing the failure, both
+  explicit and derived lookups still return the same published sort.
+- **N-TAIL-01** — For default-initialized child storage, fail the state
+  retain and each child retain of a candidate with ordered slots
+  `[a,b,a]`. Reuse the external-count fixture in the lifecycle regressions
+  to fail just before the last slot of a 65,536-child candidate. Check
+  rollback against the exact retained prefix, including repeated edges:
+  after every failure, state and child counts, live nodes and edges, and
+  next ID match their pre-call values. Verify survivor identity and that a
+  successful retry owns every edge exactly once. Release the retried parent
+  and check that child counts return to baseline. Run with the applicable
+  sanitizer configurations and review the rollback loop for reads of
+  unwritten suffix slots.
+
+### Phase 2 consuming construction
+
+Add these GoogleTest cases before implementing the
+[consuming factories](../node/design.md#phase-2-consuming-construction).
+Use hand-checked rank and payload expectations and the existing
+`NodeTestPeer` fault hooks and reference-count observations. Construct
+known canonical counterparts with the borrowed APIs. Use fresh states or
+distinct keys to establish a miss, and keep the expected parent live to
+establish a hit. Compare child addresses or IDs only while the relevant
+owner is live. Keep setup and fixture owners outside injected operations.
+
+| Case | Fixture and independent expectation |
+| --- | --- |
+| N-CONSUME-MISS | Build an ordered binary BV parent with two solely owned, different operands. Observe the same child IDs and sorts at the published slots, null input handles, and stable child reference counts with one edge per child. Retain a child independently, release the parent and verify only that child survives. Also release the manager facade first and verify the parent keeps its DAG and ranks alive. After all handles are released, verify prompt reclamation and reinterning with a fresh ID. |
+| N-CONSUME-HIT | Keep a borrowed-built parent live, give a consuming factory fresh owning copies of the same children, and obtain a second parent owner with the same identity. Check both input handles stay intact, their counts stay unchanged and the parent gains one reference. Repeat with consuming-first and subsequent borrowed lookup, an unchanged rebuild, an empty child span for a nullary application and a zero-child rebuild. Dropping intact input owners leaves the retained parent usable. |
+| N-CONSUME-DUPLICATE | Use two input slots owning the same `a`, with an optional third independent owner. On a miss of a binary parent, both slots become null, both ordered child views name `a`, and its reference count still includes two edges. Destroy the parent and observe two drops, or complete reclamation with the independent owner absent. Repeat on a hit and on pre-transfer failure to check there are two still-owning slots with unchanged counts. |
+| N-CONSUME-PAYLOAD | Cover plain builtin, exact wide index, word index above `UINT32_MAX`, qualified constant array, FP rational, and ordinary UF and concrete datatype instance applications. Compare result rank, child order and key with independently built borrowed results. Cover changed rebuilds of each payload-bearing kind, including when the original supplies borrowed payload views. Use a noncommutative parent and an alternate payload to verify order and payload remain identity-bearing. Force a table hash collision and show an unequal key is a miss with distinct identity. |
+| N-CONSUME-VALIDATE | For each consuming family, pass null and foreign handles in a later slot, wrong operand count or sort, and the applicable wrong kind, index, qualifier, rational or declaration-instance payload. For rebuild test null/foreign original and a different sort at a given position. Use the documented borrowed-factory codes and indices and compare all owning slots, reference counts and live entries after each error. Replace the rejected input and retry successfully. Compare `CheckBuiltinOperands` with `CheckBuiltin` on valid and invalid ranks, including mismatched widths at a specific written position. Check inferred sort or error, intact slots and no new parent. |
+| N-CONSUME-ALLOC | With a fresh key, inject each applicable project allocation failure from key/derived sort preparation and unique-table growth through candidate storage and payload preparation. Use a payload-bearing parent and duplicate operands, and a control with no table growth. Every recoverable failure keeps each slot, its count, original/collision neighbors and live table entries. Compare the next published parent ID with an independently counted successful sequence and require no ID consumed by the failed factory. Capacity and derived-sort changes are allowed by the factory contract. Clear the hook and retry with the same operands. |
+| N-CONSUME-RETAIN | Inject a failed result retain for a live hit and unchanged rebuild, and a failed manager-state retain after preparing a miss. Expect `kResourceLimit/kReferenceCount`, all input owners intact, no publication, and balanced state/payload cleanup. Use the retain hook allowing just the state retain to prove that a consuming miss succeeds with no extra child retains, including repeated edges. The matched borrowed miss fails at the subsequent child retain and rolls back. Also hold enough owners of one child to fill its test reference limit while keeping state retains below that limit. A consuming miss at the limit transfers the supplied owners without increasing the child's count. Confirm both implementations keep independently owned children alive. |
+| N-CONSUME-BOUNDS | Force the existing Node ID or checked-size boundary on a miss using a small fixture and the established test peer. Require its existing resource kind before ownership transfer. Check that a live exact hit still uses only the result retain when new IDs are exhausted. Test a payload view borrowed from an original also present as an owned replacement in an eligible rebuild and verify the published child preserves that owner's lifetime. |
+
+For successful move-in, count each occupied input slot before and each
+corresponding parent edge afterward. The test oracle is ownership
+conservation and canonical structural identity. Count recoverable
+retains and allocations at their existing hooks. Exercise the complete
+sweep through one successful construction, and retain borrowed-path
+rollback coverage. Use the same [build and acceptance](#4-build-and-acceptance)
+conditions for the new cases.
+
+### Phase 1C typed literals and inline numeric payloads
+
+These cases test the
+[typed API and error boundary](../node/design.md#10-phase-1c-numeric-boundary-and-typed-literals)
+and [node payload layout](../node/implementation.md#phase-1c-numeric-payloads).
+Add the complete scoped GoogleTest cases before implementation. Use public
+APIs for semantics, identity, and lifetime. Use the private test peer for
+layout inspection, collisions, and fault injection. Preserve the semantic
+coverage of the earlier tests under the project test-first rules.
+
+The storage-accounting fixture interns the Int sort before recording its
+baseline. `MakeInt` interns its result sort on first use, and
+`GetStorageStats` includes all interned sorts in `metadata_bytes`. Warming
+the sort isolates the measured node and numeric backing bytes.
+
+- **N-NUMERIC-MODULE** — Build and link consumers with GCC and Clang in
+  test-enabled and test-disabled configurations. A Node-only consumer can
+  name and use `ErrorCode`, `ResourceKind`, `DatatypeReason`, `NodeError`,
+  `Result<T>`, and `ReferenceLimit`. A util-only consumer can build typed
+  values without a Node dependency and receives `numeric::NumericError` on
+  failed numeric input. A consumer of both public modules uses typed Node
+  factories. Check that importing the Node module alone exposes neither
+  util value names nor the test peers and that the old
+  `dandelion.numeric` import is unavailable. First compile positive controls
+  under the same configuration to establish that failures are for the
+  intended names or import. The test-enabled consumer can link and use the
+  test-only header and peer without importing the private partition.
+- **N-TYPED-ACCESS** — Verify that Int, BV, and FP literals populate only
+  their matching one of `GetInteger()`, `GetBitVector()`, and
+  `GetFloatingPoint()`. Bool and RM literals populate none of these three.
+  Check `GetFpFormat()` on F(2,2), F(8,24), and a format with both fields
+  above 32, and require an empty result on non-FP sorts. Check that
+  `GetRationalParameter()` is absent for literals and present only on the
+  rational conversion. A constant-child `fp` or `to_fp` remains an operation
+  node and has no literal view.
+- **N-TYPED-BV** — Compare typed and word construction in both insertion
+  orders for width 1 (0 and 1), width 64 (`UINT64_MAX`), and width 65
+  (`UINT64_MAX`). Check that BV65 `2^64` retains both limbs and the exact
+  width. Test a valid BV view with the wrong width, a same-state non-BV
+  sort, a null sort, and a foreign sort with the same width. Expect
+  `kSortMismatch`, `kSortMismatch`, `kNullObject`, and `kForeignManager`,
+  respectively. The word entry point reports `kInvalidLiteral` for BV1
+  word 2 and retains the sort checks. Invalid requests leave the live entries
+  and next node ID unchanged.
+- **N-TYPED-FP** — In F(8,24), pass two bit-derived NaNs (for example
+  `0x7fc00000` and `0xff800001`) and a directly constructed NaN and
+  require one live identity. Check both signed zeros and both signed
+  infinities, including agreement between bit-derived and direct specials.
+  Check packed finite bits with the smallest positive subnormal in F(8,24),
+  negative one (`0xbff0000000000000`) in F(11,53), and both the one-word
+  smallest positive subnormal and the two-word finite encoding
+  `(127 << 64) + 1` in F(8,65). Require the complete format and canonical
+  category in each result and exact bits only for finite nonzero values.
+  Test an F(8,24) value with an F(9,23) sort, which has the same total bit
+  width. Expect `kSortMismatch`, also for a non-FP sort. Null and foreign
+  sorts report their view errors without publication or ID consumption.
+- **N-NUMERIC-KEYS-AND-LIFETIME** — Keep unequal keys live under forced
+  collisions. Vary the Int sign, a low or high limb, the BV width, the FP
+  format or special category, and either rational component independently.
+  For each family, reconstruct a matching value from an independent util
+  owner and from the returned view. Require the same live node on each hit.
+  Move or destroy the original numeric source, grow the table, and verify
+  the borrowed results while a node owner remains live, including when the
+  facade is destroyed first. Exercise nonallocating queries with allocation
+  and retain fault hooks armed. Independently copied util values remain
+  exact after releasing the node.
+- **N-NUMERIC-BORROWED-ROTATE** — Create an Int literal for `2^64 + 1`,
+  destroy the source Integer, and pass the borrowed view of the live node
+  to `BitVector::RotateLeft` and `BitVector::RotateRight`. Use the BV5 value
+  `0b10011`. The count is 2 modulo 5, so the results are `0b01110` and
+  `0b11100`, both with width 5. This width detects truncation of the count
+  to its low word.
+- **N-NUMERIC-TAIL** — On the supported 64-bit layout, check the 56-byte
+  header and the count field's use of its four former padding bytes. Expect
+  64-byte blocks for `INT64_MIN`, `INT64_MAX`, and the BV and finite FP
+  word fixtures. Check the out-of-range one-limb Ints `2^63` and
+  `-2^63-1`, also 64 bytes, with the appropriate signs. Include
+  `-2^64` and `2^128+1` for two and three limbs, and a two-limb BV and
+  finite FP. Check tags, alignment, trimmed counts, order, and zero low or
+  interior limbs against hand-derived values. A wide view's limb span must
+  refer to the corresponding bytes of the live node block. Each FP special
+  requests 56 bytes with no payload tail, including on a wide format.
+  Warm the result sort and reserve table capacity through fixture setup.
+  With util inputs prepared before the call, require one candidate allocation
+  for a wide literal miss, no secondary numeric allocation, and no allocation
+  on an exact hit. Exercise a util GMP operation on a node-borrowed signed
+  magnitude and packed rational component and compare exact results with
+  the same operations on independently owned values while both owners live.
+- **N-NUMERIC-RATIONAL** — Convert `-6/-9` and `2/3` with an identical
+  RM child and format. Require one identity, a 16-byte rational tail
+  following the format indices, and an 88-byte block. Check zero
+  normalization, `INT64_MIN/1`, and `1/UINT64_MAX` in the same layout. For
+  `(2^64+1)/3`, `-3/(2^64+1)`, and
+  `-(2^64+1)/(2^65+1)`, check both trimmed counts, the sign, both
+  component spans, and requested block sizes of 104, 104, and 112 bytes.
+  Check a component just above the signed range using `2^63/1`. Borrow
+  the parameters after destroying the util input, and exercise both rebuild
+  forms with a different RM child. Drop the original and verify that the
+  rebuilt node's borrowed rational, format indices, and child remain exact.
+- **N-NUMERIC-STATS** — Use a manager with word and wide literals, FP
+  specials, and small and wide rational conversions. Compute live node,
+  edge, and `node_bytes` deltas from the independent sizes and fixture child
+  slots above. `numeric_backing_bytes` stays zero for those forms. Add a
+  GMP-backed wide builtin index as a control with nonzero external numeric
+  backing. An additional owner on a hit contributes zero bytes and edges.
+  Check that releasing some roots removes exactly the retired blocks and
+  edges, and releasing the last roots clears node and numeric backing bytes.
+  Keep table and metadata accounting separate. Use requested bytes for
+  correctness checks and the [allocation benchmark](../node/implementation.md#phase-1c-allocation-measurements)
+  for allocator size classes and the 48-byte header comparison.
+- **N-NUMERIC-ERRORS** — Check each `NumericError` mapping, including
+  invalid numeric input as a literal or parameter error, a zero denominator
+  as `kInvalidParameter`, `kSizeLimit` as `kResourceLimit/kSize`, and
+  `kCppAllocation` as `kResourceLimit/kCppAllocation`. Exercise actual
+  factory call sites where a util failure is reachable and the private
+  translation entry for any mapping without a reachable public error path.
+  Check exact indices
+  when a Node operand or parameter position is known, sentinel values for
+  unused positions, and `kNone` for the datatype reason. Keep a checked
+  width or format mismatch and an owning-handle reference overflow as
+  controls for errors originating in Node. Keep GMP termination tests
+  separate from recoverable fault injection.
+- **N-NUMERIC-ROLLBACK** — For word, special, wide literal, and both rational
+  layouts, fail each reachable project allocation and retain in a miss.
+  Use warmed fixtures both without and with required table growth. Force a
+  checked layout size failure with a limit between adjacent requested sizes,
+  and exercise limb-count conversion and byte-size overflow using bounded
+  layout inputs through the private peer. Fail the result retain on an
+  exact hit. For rational construction and changed rebuild, fail state
+  acquisition and the borrowed child retain after payload preparation, and
+  the applicable pre-transfer failures on the consuming path. After each
+  failure verify the error detail, exact survivor lookups, live node and
+  edge counts, requested node and numeric backing bytes, state and child
+  references, and next node ID. Source values and consuming input owners
+  remain intact. A candidate allocation is paired with one reclamation
+  or rollback free. Table capacity and valid derived sorts may remain.
+  Clear the fault and retry with the same input, checking the expected ID,
+  key, and references. Run the sweeps and reclamation under the existing
+  sanitizer acceptance configuration.
+
 ### Frontend component cases
 
 **NODE-DT-RECIPE01** checks that repeat views of a shared field recipe have
@@ -370,12 +658,20 @@ to an otherwise unbound name fails; no sequential binding is invented.
 (assert (= (twice 3) 6))
 ```
 
-The proposed frontend retains a defined-call identity and argument, with the
+The implemented frontend retains a defined-call identity and argument, with the
 formal and body owned in its definition environment. When a consumer later
 instantiates the body, both addition operands refer to the actual argument;
 no formal is free in the query root and the call is not a free UF. Capture,
-shadowing and definition-environment lifetime have separate tests. This is a
-proposed frontend integration case, not an existing NodeManager capability.
+shadowing and definition-environment lifetime have separate tests. This is a frontend integration case, not a NodeManager capability.
+
+For the implemented frontend Phase 1 body aliases, define two closed nullary
+names with the same typed BV body and assert their equality. Both operands
+must have the body's node identity, with distinct source occurrences.
+Repeat with a nullary alias whose body calls a definition with formals.
+The alias must resolve to that typed application, and the sealed query
+must still own its definition environment. Check shadowing uses the
+definition-site binding, invalid result sorts produce no binding, and a
+later model-value request resolves the same body under the owning context.
 
 ```smt2
 (declare-datatype Color ((red) (blue)))
@@ -493,25 +789,18 @@ Resetting the denominator to the small Integer(1) requires no allocation.
 | Representation and diagnostics | Static type checks cover the wide identities, counts, arities, and indices. A sort constructor and staged datatype header accept a parameter count beyond 32 bits without allocating its parameters. A bad operand and a bad indexed parameter report their positions, with `UINT64_MAX` in the unused field. |
 | Key isolation | Keep both candidates alive, alter one key field at a time, and re-query both. Include either extract endpoint, indices separated by one above 64 bits, either rational component, GMP BV and FP values with the same sort, and all five rounding modes. Generate wide integers that cancel under the original multiply-XOR recurrence and bound probes with natural hashing. |
 | Typing | Use declared fixture domains, type arguments and ranges for all six declaration categories. Check distinct datatype selector fields and tester links. Check a late variadic operand of the same category with an incompatible width or format, preserve a nested same-kind operand and edges in exact order, and infer a fresh result sort without allocating a node. Exercise a valid FP format with mismatched packed BV width, a null const-array qualifier, and a wrong-width element in store. |
-| Numeric boundaries | Force reduced GMP limb capacity around decimal and radix imports, decimal powers, shifts with a spare limb, and rational cross-products. Keep source values intact. Compare 129-bit values with equal upper chunks and query a past-end chunk. Derive rounding for early underflow at ±1/32 in FP(2,3), ties at 9 in FP(8,3), and the exact fraction at 1 + 1/2 + 2^-65 in FP(65,66). Check wide sign, exponent and fraction boundaries and backing-byte accounting. |
-| Failure atomicity | Sweep numeric C++ allocation checkpoints in every GMP-backed Node payload form. Fail a late retain beyond the inline child count and compare all counts and IDs before retry. Exhaust constructor, declaration, and implicit Bool sort identities independently during datatype commit while retaining a prior instantiated signature. |
+| Numeric boundaries | Check exact packed values and payload sizes, including inline Int, BV, FP and Rational limbs and external backing for wide indices. Run import, capacity, ordering and FP rounding cases in the standalone [util suite](util.md). |
+| Failure atomicity | Sweep allocation checkpoints for Node blocks with packed payloads and external wide indices. Fail a late retain beyond the inline child count and compare all counts and IDs before retry. Exhaust constructor, declaration, and implicit Bool sort identities independently during datatype commit while retaining a prior instantiated signature. |
 | Datatype productivity | A constructor requiring both B and C must wait for both. Use A → (B,C), B → base, C → A, then repair C with a base. A reverse-order chain becomes productive from its final base. |
 | Table and ownership | Delete a record from a capacity-16 cluster with homes 15, 15, 1, 15. Re-query survivors immediately after failed compaction and after growth. Compare batch and sequential release when few or no nodes survive, including replacement allocation failure. Exercise each metadata handle and ManagerRef as sole state owner, overflow through Attach and Child, and staged recipes after builder moves. |
 | Traversal | In a sparse graph with repeated roots, sweep visit-table allocation failures and compare the entire delivered prefix to a successful traversal. Check that errors are terminal and roots remain held until walker destruction. A postorder callback can retain a child and return an unchanged full NodeError. |
 
-With 64-bit GMP limbs, exercise the decimal import boundary at 19 and 20
-significant digits under a two-limb cap, for integer and fraction parsing.
-Check the last accepted length and the first rejected length at `INT_MAX`
-limbs using the import sizing calculation alone. Under a zero-limb cap, a
-radix word of value `2^63` fails with `kResourceLimit/kSize` and `2^63 - 1`
-still fits inline. With one limb available, the unsigned word is exact.
-Binary and hexadecimal spellings of `2^127` require a three-limb import.
-
-For FP(8,2), `(2^64 - 1)/(2^64 + 1)` rounds to 1 toward nearest and to
-3/4 toward zero. The nearest comparison requires a spare limb for the
-denominator-minus-remainder subtraction. A two-limb cap permits the
-toward-zero result and must report `kResourceLimit/kSize` for nearest. Check
-the extra limb required when incrementing the two-limb quotient of `7/3`
-in FP(8,65) and when biasing the two-limb exponent of 1 in FP(66,2). For
-directed overflow to the largest finite value in FP(2,130), test the limb
-boundary when constructing the fraction field.
+Standalone numeric calls use `NumericError::kSizeLimit` for a checked
+capacity failure. For example, binary and hexadecimal spellings of `2^127`
+occupy exactly two 64-bit limbs. Radix import succeeds at a two-limb cap and
+reports `kSizeLimit` below it. Derive working-limb requirements for decimal
+import and FP rounding from the current numeric operation. Preserve the
+mathematical expectations, including rounding `(2^64 - 1)/(2^64 + 1)` to 1
+under RNE and to 3/4 under RTZ in FP(8,2). The [util suite](util.md) owns
+numeric capacity tests. The [typed Node cases](#phase-1c-typed-literals-and-inline-numeric-payloads)
+cover Node's translation to its own error types.

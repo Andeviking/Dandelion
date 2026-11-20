@@ -1,10 +1,11 @@
 # SMT-LIB Frontend Design
 
-**Status: implemented frontend with pending contract refinements.** See the
-[implementation and acceptance record](implementation.md) and the
-[Phase 2 test design](../testing/frontend.md#phase-2-test-design). This
-document specifies one user query over quantifier-free Core, BV, FP and
-rounding modes, Int, extensional arrays, UF and inductive datatypes,
+**Status.** Phase 2 uses fused command reading.
+The [implementation record](implementation.md) describes the implementation
+and its verification. The [Phase 2 test design](../testing/frontend.md#phase-2-test-design)
+defines acceptance. This document specifies one user query over
+quantifier-free Core, BV, FP and rounding modes, Int, extensional arrays,
+UF and inductive datatypes,
 including their supported combinations. General Real and String terms,
 user quantifiers, higher-order
 input, recursive function definitions, and user-level incremental sessions
@@ -18,9 +19,8 @@ Theories and logic revisions are pinned independently in
 builders. It accepts a solver callback and a model provider interface.
 Production solving and model implementation remain separate work.
 
-The sections marked **overhaul contract** specify adopted changes awaiting
-implementation. Their test-first cases are in the
-[frontend overhaul test design](../testing/frontend.md#frontend-overhaul-test-design).
+The [Phase 2 design](#phase-2-fused-command-reading) specifies the active
+command path. The compact syntax section records the Phase 1 representation.
 
 ## Architecture and interfaces
 
@@ -30,19 +30,18 @@ checked before its effects become visible. The driver invokes the solver at
 This is still a single-query interface: it does not add `push`, `pop`, or a
 second `check-sat`.
 
+The following components share the command boundary.
+
 ```text
-reader -> scanner -> command syntax -> driver -> elaborator -> NodeManager
-                                        |              |
-                                      solver <--- sealed query
-                                        |
-                                  retained model -> model bindings
+Reader -> scanner -> grammar frames and semantic reductions -> NodeManager
+                               |
+                       committed TypedCommand -> Run -> solver and sink
 ```
 
-A parser-only consumer uses the same command parser without invoking a solver.
-It can inspect commands and typed query structure, but cannot claim to resolve
-a later model-generated value without the corresponding model. A separate
-whole-file validator may inspect a finite script where requested; it is not a
-precondition for normal command execution or a second parser.
+A parser-only consumer uses the same reader to inspect typed commands and
+the query. A later model-generated value requires the corresponding
+model. The independent `SyntaxValidator` serves grammar-only consumers
+through the same scanner and frames.
 
 The reader can return available bytes, a short read, EOF, or an I/O error; it
 must not wait for its entire buffer to fill before returning available input.
@@ -62,30 +61,27 @@ Their acceptance of a particular input is evidence, not the project contract.
 The C++23 module `dandelion.frontend` exposes these responsibilities.
 
 - The solver-independent frontend session owns its reader state, name
-  environments, source records, definitions, assertions and NodeManager
-  reference. `NextSyntax()` returns a public `CommandHeader` with the
-  command kind and span. The session keeps the parsed syntax pending.
-  `Apply()` resolves and types it using the applicable model bindings and
-  publishes its effects atomically. The driver checks runtime prerequisites
-  and calls these entry points in order. Borrowed-byte and reader adapters use
-  the same scanner and parser.
+  environments, optional source history and the typed query builder with its
+  NodeManager reference. `ReadCommand()` scans and types one command,
+  publishes its effects atomically and returns the committed descriptor.
+  `Session::Run()` checks result-dependent prerequisites and dispatches
+  responses. The independent `SyntaxValidator` shares the lexer and
+  grammar frames and returns command headers.
 - At `check-sat`, seal the query into an owning `QueryContext` with assertion
-  roots, profile, original signature, definition table, manager and necessary
-  provenance. The synchronous engine borrows a `const QueryContext&` for
+  roots, profile, original signature, parameterized definition templates,
+  datatype groups, options and manager. The synchronous engine borrows a `const QueryContext&` for
   the call. The typed check command, session and any retained model share
   context ownership. Neither the query nor a model
   may outlive the semantic information required to interpret its nodes.
-- A nonrecursive definition owns its typed body, ordered formal identities,
-  rank and definition identity. Defined applications retain the definition
-  identity and typed arguments. Definitions and source aliases are separate
-  from user-declared free functions and are not added to `get-model` as
-  independent uninterpreted symbols. See [binding](#environments-commands-and-binding).
+- Nullary definitions and `:named` introduce direct-body aliases.
+  Parameterized definitions own a declaration, formals and body and use
+  saturated calls. Only original free declarations receive `get-model`
+  entries. See [binding](#environments-commands-and-binding).
 - A source span has a source ID, half-open byte offsets and start/end line and
-  byte-column coordinates. Retain command, declaration and assertion
-  provenance where required. Separate source occurrences may share a node.
-  Preserve a value request's input rendering through its response so a driver
-  can print the requested term without replacing its source definitions.
-  Reader windows and scratch do not outlive a command unless explicitly owned.
+  byte-column coordinates. Successful occurrence records are session-owned
+  and opt-in. Keep transient locations for diagnostics and each value
+  request's normalized input rendering and span through the response.
+  Reader windows and command scratch are borrowed within their lifetimes.
 - A retained model owns the manager state, original-query and recovery data,
   declaration and definition interpretations, and any model values it needs.
   After a successful check, later requests can refer to terms absent from the
@@ -111,7 +107,7 @@ runner may separately require a complete single-query input.
 | Form | Admission and effect |
 | --- | --- |
 | `set-logic L` | Once before logic. Resolve the case-sensitive name against the [registry](#logic-registry-and-conformance). `ALL` selects the supported profile. A logic-dependent command before selection or a repeated selection is an error. |
-| `set-info :key [value]` | Before logic, building or after check. Preserve metadata order and repetitions. `:smt-lib-version` accepts exact decimal spellings `2.6` or `2.7`; `:source` accepts a string or quoted symbol; `:category` accepts the strings `"crafted"`, `"random"` or `"industrial"`; `:license` accepts a string; `:status` accepts `sat`, `unsat` or `unknown`. A different well-formed version is unsupported; wrong token/value forms are invalid. Other well-formed keys are opaque attributes. Status metadata never establishes a solver answer. |
+| `set-info :key [value]` | Before logic, building or after check. Validate attributes using the [metadata rules](logic-profile.md#metadata). Category accepts strings by default, including `"check"`, with a strict opt-in enumeration. Capture ordered metadata, including repetitions, only when requested. Status is advisory. |
 | `set-option :print-success true/false` | Apply immediately in any live state; its new value controls this command's acknowledgement. Default false. |
 | `set-option :produce-models true/false`, `:global-declarations true/false` | Supported in before-logic state, default false. With one permanent declaration level, both global-declaration settings have the same scope effect. An unsupported option setting terminates after `unsupported`. |
 | Fixed-false standard options | Before logic, accept `false` for `:interactive-mode`, `:produce-assertions`, `:produce-assignments`, `:produce-proofs`, `:produce-unsat-assumptions`, and `:produce-unsat-cores`. Their value remains false; setting one to true is unsupported. |
@@ -122,7 +118,7 @@ runner may separately require a complete single-query input.
 | `define-sort`, `define-fun`, `define-const` | Building only. Validate fresh names, parameters, rank, scopes and body before publishing the definition. Definitions are nonrecursive; `define-const` is the zero-parameter form. |
 | `declare-datatype`, `declare-datatypes` | Building only in a DT profile. Validate and commit the group atomically. |
 | `assert t` | Building only. Require a closed Bool root in the selected assertion profile and append it in input order, including duplicates. |
-| `check-sat` | Building only, once. Freeze the query signature, roots and model option, call the solver and emit its result immediately. A second check, declaration, definition or assertion after it is an invalid state. |
+| `check-sat` | Building only, once. Freeze the typed query, release textual lookup if model production is disabled, and let the driver call the solver and emit its result immediately. A second check, declaration, definition or assertion after it is an invalid state. |
 | `get-model`, `get-value (t...)` | After check and with model production enabled. A value request has a nonempty list of well-sorted, closed, monomorphic, quantifier-free terms in the active signature and supported project profile. A canonical negative Int in a QF_UFIDL value request uses the documented value-input exception. Same-model abstract values returned earlier may be resolved in this model-query scope. The profile excludes `:named` on value requests. |
 | `exit` and EOF | `exit` with no arguments emits `success` if enabled and terminates immediately in any state; no later token is processed. EOF at a command boundary terminates normally. EOF inside a command is an input error. |
 | Excluded commands | Report `check-sat-assuming`, `push`, `pop`, `reset`, `reset-assertions`, recursive definitions, global sort parameters and proof/core/assignment commands as unsupported. Malformed forms are syntax errors. |
@@ -150,7 +146,7 @@ The driver processes a valid prefix in order:
    response are published together after the complete response is written
    and any sink flush succeeds. An inspection session opened with
    `ForModelText` or `ForModelReader` uses the owner it was opened with.
-   `Apply` rejects a different owner even if it shares the same query.
+   `ReadCommand` rejects a different owner even if it shares the same query.
    `get-model` covers the current user-declared function and
    constant signature, including unused declarations.
 4. After `unsat`, model inspection is an invalid state. After `unknown`,
@@ -209,6 +205,10 @@ not that every input under those labels is accepted. In particular, general
 Real and String solving remain outside scope. Supported FP ranks can accept the
 specified closed rational conversion operand without admitting Real terms.
 
+Validate metadata syntax and recognized value forms from the pending
+command's token views. Render and retain owned attribute text only for source
+capture. The strict category check uses the same token views.
+
 Check signature and source-sort gates throughout elaboration, including
 unused bodies and arguments. Do not expand definitions or reject supported
 integer operations to enforce the declared label's narrower assertion shape.
@@ -261,7 +261,7 @@ interval. Token references are independent of window movement.
   and failure cleanup. Grammar checking sees the complete command before
   semantic publication. After `exit`, do not tokenize or validate a tail.
 
-#### Paged compact syntax (overhaul contract)
+#### Paged compact syntax (Phase 1)
 
 Append token records, expression records, ordered child references and owned
 reader spelling bytes to per-command paged storage. Existing pages stay in
@@ -279,8 +279,8 @@ the compact representation. Preserve logical addresses, half-open spans and
 ordered child ranges across widening. Check overflow before storing fields
 and report an actual allocation or representation failure through the existing
 resource boundary. The command owns this storage through parsing and apply.
-Copy any spelling needed by a published command or query into its owning
-storage before releasing syntax pages.
+Copy spellings needed by a published binding, response or source record
+into their owning storage before releasing syntax pages.
 
 Under `DANDELION_FRONTEND_TESTING`, `Session::ForceSyntaxPromotionThreshold`
 accepts a `std::uint64_t` threshold and is `noexcept`. Crossing it exercises
@@ -293,8 +293,19 @@ start at zero.
 
 ### Environments, commands, and binding
 
-Separate sort and term maps own canonical names and have heterogeneous
-lookup by spelling. The scope map borrows command-local names and points to
+Separate sort and term `NameTable` indexes support heterogeneous lookup
+by canonical spelling. A lookup probes with a view, compares the full key
+on a hash hit and never inserts a missing token. Keep entries compact with
+a borrowed spelling or a stable pool reference and a tagged binding index.
+The common free and parameterized declaration entries borrow
+`DeclView::GetNameHint()` when it is the exact canonical key and its storage
+remains stable for the table lifetime. The owning manager outlives these
+views. Store alias and other ineligible spellings once in stable frontend
+storage. Term entries distinguish declaration instances, datatype bindings
+and direct-body alias ordinals. Creating a free declaration does not create
+its application node. Store owning alias nodes in dense root storage.
+Rehashing preserves binding ordinals and borrowed spelling
+lifetimes. Use full structural index widths or an exact wide fallback. The scope map borrows command-local names and points to
 binding records by stable index. An undo vector and frame marks restore the
 previous visible binding heads. The active signature reserves its unindexed names in the
 corresponding namespace. An indexed identifier has a distinct identity from
@@ -307,27 +318,32 @@ own frame. Quoted reserved tokens are usable where their canonical names
 pass these same rules. Pattern heads and symbolic tester indices resolve
 against the datatype signature associated with the scrutinee.
 
-A command transaction owns its new entries, roots, occurrences and changes
+A Phase 1 command transaction owns its new entries, roots, optional occurrences and changes
 to command state. Named subterms use pending term entries visible within
 the current transaction. Reserve or initialize all final frontend entries
-before publishing. Use indexed pending records and an undo journal keyed by
+before publishing. Source capture appends only when enabled. Keep append
+marks for each affected source collection, and roll back with their owning
+strings and handles while rolling back the semantic changes. Use indexed
+pending records and an undo journal keyed by
 canonical spelling, independent of map rehashes. Record each insertion
 before its next fallible action. Restore visible scope heads and logical
 record counts to their frame marks. Erase inserted slots by spelling with
 the command arena still live. On commit, disarm the journal. Capacity growth
 and IDs consumed by independent node factories can remain in the private manager until it is released. Failure consumes
 no frontend-visible declaration, label, assertion, option change or event.
-The driver releases the committed prefix when the session ends.
+The driver releases its prefix ownership when the session ends. Compile
+fault-injection `Checkpoint` calls out of non-testing builds at the call
+site. Testing builds keep the hooks for failure and retry coverage.
 [Node guarantees and exceptions](../node/design.md#7-errors-and-factory-guarantees)
 
 - For `let`, validate binder names and resolve each RHS from left to right
   in the outer lexical frame. Earlier valid inline names are visible in
   later RHSs. Install the resulting local binding heads together for the
-  body. Substitution reuses the owning RHS nodes. Leave a transient
-  binding identity and RHS link on each local reference for closure and
-  component inspection.
+  body. Substitution reuses the owning RHS nodes. Carry the used binding's scope and RHS dependency marks for closure.
 - For `define-sort`, resolve the body against the prior sort environment
-  plus distinct fresh parameter slots. Store a flat acyclic DAG recipe
+  plus distinct fresh parameter slots. Bind nullary aliases immediately to
+  the resolved concrete `Sort` and register the canonical name as a model
+  abbreviation candidate. For parameterized aliases, store a flat acyclic DAG recipe
   with bound constructor identities, constants, and one shared leaf for
   each parameter identity. Repeated uses of that parameter reference its
   leaf, and substitution reuses the same actual expression for each use.
@@ -340,85 +356,68 @@ The driver releases the committed prefix when the session ends.
   of its own. Memoization avoids repeating the same recipe and fixed
   substitution, but cannot avoid constructing genuinely different concrete
   sort instantiations generated by distinct substitutions.
-- For `define-fun` and `define-const`, resolve rank and body in the prior
-  environment plus distinct ordered formal declarations. Reserve the new
-  name for collision checking but exclude it from lookup in its own body;
-  definitions may refer only to earlier definitions, so the definition graph
-  is acyclic. A formal can shadow a user function, and duplicate parameters
-  fail. Check the complete body even when the definition is never used.
-- Represent a definition by an owning record containing its rank, formal
-  identities and typed body. The frontend uses a fresh internal
-  declaration and an ordinary typed `kApply` for each definition call; a
-  query/session-owned table maps that declaration identity to its definition.
-  The zero-argument form is a zero-argument application. Check arguments at
-  each call, but do not instantiate the body merely to construct the call.
-  Existing `FreshFunction`, `MakeFormal` and `MakeApply` provide relevant
-  node primitives. The frontend context owns the definition table. A declaration with a table entry has its defined meaning,
-  not the interpretation of a free or unconstrained UF.
-- Pass the owning definition environment alongside any query, retained term
-  or model containing such applications. Solver preprocessing may expand a
-  needed call with capture-safe simultaneous substitution and a memo for
-  that environment, or use another semantically exact method. Only bodies
-  contain open formal placeholders; query roots themselves are closed.
-  An unused definition is typed but need not be expanded. Nested definition
-  applications preserve earlier symbol identities even under caller
-  shadowing. Full expansion of a used compressed definition can still require
-  exponential work or storage; DAG sharing and local memoization are not a
-  general bound. No artificial expansion budget substitutes for a sound
-  representation or correct failure handling.
-- For `(! t attributes...)`, require at least one attribute. Treat
-  `:pattern` as unsupported, and preserve other nonsemantic attributes
-  in the flat owned metadata format, with optional standard attribute
-  values. Allow one `:named` in an annotation form, with a fresh symbol
-  operand and a closed child of any admitted sort. A second attribute
-  with this key on the same form is invalid. Reserve the pending
-  declaration name too, so a label in a definition cannot collide
-  with the definition being elaborated. Add the alias after its child
-  and the annotation's own required checks, at that left-to-right
-  postorder event. Later siblings, branches and commands can refer
-  to it. Lexical locals can shadow the published alias. Instantiation
-  of a macro body never republishes annotations already processed
-  in the defining command.
+- For `define-fun` and `define-const`, reserve the fresh canonical name
+  for collision checks and exclude it from lookup in its own body. Resolve
+  parameter and result sorts and elaborate the entire body under the prior
+  environment and ordered distinct formals. Check declared result sort and
+  validate closedness under that binding scope, including unused bodies.
+  A formal can shadow a user function. Reject duplicate formals and self
+  or forward references.
+- A nullary definition binds its canonical name directly to an owning
+  body `Node`. This global alias has no declaration, instance, template
+  or application wrapper. A reference reuses the body root and checks any
+  qualifier against its sort. Positive arity is invalid. Apply the existing
+  identifier grammar for a zero-argument reference.
+- A parameterized definition stores `DefinedFunction { Decl decl;
+  std::vector<Decl> formals; Node body; }` and constructs saturated
+  `kApply` calls using the resolved declaration instance. Use
+  `FreshFunction`, `MakeFormal` and `MakeApply` with checked ranks.
+  Query consumers interpret calls through the matching template. They
+  may substitute simultaneously in the fixed argument environment
+  with scoped memoization or use another exact strategy. Expansion of
+  used compressed definitions can take exponential work and storage.
+- For `(! t attributes...)`, require at least one attribute. Reject
+  `:pattern` as unsupported. Validate ordinary attributes as syntax data
+  and save their text only when source capture is enabled. Allow at most
+  one `:named` per form, with a fresh symbol and a closed child of any
+  admitted sort. Check collision with any pending definition name.
+  Enter the alias through the same owning direct-body binding as a nullary
+  definition, after its child and the annotation's checks. Later siblings,
+  RHSs, branches and commands see the alias in left-to-right postorder.
+  Lexical locals can shadow it. Looking up an alias or calling a definition
+  never republishes a source name or annotation.
 
-For the `:named` closedness test, walk the *resolved source* operand
-iteratively before relying on the expanded node. Each lexical reference
-records its binder ID, the binder's source region and its binding category.
-A reference to a binder outside the operand makes it open, including a
-formal, an outer `let` binding with literal RHS or an enclosing match
-variable. Global declarations, resolved definitions and prior closed
-aliases require no closure walk into their definitions. Check application
-arguments as source expressions. For a `let` inside the operand, enter
-through the body and follow a local binding's RHS only when that binding
-is used, using the recorded outer resolution of the RHS. For a `match`
-inside the operand, examine the scrutinee and all branch bodies, treating
-each pattern identity as bound only within its branch. Attribute values
-are syntax data. A visited set of resolved operand records and RHSs is
-local to this check. The standard's dependency rule for
-`let` makes a name around `(let ((unused x)) 0)` closed even when
-`x` is bound outside, while naming the occurrence `x` directly fails.
-For nested annotations, reuse a successfully verified closed inner source
-occurrence instead of walking it again for every enclosing `:named`. Cache by
-resolved occurrence and its lexical context, never by a shared NodeId alone.
-Continue to type all written operands and publish annotation events in source
-order; the closure cache does not skip those obligations.
-All source RHSs and branches are independently resolved and typed,
-including those skipped by the closure walk. [SMT-LIB §§3.6.2, 4.1.6](https://smt-lib.org/papers/smt-lib-reference-v2.7-r2026-09-09.pdf),
-[topic 4](topic-research.md#4-symbols-scopes-definitions-and-annotations)
+#### Frame-local operands and closedness
 
-#### Frame-local elaboration (overhaul contract)
+Keep owning operands in active frames and release completed scratch after
+its parent and any pending publication have acquired the result. For source
+occurrences in a lexical binder scope, track the earliest enclosing binder
+region on which each completed result depends, or an empty escape mark.
+Order marks by source-region entry so the minimum identifies the outermost
+dependency; regions containing a use are nested. Local uses include the
+binding's own region and, for a let binding, its outer-resolved RHS mark.
+Combine all written application operands, including unused actuals.
+Qualifiers and attributes add no dependencies. Resolved globals and prior
+closed direct-body aliases introduce no lexical dependency.
 
-Keep transient term owners, resolved operands and scope marks in the active
-elaboration frames. A parent collects its completed children in source order.
-Release a finished frame's storage after its parent and pending publication
-records have acquired the needed results. Keep the source dependency records
-needed for a pending closedness check across frame exits, including lexical
-binder identities and the outer-resolution links of used `let` RHSs. Reuse
-the closedness result of an already checked nested annotation by occurrence.
-The annotation visit count for a chain of `n` named annotations on a leaf
-remains `n`. Unused RHSs and branches made unreachable by first-match
-semantics still participate in typing, annotation checks and transactional
-publication. A later failure discards all pending names and occurrences from
-that command and restores the earlier lexical visibility.
+At a let body boundary, drop the let's mark if no earlier mark survives.
+Only used RHSs contribute through local references. At a match boundary
+combine the scrutinee and the result of every written branch after clearing
+that branch's local pattern dependency. Propagate an outer dependency even
+from a branch omitted in first-match lowering. A `:named` operand must
+reach the annotation with an empty escape mark. For example, within a scope
+binding `x`, naming `x` fails even when its RHS is a literal. Naming
+`(let ((unused x)) 0)` succeeds, provided the unused RHS type-checks. Check
+each annotation occurrence during reduction. Node identity alone cannot
+determine closure, and no secondary dependency walk is needed.
+
+Use a node-only specialization for binder-free elaboration, with no mark
+storage or propagation per operand. Switch to dependency-bearing frames for
+active binder scopes, including formal bodies, let bodies and binding match
+branches. Nested named annotations reuse the reduced dependency result.
+All written terms remain subject to validation and any later command
+failure rolls back pending aliases and captured occurrences.
+[SMT-LIB §§3.6.2, 4.1.6](https://smt-lib.org/papers/smt-lib-reference-v2.7-r2026-09-09.pdf)
 
 ### Sorts, ranks and node construction
 
@@ -429,7 +428,16 @@ node validation in NodeManager for independently callable entry points.
 A single resolved factory call supplies final arity, compatibility,
 index, payload and result-sort checks where applicable. Use
 `CheckBuiltin` only when a caller needs a checked result sort without
-constructing a node. A general SMT type constraint solver is unnecessary.
+constructing a node. Use `MakeWordIndexedBuiltin` for indices that fit
+an unsigned word when the request needs neither a qualifier nor a rational
+payload. Other requests use the general factory. Decode literals of
+word-sized BV widths directly to a word for `MakeBvWordValue`. Preserve
+exact wide decoding and width reduction for indexed literals. Borrow
+`SortView` values from resolved owning sorts
+through declaration construction. The factory validates and stores the
+semantic rank, and the declaration outlives parser rank scratch. These
+NodeManager entry points are the target boundary for Phase 1. Preserve
+factory error category and operand/index attribution on both paths.
 
 1. Resolve sort identifiers, including exact BV and FP parameters and the
    four FP aliases. Expand aliases and instantiate in declared argument
@@ -480,30 +488,22 @@ constructing a node. A general SMT type constraint solver is unnecessary.
    `fp.eq` versus Core equality, adjacent chains, n-ary `distinct`,
    and `fp` or `to_fp` even with constant bit operands. No frontend
    rewrite changes symbol meaning or substitutes a value for an underspecified
-   operation. Raw `MakeFpBits` has no direct textual
-   request. Defined calls and model-only abstract values use internal
+   operation. Programmatic packed FP literals use
+   `numeric::FloatingPointValue::FromBits` and `MakeFpValue`. Defined calls
+   and model-only abstract values use internal
    declarations through their respective identity tables, never as free UF.
    [Node operator map](../node/operators.md),
    [SMT-LIB §3.6.3 and Figure 5.3](https://smt-lib.org/papers/smt-lib-reference-v2.7-r2026-09-09.pdf)
 
-#### Pooled declarations and concrete sorts (overhaul contract)
+#### Semantic declaration storage and concrete sorts
 
-Keep a compact user function record with its declaration identity, provenance,
-name reference and rank range. Pool the published source spelling and the
-rendered rank spellings in query-owned storage. The declaration record has
-no per-declaration `std::vector<std::string>` and shares spelling storage
-wherever the same bytes suffice. Preserve the raw quoted spelling for public
-readback and the dequoted spelling for lookup. Views remain valid for the
-lifetime of the query that owns the records. `UserFunction::source_name`
-supports equality with `std::string_view` and `std::string`.
-`UserFunction::source_rank` supports equality with
-`std::vector<std::string>`, `.size()`, indexing, `.back()` and range
-iteration. Domain spellings are in declaration order, followed by the result
-spelling. Maintain full spelling equality on hash collisions. Publish the
-record, spellings and lookup entries as one transaction. `HasFunction` uses
-the same-manager declaration identity and tolerates gaps occupied by
-definitions, formals, datatype declarations or IDs consumed by failed
-commands.
+Append owning `Decl` and `SortConstructor` values to the free signature.
+Keep declaration provenance and declared rank spelling in optional source
+records. `HasFunction` uses the same-manager declaration identity and
+tolerates gaps from templates, formals, datatype declarations and failed
+commands. Store parameterized templates in publication order with an
+internal declaration index for lookup. Count and ordinal access permits
+block-backed storage without relocation of all templates at growth.
 
 Cache resolved concrete sort forms such as `(_ BitVec 32)` and
 `(_ FloatingPoint 8 24)` in bounded frontend storage. Include all data
@@ -513,20 +513,10 @@ parameters, unresolved recipes and failed resolutions out of the concrete
 cache. Eviction permits ordinary resolution on a later miss. Under
 `DANDELION_FRONTEND_TESTING`, `sort_cache_hits` counts successful reuse.
 
-#### Commutative canonicalization (overhaul contract)
+#### Commutative canonicalization
 
-The module exports the following options type.
-
-```cpp
-struct ParseOptions {
-  // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
-  bool canonicalize_commutative = false;
-};
-```
-
-Both `Session::FromText` and `Session::FromReader` retain the existing
-overload with an optional source ID. Each also accepts `ParseOptions`
-before the optional `std::uint32_t` source ID. Enabling the option
+`ParseOptions::canonicalize_commutative` defaults to false for text,
+reader and model inspection adapters. Enabling the option
 canonicalizes typed terms before publication,
 including assertions, definition bodies, named and annotated terms, and value
 requests. Source order governs elaboration, diagnostics, annotation events
@@ -534,10 +524,12 @@ and rendering in both modes.
 
 The standalone pass takes an owning manager reference and returns owning
 results for the same manager, in input root order. It visits children before
-parents and reuses the result for shared subgraphs. Rebuild changed ancestors
-through the checked node factories with the original kind, payload and
-declaration identity. This permits parent merges even when the parent itself
-has no commutative positions. Keep the input handles and their DAG valid.
+parents and reuses the result for shared subgraphs. Use the same
+commutative-position policy in the parser and standalone pass. Rebuild
+changed ancestors with `NodeManager::RebuildNode`, preserving kind, payload,
+indices, qualifier and declaration identity. This permits parent merges
+even when the parent itself has no commutative positions. Keep the input
+handles and their DAG valid.
 
 ```cpp
 Outcome<std::vector<Node>> CanonicalizeCommutative(
@@ -562,6 +554,37 @@ order, including UF and datatype applications, `ite`, implication, ordered
 comparisons, subtraction, concatenation and array operations. Under
 `DANDELION_FRONTEND_TESTING`, `commutative_canonicalizations` observes actual
 operand reorderings by a session.
+
+#### Semantic rank rendering
+
+Format model signature ranks from the declaration's ordered semantic domain
+and range under the sealed sort namespace. Use canonical declared names
+with necessary quoting. Keep no parse-time `sort_spellings` map or
+mandatory source-rank renderings. Index nullary candidates by concrete sort
+identity and parameterized candidates by recipe height when rendering starts.
+Match each recipe and concrete sort pair bottom-up. Cache its unique
+substitution or failure for the response. Merge child substitutions and
+reject conflicting bindings for repeated parameters. Concrete constructor
+identities must agree. Place the inferred arguments in parameter order and
+use `Bool` for unused parameters. An inferred argument must be a strict
+subsort of the rendered sort. In particular, a parameter-root identity
+recipe cannot spell `S` as `(Id S)`.
+
+Memoize each concrete sort's bottom-up spelling plan and count of sort heads
+per response. Use the ordinary spelling as the initial choice. Inferred
+applications must reduce that count relative to ordinary syntax. Compare
+candidates by head count, then quoted head length. Prefer ordinary syntax
+on an exact score tie with ordinary syntax and order tied aliases by
+canonical name. Saturate head counts for comparisons without constructing
+expanded candidate strings. Prune recipes taller than the concrete sort.
+Once at most two heads suffice, the only competing parameterized aliases
+have one atomic argument. Skip recipes whose height deficit exceeds the
+maximum height of an atomically spelled strict subsort. Keep the existing
+shared-recipe scale checks. Emit selected plans iteratively. A chain of
+nullary aliases for successively doubled array sorts can therefore print
+the top alias without unfolding the shared rank.
+All spelling choices resolve to the same sort in the sealed signature.
+This applies equally to declared ranks and generated sort ascriptions.
 
 ### Datatype publication and match
 
@@ -651,10 +674,12 @@ to parse source.
   source `(- n)` as an Int operation. Import binary and hexadecimal digits
   exactly, preserving their full declared width. Validate independent radix
   helper inputs even when the scanner has already validated its source.
-- For `(_ bvN w)`, require `w > 0` and `bit_length(N) <= w`; do not
-  allocate `2^w` merely to test the bound. Preserve exact rotate and
-  divisibility indices. Invalid indices and a valid size that an existing
-  representation cannot hold have different outcomes.
+- For `(_ bvN w)`, require `w > 0` and reduce the exact unsigned numeral
+  modulo `2^w` before constructing a Node value. Word-sized widths use
+  unsigned accumulation and masking. Wider values use the low bits of the
+  exact magnitude. Preserve exact rotate and divisibility indices. Invalid
+  indices and a valid size that an existing representation cannot hold
+  have different outcomes.
 - Parse BV widths and FP format indices exactly before any narrowing.
   The current NodeManager uses `uint32_t` for BV widths, FP components and
   their sum, and this existing representation is the selected baseline.
@@ -700,8 +725,9 @@ successful values and retain each use's source occurrence independently.
 An oversized literal takes the ordinary exact path and bypasses admission.
 On eviction, a later use takes the ordinary path. The entry and key-size
 bounds govern cache admission and retention. The input language still accepts
-every mathematically valid representable literal. Under
-`DANDELION_FRONTEND_TESTING`, `literal_cache_hits` counts successful reuse.
+every mathematically valid representable literal. All builds use the same
+admission policy for word-sized and wider values. Test builds additionally
+count successful reuse in `literal_cache_hits` and support fault injection.
 Allocation failures in caching or publication follow the existing resource
 diagnostic and command rollback rules. A later command may retry the same
 input successfully.
@@ -736,17 +762,243 @@ These representation limits do not authorize separate input,
 work or memory quotas, and they must be stated when describing supported
 inputs rather than claiming every mathematically valid width is representable.
 
-#### Query teardown (overhaul contract)
+#### Seal cleanup and teardown
 
-When the final owner drops a query, batch-release the owning term handles
-from assertions, definitions, named terms and annotations through
-`NodeManager::ReleaseRoots` while the manager reference is live. Repeated
-handles are separate references and each is consumed once. The batch must
-respect any independently retained root or child. With no surviving nodes,
-the manager can detach the grown unique table while a separate manager
-reference remains available. Query destruction must remain nonthrowing. If
-batch preparation cannot allocate, ordinary handle destruction still
-releases the query's references.
+Perform fallible preparation for sealing before publishing the sealed query.
+With model production disabled, batch-release the dense alias roots through
+`NodeManager::ReleaseRoots` while the manager is live, then discard textual
+term and sort storage, abbreviation indexes and other lookup scratch.
+Prepare the release so no allocation is required after commit. With model
+production enabled, share the frozen environment with the sealed context for
+detached inspection. On a failed seal, retain the prior phase, roots, aliases
+and source history. Independently captured records keep their own roots in
+either mode.
+
+At final teardown batch-release owners from the query's assertions and
+parameterized definition bodies, the inspection environment's aliases, and
+any captured roots when their respective owners are destroyed. Each slot
+is a distinct owning reference. Keep an appropriate manager reference
+alive for each batch. Release preserves separately retained handles and
+shared children. With no surviving nodes the manager can detach the grown
+unique table even if an independent manager reference survives. Destruction
+is nonthrowing and may use ordinary handle destruction if batch preparation
+cannot allocate.
+
+## Phase 2 fused command reading
+
+The [public protocol](semantic-interfaces.md#phase-2-command-processing-and-publication)
+replaces pending syntax with a single typed `ReadCommand`. The scanner and
+grammar share a command boundary with semantic reduction.
+
+The selected frame and operand layout follows the command-at-a-time
+reduction observed in Bitwuzla 0.8.0. Dandelion uses one contiguous operand
+buffer and frame-specific uncommon state to avoid a large work record
+per operand. Online coordinates preserve locations when window bytes
+expire. Keeping pre-close bindings private also makes publication safe
+for Dandelion's user-supplied Reader callbacks.
+[Frontend architecture review](/pub/netdisk2/zhangx/dandelion-frontend-bench/qf_bv_compare/review_philosophy_frontend.md)
+
+```text
+Reader -> lexer -> grammar frames and semantic reductions -> NodeManager
+                               |
+                     closing delimiter and checks
+                               |
+                       committed TypedCommand -> Run
+```
+
+### Iterative scanner and frame storage
+
+The lexer keeps a running checked 64-bit offset, line, and byte column. Start
+at offset 0, line 1, column 1. Consuming CR advances the line and resets the
+column to 1. A following LF advances only the offset, even across a refill.
+A lone LF starts a new line. Other bytes each advance the byte column,
+including the bytes of a multibyte scalar. Retain the scalar's start before
+any refill. Invalid leading bytes, incomplete or malformed sequences and
+invalid scalar encodings use the existing point diagnostic at that start
+(both endpoints equal). Reader I/O failures use the current point and keep
+the returned error code when supplied. The scanner carries the partial
+scalar, quote lookahead, pending CR and token state across refills.
+
+A token carries its kind, raw lexeme and begin/end marks. The text adapter
+borrows source bytes. The Reader adapter borrows its current window until
+refill and uses reusable scratch for a split token, including one-byte
+lookahead after a closing string quote. Finish all uses of a borrowed
+lexeme before the next token or refill. Decode numeric payloads and look up
+canonical names in place. Own spelling only for split lexemes, pending
+binders and identifiers whose semantic use crosses a refill, requested
+`echo` or `get-value` text, and opt-in source records. Copy a newly introduced
+permanent name directly to its stable owner or move its already-owned
+pending spelling there. Identifiers resolved early travel as identities.
+
+Use a stack of grammar frames with role, next slot or list state, start
+mark and scratch bases. Roles include command, term, application head,
+indexed/qualified identifier, sort, binder list, match pattern and branch,
+datatype headers and fields, attribute, and opaque S-expression. Drive the
+stack by consuming a token, shifting a slot or pushing a nested frame, then
+reducing completed frames. Record grammar progress before a fallible
+semantic action so a failure can resume at the next grammar event. Grammar
+roles and checks depend on tokens and
+parent slots, so the same frame machine operates with semantic actions
+disabled. Fixed arities and required lists are checked at their
+grammar-defined boundaries. Recognized excluded forms still validate their
+grammar. The command frame consumes its closing `)` and returns without a
+trailing trivia scan or lookahead.
+
+The typed loop advances grammar and reduction state in the same frame.
+`SyntaxValidator` uses the shared grammar operations with grammar-only
+frames. Ordinary leaves and applications reduce directly from the token
+view and operand suffix. A parallel `let` stores each pending binder's
+canonical spelling in reusable stable pages. It releases the pending
+binder records when the list closes and reclaims their spelling space
+when leaving the scope. Indexed operators decode numerals as they arrive
+and preserve the written index marks. An indexed BV literal borrows the
+digits through its width and closing delimiter. The scanner copies them
+to a reusable buffer if a refill or split-token scratch would otherwise
+invalidate the view.
+
+Use one reusable contiguous buffer of owning `Node` slots for completed
+operands. Each active term frame remembers a base, addresses its current
+operand suffix by index, and reduces it at close. Parallel buffers hold
+the corresponding written start/end marks and, only in binder scopes,
+dependency marks. Rare payloads use frame-specific scratch, with inline
+slots for common index counts and exact wide values when needed. Indices
+survive buffer reallocation and frame cleanup removes only suffixes. Retain the
+completed operand or index's endpoints until its parent finishes and
+map factory attribution back to the original positions. Unattributed
+errors use the complete application span. An early error tied to an
+open construct records its start and frame identity so close can supply
+the end without retaining intervening tokens.
+
+Elaboration computes scope marks and performs any allowed rewrites before
+passing the disposable operand suffix directly to the
+[consuming Node factories](../node/design.md#phase-2-consuming-construction).
+The common path needs no secondary vector of `NodeView`. A miss clears the
+transferred slots. On a hit or error, discard those still-owning slots
+with ordinary handle destruction when the frame unwinds. A local, alias,
+root or other independent owner keeps its own reference. For optional
+commutative ordering, permute the owning slots and remember the written
+positions. A failed factory leaves every slot owned, so the reducer can
+restore the written order and use `CheckBuiltinOperands` to diagnose rank
+errors. A resource error retains its original classification. Clear the
+operand and location suffixes before pushing the parent result. Binder
+setup, term reduction, syntax-only drain and cleanup all use bounded
+native stack depth.
+
+Ordinary application and binding-list frames keep no expression records
+or child arrays. Bounded structural scratch holds command arguments,
+sort ranks, and recipes for qualified identifiers, datatypes, FP
+lookahead, model requests and annotations. Fixed child slots cover
+small records. Only variable-length structural lists can grow an
+overflow array. Opaque metadata contributes grammar depth and, when
+requested, normalized text. In addition to the typed DAG and signature,
+scratch is proportional to open frames, live operands, pending binders,
+special-form state and requested text. A wide application or parallel
+`let` can retain a linear number of immediate operands.
+
+Clear owning elements at the command boundary and on semantic failure.
+The typed frame stack retains up to 2 MiB of capacity between commands.
+Other reusable vectors keep at most 256 KiB each, and structural scratch
+retains at most 256 records and 64 KiB of captured text. Binder spelling
+pages retain up to 256 KiB. A larger command can grow these buffers and
+releases excess capacity after the command.
+
+### Reduction of special forms
+
+- For a parallel `let`, resolve RHSs in the outer lexical scope, while
+  admitting earlier staged `:named` aliases. Keep completed RHS roots and
+  pending binder names in frame scratch. Publish all lexical binders to the
+  body together after the binding list closes. Restore the previous lexical
+  scope when the body closes. Apply the existing occurrence-level closure and
+  first-match rules to `let`, formal bodies and `match`.
+- For `declare-datatypes`, collect the entire header list and index its
+  canonical names and arities in the group overlay before any field sort.
+  Single `declare-datatype` obtains its own header from the name and its
+  constructor-list or `par` prefix before resolving fields. Resolve
+  `par` parameters before group headers and committed sort constructors.
+  Reduce fields to builder recipes with exact spans as read. Forward
+  references use group ordinals. Accumulate constructor and selector
+  freshness checks and validate group lengths and productivity before
+  publication. Prepare frontend group and name slots before calling the
+  builder's fallible final commit, then move the group into those slots
+  and complete frontend publication without throwing.
+- For the second source operand of a resolved indexed `to_fp` that can
+  take the concrete-rational rank, recognize the closed rational grammar
+  in parallel with ordinary term grammar. Check each unqualified `-`
+  or `/` head against local, staged and committed term bindings before
+  treating it as a rational head. While the candidate remains viable,
+  keep only a typed numeric recipe of exact leaves, operator tags and
+  source marks, with pending operators in live frames. Do not evaluate
+  candidate arithmetic or report its numeric errors until the complete
+  second operand and the enclosing two-operand shape select that rank.
+  Fold the recipe iteratively, left to right in postorder. For an outer
+  zero divisor supplied by `(/ 0 3)`, blame that complete child span.
+  If shape or a resolved binding disqualifies the candidate, feed its
+  reduced prefix to the ordinary term reducer from the saved marks and
+  exact payloads, then continue that path from the live frame slots.
+  Each recipe item is replayed at most once. Retain the ordinary numeric
+  token class in the recipe for its normal admission and diagnostics.
+  The third operand, if present, selects ordinary application before
+  that operand is elaborated. A selected user or local binding is never
+  reinterpreted after a rank error. Discard the recipe after selection.
+- For eligible `get-value`, append normalized token spelling in request
+  order as each term is read. Append one space between adjacent tokens
+  except just after `(` or before `)`. Preserve each token's original
+  bytes. A resolved abstract reference replaces exactly its captured
+  token or qualified range with the canonical ascription, using output
+  marks so a quoted lookalike stays untouched. Keep each completed
+  request's text, owning term and span in the command descriptor. All
+  requests must be admitted before emitting any value response bytes.
+- For unknown metadata and uninterpreted attribute values, validate the
+  token classes and S-expression frames incrementally. Without capture,
+  discard accepted tokens and closed frames. With capture, feed the
+  normalized text directly into pending source records. Recognized
+  metadata retains its existing checking rules and ordinary `:named`
+  admission remains a semantic action.
+
+### Failure drain and sparse publication
+
+On the first effective semantic, state or recoverable elaboration failure,
+save its diagnostic, disable semantic actions and release owned semantic
+scratch. Keep grammar frames, lexical state and any marks needed to
+complete the diagnostic. The grammar-only run consumes exactly the same
+slots without creating typed terms, resolving names, capturing source
+history or performing model operations. A malformed tail or Reader failure
+takes precedence. If a resource failure prevents syntax validation, return
+the resource diagnostic and terminate. A well-formed failed command
+consumes its closing delimiter and leaves the session available for the
+next command. Driver result gating can select this grammar-only behavior
+as soon as a request is known to be ineligible, with the gate result
+observable only after grammar succeeds.
+
+Keep committed storage untouched during input. Create a command-local
+overlay only when adding an eagerly visible `:named` alias or datatype
+header. Use namespace-specific lazy indexes over owning pending records
+and keep append order for publication. Semantic lookup prefers lexical
+bindings, then the overlay, then the committed environment and active
+theory. Freshness includes the pending definition name without making
+the definition look-up visible in its own body. Plain assertions and
+declarations accumulate a root or final declaration record in local
+slots and need no overlay or per-command transaction object.
+
+Once the command closes and the remaining checks succeed, prepare all
+fallible publication work with no further Reader callbacks. Use direct
+reserve and nonthrowing append for a single range, and reserve plus
+reverse-append preparation for a command affecting multiple ranges or
+name slots. Prepare return payload and source records before publication.
+Record affected sizes and installed slots before the next fallible action.
+On preparation failure, erase those slots and unwind appended records in
+reverse ownership order. Make a successful commit nonthrowing, including
+prepared datatype group installation, phase and option updates, and
+disarming rollback. Maintain committed views at the public boundary.
+The only persistent frontend effects on failure are ones committed by
+earlier commands. A separate response transaction governs model-local
+name publication after output.
+
+The explicit `SyntaxValidator` shares the lexer and grammar-only frame
+machine. Existing grammar-without-logic tests justify this tooling path.
+It needs only token and command spans. With normal source capture
+disabled there is no source history in the typed session, and neither
+path owns a syntax tree.
 
 ## Cross-topic decisions
 
@@ -755,9 +1007,8 @@ releases the query's references.
 - The [registry](logic-profile.md) selects explicit rules for the registered
   2025-facing labels. Local compatibility profiles and Real-free
   intersections do not claim complete coverage of their named benchmarks.
-- Keep nonrecursive function definitions and calls as typed semantic
-  structure. Their table is part of the query/model contract, not a source of
-  fresh unconstrained functions. Validate bodies and arguments without
+- Keep parameterized templates and their calls in the query contract. Resolve
+  nullary definitions and inline names to their already typed bodies. Validate bodies and arguments without
   expanding calls to determine an assertion's catalog fragment.
 - Resolve value requests after the check against the active signature and
   retained model. Model-generated values are scoped to that model; an
@@ -771,11 +1022,11 @@ releases the query's references.
 
 The [implementation record](implementation.md) reports verification of these boundaries.
 
-| Area | Implemented boundary |
+| Area | Phase 1 boundary |
 | --- | --- |
 | Protocol | Command streaming, prefix responses, terminal EOF and `exit`, and result-dependent model commands. |
 | Logic and types | Explicit signature registry, compatibility rules, and Real-free intersections. The solver checks its actual routing preconditions. |
-| Definitions and Node | Typed applications and an owning definition table with ordered formals and bodies. |
+| Definitions and Node | Direct closed aliases and saturated parameterized calls with an owning template table. |
 | Datatype diagnostics | Fixed-size reasons under `kInvalidDatatype`, with atomic group publication. |
 | Exact input | Checked radix and rational helpers with the existing numeric ownership and failure behavior. |
 | Models | Owned model contexts, typed value resolution and capture-safe output. Production providers establish total interpretations of the original signature. |
@@ -1028,6 +1279,13 @@ streaming, definitions, model evaluation and ownership:
   all source branches and binding RHSs are typed even when later unused.
   Matching shared datatype recipes avoids revisiting the same recipe/sort
   pair, using the group-scoped recipe query.
+- Solve-only sealing drops alias ownership only after successful seal
+  preparation. Assertions, parameterized templates and opted-in capture
+  retain independent owners. With models enabled, the frozen environment
+  supports lookups even after the creating session and its input are gone.
+- Rendering ranks from semantic sorts preserves declaration identity and
+  exact types. Per-response sort plans replace parse-time spelling
+  preferences and retain compact output for shared ranks.
 - Large input and exact values have no discretionary quota; checked physical
   and representation failures remain correctly classified. The selected
   32-bit BV/FP fields are an explicit, tested representation boundary.
@@ -1064,7 +1322,7 @@ input's status annotation.
 | Case IDs and source | Representative cases and independent expectations |
 | --- | --- |
 | FE-CMD01–05, command/logic table | One positive per command and each supported Boolean option. Include wrong arity, missing/unknown/repeated logic, declarations after check, second check, EOF or exit before a check, and unsupported commands/options. A check emits its result with stdin open; later errors preserve it; bytes after exit are ignored. Verify metadata never supplies a solver result. |
-| FE-INFO01–06, §4.2.9 and local metadata policy | Each of version 2.6/2.7 and rejected other version/wrong shape, source string/quoted symbol, all categories and wrong value, license, status and opaque attributes. Include `get-info`, `get-option`, `echo`, their unknown keys, option state, response grammar and `:print-success` timing. |
+| FE-INFO01–06, §4.2.9 and local metadata policy | Each of version 2.6/2.7 and rejected other version/wrong shape, source string/quoted symbol, compatible and strict category controls and wrong token classes, license, status and opaque attributes. Include `get-info`, `get-option`, `echo`, their unknown keys, option state, response grammar and `:print-success` timing. |
 | FE-LEX01–08, §3.1 and Appendix B | P10 and FE-LEX-001, simple/quoted names including quoted reserved words, empty string and doubled quote, ASCII and UTF-8 text, CR/LF/CRLF, final comment and exact spans. Include BOM, NUL, bad UTF-8, quoted backslash, incomplete quote, bad radix/digits, leading-zero numeral, negative index symbol and nested attribute/list EOF. Exhaust every single split point of the small fixture and one-byte chunks. A read fault mid-token is a different outcome from EOF in the same token. |
 | FE-BIND01–08, W1/W2 and §3.6 | Parallel RHS and let duplicates, nested bindings and restoration, name collisions, fresh formals, unused parameters and definition capture. Test sort aliases and wrong arity/circular name. Check definition identity and actuals, retained body and environment, transitive definitions, invalid arguments, capture-safe meaning and exclusion from free UF/model declarations. Test unused nested definitions without eager expansion and compare small used examples semantically. |
 | FE-NAME01–09, W2 and §4.1.6 | Same-command postorder sibling and later-command visibility, forward reference rejection, nested annotations, non-Bool label, fresh/duplicate/collision cases, closed under binder, open outer local, inner unused and used RHS, unused macro actual still free, branch pattern local and name in a later ineffective branch. Invalid later term or C++ allocation restores prefix tables. Include ordinary metadata, excluded patterns and excluded `:named` on value requests. |
@@ -1307,9 +1565,9 @@ the inspected source revisions. No source was modified.
   A small synthetic nested-definition example at depths 8 and 14 returned
   `sat` with all three, for both used and unused definitions. The example is
   a semantic control, not a performance comparison.
-- For `(_ bv256 8)`, cvc5 and Bitwuzla rejected the value; Z3 accepted the
-  tested equality to zero. The QF_BV extension and the project profile, not
-  majority behavior, determine the expected contract.
+- For `(_ bv256 8)`, cvc5 and Bitwuzla rejected the value. Z3 accepted the
+  tested equality to zero. The Phase 1 profile explicitly admits indexed
+  numerals with reduction to the declared width.
 - A later four-level version of [FE-DT-SHARING-01](../testing/frontend.md#streaming-definitions-and-model-query-cases)
   used `Dup(T)=Array(T,T)` and an argument-determined `box` constructor.
   cvc5 1.4.2 in strict mode returned `sat`, exit 0; Z3 5.3.3 reported an
@@ -1408,7 +1666,10 @@ filesystem/cache conditions and raw phases, and compare equivalent output
 ownership. Measure peak process RSS separately. It includes allocator
 retention, input/scratch pages, nodes, GMP and library memory. Phase
 counters supplement it and cannot attribute all RSS to individual phases.
-No performance measurement of this design was made.
+The local review and audit describe baseline measurements motivating both
+changes. They establish neither Phase 1 nor Phase 2 performance.
+[Frontend review](/pub/netdisk2/zhangx/dandelion-frontend-bench/qf_bv_compare/review_philosophy_frontend.md)
+[Contract audit](/pub/netdisk2/zhangx/dandelion-frontend-bench/qf_bv_compare/audit_frontend_contracts.md)
 
 ## Acceptance scope
 

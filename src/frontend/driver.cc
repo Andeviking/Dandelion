@@ -3,14 +3,6 @@ import :internal;
 import std;
 
 namespace dandelion::frontend::detail {
-namespace {
-[[noreturn]] void OutputError(SourceSpan where, std::string_view message,
-                              std::error_code error = {}) {
-  throw Failure{
-      {DiagnosticCode::kOutputIo, where, message, std::nullopt, error}};
-}
-}  // namespace
-
 void Response::Write(std::string_view bytes, SourceSpan where) {
   if (bytes.empty()) return;
   if (!sink_.write) OutputError(where, "Missing response writer");
@@ -41,6 +33,38 @@ void Response::Finish(SourceSpan where) {
 
 namespace dandelion::frontend {
 namespace {
+std::string_view ResponseText(CommandResponse response) noexcept {
+  switch (response) {
+    case CommandResponse::kNone:
+      return {};
+    case CommandResponse::kSuccess:
+      return "success";
+    case CommandResponse::kUnsupported:
+      return "unsupported";
+    case CommandResponse::kTrue:
+      return "true";
+    case CommandResponse::kFalse:
+      return "false";
+    case CommandResponse::kZero:
+      return "0";
+    case CommandResponse::kStdout:
+      return "\"stdout\"";
+    case CommandResponse::kStderr:
+      return "\"stderr\"";
+    case CommandResponse::kName:
+      return "(:name \"Dandelion\")";
+    case CommandResponse::kVersion:
+      return "(:version \"development\")";
+    case CommandResponse::kAuthors:
+      return "(:authors \"\")";
+    case CommandResponse::kErrorBehavior:
+      return "(:error-behavior immediate-exit)";
+    case CommandResponse::kUnknownReason:
+      std::unreachable();
+  }
+  std::unreachable();
+}
+
 std::string_view AnswerText(CheckAnswer answer) {
   switch (answer) {
     case CheckAnswer::kSat:
@@ -105,7 +129,7 @@ std::string ErrorText(const Diagnostic& diagnostic) {
 RunResult Report(Diagnostic error, const ResponseSink& sink,
                  bool response_started, std::shared_ptr<ModelOwner> model) {
   if (response_started || error.code == DiagnosticCode::kOutputIo)
-    return {1, error, nullptr};
+    return {1, error, std::move(model)};
   const auto emitted = detail::Guard(error.where, [&] {
     detail::Response response(sink);
     if (error.code == DiagnosticCode::kUnsupported)
@@ -114,7 +138,7 @@ RunResult Report(Diagnostic error, const ResponseSink& sink,
       response.Write(ErrorText(error), error.where);
     response.Finish(error.where);
   });
-  if (!emitted) return {1, emitted.error(), nullptr};
+  if (!emitted) return {1, emitted.error(), std::move(model)};
   return {1, error, std::move(model)};
 }
 Outcome<CheckResult> InvokeEngine(const Engine& engine,
@@ -137,31 +161,25 @@ Outcome<CheckResult> InvokeEngine(const Engine& engine,
 }
 }  // namespace
 
-RunResult Run(Session& session, const Engine& engine,
-              const ResponseSink& sink) {
-  auto model = session.state_->inspection_model;
+RunResult Session::Run(const Engine& engine, const ResponseSink& sink) {
+  if (state_->in_read)
+    return {1, detail::ReentrantRead(state_->scanner.Here()),
+            state_->inspection_model};
+  auto model = state_->inspection_model;
   auto answer = model ? std::optional(model->GetAnswer()) : std::nullopt;
   auto reason = model ? model->GetReason() : UnknownReason::kUnknown;
 
   for (;;) {
-    const auto syntax = session.NextSyntax();
-    if (!syntax) return Report(syntax.error(), sink, false, std::move(model));
-    if (!*syntax) return {0, std::nullopt, std::move(model)};
-    const auto [kind, where] = **syntax;
+    auto next = state_->ReadCommand(model.get(), &answer);
+    if (!next) {
+      state_->phase = SessionPhase::kTerminated;
+      return Report(next.error(), sink, false, std::move(model));
+    }
+    if (!*next) return {0, std::nullopt, std::move(model)};
+    auto& command = **next;
+    const auto [kind, where] = command.header;
     detail::Response response(sink);
     auto applied = detail::Guard(where, [&] {
-      const bool requests_model =
-          kind == CommandKind::kGetModel || kind == CommandKind::kGetValue;
-      if (requests_model && session.GetPhase() == SessionPhase::kAfterCheck &&
-          session.GetOptions().produce_models) {
-        if (answer == CheckAnswer::kUnsat)
-          detail::Fail(DiagnosticCode::kInvalidState, where,
-                       "Model inspection is unavailable after unsat");
-        if (!model)
-          detail::Fail(DiagnosticCode::kModelUnavailable, where,
-                       "No inspectable model is available");
-      }
-      auto command = detail::Use(session.Apply(model.get()), where);
       if (kind == CommandKind::kCheckSat) {
         auto result =
             detail::Use(InvokeEngine(engine, *command.query, where), where);
@@ -184,31 +202,37 @@ RunResult Run(Session& session, const Engine& engine,
         response.Write(spelling, where);
         response.Write("\n", where);
       } else if (kind == CommandKind::kGetValue) {
-        detail::WriteValues(*model, *session.state_, command.values, response,
-                            where);
+        detail::WriteValues(*model, *state_, command.values, response, where);
         return;
       } else if (kind == CommandKind::kGetModel) {
-        detail::WriteModel(*model, *session.state_, response, where);
+        detail::WriteModel(*model, *state_, response, where);
         return;
-      } else if (command.needs_unknown_reason) {
-        if (answer != CheckAnswer::kUnknown)
-          detail::Fail(DiagnosticCode::kInvalidState, where,
-                       "No unknown result is available");
-        response.Write("(:reason-unknown ", where);
-        response.Write(ReasonText(reason), where);
-        response.Write(")\n", where);
-      } else if (!command.text.empty()) {
-        response.Write(command.text, where);
+      } else if (const auto* echo =
+                     std::get_if<std::string>(&command.response)) {
+        response.Write(*echo, where);
         response.Write("\n", where);
+      } else {
+        const auto tag = std::get<CommandResponse>(command.response);
+        if (tag == CommandResponse::kUnknownReason) {
+          response.Write("(:reason-unknown ", where);
+          response.Write(ReasonText(reason), where);
+          response.Write(")\n", where);
+        } else if (const auto text = ResponseText(tag); !text.empty()) {
+          response.Write(text, where);
+          response.Write("\n", where);
+        }
       }
       response.Finish(where);
     });
     if (!applied) {
-      session.state_->pending.reset();
-      session.state_->phase = SessionPhase::kTerminated;
+      state_->phase = SessionPhase::kTerminated;
       return Report(applied.error(), sink, response.Started(),
                     std::move(model));
     }
   }
+}
+RunResult Run(Session& session, const Engine& engine,
+              const ResponseSink& sink) {
+  return session.Run(engine, sink);
 }
 }  // namespace dandelion::frontend

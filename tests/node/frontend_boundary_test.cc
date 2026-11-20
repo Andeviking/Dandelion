@@ -1,5 +1,7 @@
 #include "test_support.h"
 
+#include "../util/numeric_test_peer.h"
+
 namespace dandelion::testing {
 namespace {
 
@@ -118,6 +120,52 @@ TEST_F(NodeTest, IndexedRationalAndNamePayloadsOwnIndependentInputCopies) {
   const auto declaration = Take(manager_.DeclareFunction(name, {}, z.Borrow()));
   name.assign("changed");
   EXPECT_EQ(declaration.Borrow().GetNameHint(), std::string(128, 'f'));
+}
+
+TEST_F(NodeTest,
+       MovedFromRationalsStayCanonicalThroughMovesAndNodePublication) {
+  const Integer one(1), two(2), three(3);
+  auto original = Take(Rational::Make(one.Borrow(), two.Borrow()));
+  numeric::NumericTestPeer::FailAllocationAfter(0);
+  auto constructed = std::move(original);
+  numeric::NumericTestPeer::ClearFailures();
+  EXPECT_EQ(original.Borrow().Numerator().ToDecimal(), "0");
+  EXPECT_EQ(original.Borrow().Denominator().ToDecimal(), "1");
+  EXPECT_EQ(constructed.Borrow().Numerator().ToDecimal(), "1");
+  EXPECT_EQ(constructed.Borrow().Denominator().ToDecimal(), "2");
+  auto assigned = Take(Rational::Make(two.Borrow(), three.Borrow()));
+  numeric::NumericTestPeer::FailAllocationAfter(0);
+  assigned = std::move(constructed);
+  numeric::NumericTestPeer::ClearFailures();
+  EXPECT_EQ(constructed.Borrow().Numerator().ToDecimal(), "0");
+  EXPECT_EQ(constructed.Borrow().Denominator().ToDecimal(), "1");
+  auto& alias = assigned;
+  assigned = std::move(alias);
+  EXPECT_EQ(assigned.Borrow().Numerator().ToDecimal(), "1");
+  EXPECT_EQ(assigned.Borrow().Denominator().ToDecimal(), "2");
+  const auto rounding = Take(manager_.MakeRoundingMode(RoundingMode::kRne));
+  const std::array indices = {two, two};
+  const auto conversion = Op(Kind::kFpFromRational, {rounding.Borrow()},
+                             indices, {}, constructed.Borrow());
+  EXPECT_EQ(conversion.Borrow().GetRationalParameter()->Numerator().ToDecimal(),
+            "0");
+  EXPECT_EQ(
+      conversion.Borrow().GetRationalParameter()->Denominator().ToDecimal(),
+      "1");
+  const auto big = Number("340282366920938463463374607431768211456");
+  const auto denominator = Number("340282366920938463463374607431768211457");
+  auto big_original = Take(Rational::Make(big.Borrow(), denominator.Borrow()));
+  numeric::NumericTestPeer::FailAllocationAfter(0);
+  auto big_moved = std::move(big_original);
+  numeric::NumericTestPeer::ClearFailures();
+  EXPECT_EQ(big_moved.Borrow().Numerator().Compare(big.Borrow()), 0);
+  EXPECT_EQ(big_original.Borrow().Denominator().ToDecimal(), "1");
+  numeric::NumericTestPeer::FailAllocationAfter(0);
+  assigned = std::move(big_moved);
+  numeric::NumericTestPeer::ClearFailures();
+  EXPECT_EQ(assigned.Borrow().Denominator().Compare(denominator.Borrow()), 0);
+  EXPECT_EQ(big_moved.Borrow().Numerator().ToDecimal(), "0");
+  EXPECT_EQ(big_moved.Borrow().Denominator().ToDecimal(), "1");
 }
 
 TEST_F(NodeTest, DeepFiniteDatatypeRecipeInstantiationIsIterative) {

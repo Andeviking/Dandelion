@@ -1,6 +1,7 @@
 module dandelion.node_workload;
 import std;
 import dandelion.node;
+import dandelion.util.numeric;
 
 namespace dandelion::node_bench {
 namespace {
@@ -28,6 +29,21 @@ Value Get(Result<Value> result, std::string_view operation) {
                   std::to_string(static_cast<unsigned>(error.code)));
   }
   if constexpr (!std::is_void_v<Value>) return std::move(*result);
+}
+
+template <class Value>
+Value Get(numeric::NumericResult<Value> result, std::string_view operation) {
+  if (!result) {
+    const auto error = result.error();
+    if (error == numeric::NumericError::kSizeLimit ||
+        error == numeric::NumericError::kCppAllocation) {
+      throw std::runtime_error("Numeric resource limit during " +
+                               std::string(operation));
+    }
+    throw Invalid(std::string(operation) + " failed with numeric error " +
+                  std::to_string(std::to_underlying(error)));
+  }
+  return std::move(*result);
 }
 
 std::size_t Id(std::string_view text) {
@@ -151,8 +167,9 @@ Kind ParseKind(std::string_view name) {
 void ParsePayload(Instruction& instruction,
                   std::span<const std::string_view> words,
                   const std::unordered_map<std::size_t, std::size_t>& instances,
-                  std::vector<Integer>& payloads,
-                  std::vector<Rational>& rationals, std::size_t children) {
+                  std::vector<numeric::Integer>& payloads,
+                  std::vector<numeric::Rational>& rationals,
+                  std::size_t children) {
   using enum Kind;
   const Kind kind = instruction.kind;
   if (kind == kApply) {
@@ -177,14 +194,15 @@ void ParsePayload(Instruction& instruction,
   Require(words.size() <= std::numeric_limits<std::uint8_t>::max(),
           "too many payload fields");
   for (const auto& word : words) {
-    payloads.push_back(Get(Integer::ParseDecimal(word), "integer"));
+    payloads.push_back(Get(numeric::Integer::ParseDecimal(word), "integer"));
   }
   if (kind == kFpFromRational) {
     Require(words.size() == 4, "expected FP rational payload");
     instruction.auxiliary = rationals.size();
-    rationals.push_back(Get(Rational::Make(payloads[start + 2].Borrow(),
-                                           payloads[start + 3].Borrow()),
-                            "rational parameter"));
+    rationals.push_back(
+        Get(numeric::Rational::Make(payloads[start + 2].Borrow(),
+                                    payloads[start + 3].Borrow()),
+            "rational parameter"));
     payloads.resize(start + 2);
   }
 }
@@ -276,13 +294,15 @@ class Metadata {
       return Get(manager_.RoundingModeSort(), kind);
     }
     if (kind == "bv" && args.size() == 1) {
-      const auto width = Get(Integer::ParseDecimal(args[0]), "BV width");
+      const auto width =
+          Get(numeric::Integer::ParseDecimal(args[0]), "BV width");
       return Get(manager_.MakeBvSort(width.Borrow()), kind);
     }
     if (kind == "fp" && args.size() == 2) {
-      const auto exponent = Get(Integer::ParseDecimal(args[0]), "FP exponent");
+      const auto exponent =
+          Get(numeric::Integer::ParseDecimal(args[0]), "FP exponent");
       const auto significand =
-          Get(Integer::ParseDecimal(args[1]), "FP significand");
+          Get(numeric::Integer::ParseDecimal(args[1]), "FP significand");
       return Get(manager_.MakeFpSort(exponent.Borrow(), significand.Borrow()),
                  kind);
     }
@@ -579,11 +599,7 @@ std::size_t Workload::StorageBytes() const noexcept {
     if (offset >= sizeof(word)) bytes += word.capacity() + 1;
   }
   for (const auto& value : payloads_) bytes += value.Borrow().BackingBytes();
-  for (const auto& value : rationals_) {
-    const auto rational = value.Borrow();
-    bytes += rational.Numerator().BackingBytes() +
-             rational.Denominator().BackingBytes();
-  }
+  for (const auto& value : rationals_) bytes += value.Borrow().BackingBytes();
   return bytes;
 }
 
@@ -630,17 +646,30 @@ Node Replay::Make(const Instruction& instruction) {
   if (kind == kBoolValue)
     return Get(manager_.MakeBool(literal().Sign() != 0), "Bool");
   if (kind == kIntValue) return Get(manager_.MakeInt(literal()), "Int");
-  if (kind == kBvValue)
-    return Get(manager_.MakeBvValue(sort(), literal()), "BV");
+  if (kind == kBvValue) {
+    const auto literal_sort = sort();
+    const auto width = literal_sort.GetWidth();
+    Require(width.has_value(), "BV literal requires a BV sort");
+    const auto value = Get(numeric::BitVector::FromIntegerExact(
+                               numeric::IntegerView(*width), literal()),
+                           "BV payload");
+    return Get(manager_.MakeBvValue(literal_sort, value.Borrow()), "BV");
+  }
   if (kind == kFpValue) {
-    return Get(instruction.payload_count == 0
-                   ? manager_.MakeFpSpecial(sort(), FpSpecial::kNaN)
-                   : manager_.MakeFpBits(sort(), literal()),
-               "FP");
+    const auto literal_sort = sort();
+    const auto format = literal_sort.GetFpFormat();
+    Require(format.has_value(), "FP literal requires an FP sort");
+    const auto value =
+        Get(instruction.payload_count == 0
+                ? numeric::FloatingPointValue::Special(
+                      *format, numeric::FpCategory::kNaN)
+                : numeric::FloatingPointValue::FromBits(*format, literal()),
+            "FP payload");
+    return Get(manager_.MakeFpValue(literal_sort, value.Borrow()), "FP");
   }
   if (kind == kRoundingModeValue) {
     return Get(manager_.MakeRoundingMode(
-                   static_cast<RoundingMode>(*literal().TryUint32())),
+                   static_cast<numeric::RoundingMode>(*literal().TryUint32())),
                "rounding mode");
   }
   children_.clear();
@@ -655,7 +684,7 @@ Node Replay::Make(const Instruction& instruction) {
   }
   const std::optional<SortView> qualifier =
       kind == kArrayConst ? std::optional(sort()) : std::nullopt;
-  const std::optional<RationalView> rational =
+  const std::optional<numeric::RationalView> rational =
       kind == kFpFromRational
           ? std::optional(workload_.rationals_[instruction.auxiliary].Borrow())
           : std::nullopt;
@@ -763,6 +792,240 @@ WalkStats Walk(std::span<const Node> roots, bool describe_shape) {
                         }),
       "postorder");
   return stats;
+}
+
+std::vector<Node> BuildFoldingDag(NodeManager& manager) {
+  using enum Kind;
+  using numeric::Integer;
+  using numeric::IntegerView;
+  using numeric::RoundingMode;
+  const auto make = [&](Kind kind, auto... children) {
+    return Get(manager.MakeBuiltin({kind, {}, {}, {}}, std::array{children...}),
+               "build folding fixture");
+  };
+  const auto extract = [&](NodeView child, std::uint64_t high,
+                           std::uint64_t low) {
+    return Get(manager.MakeWordIndexedBuiltin(kBvExtract, std::array{high, low},
+                                              std::array{child}),
+               "build BV extract");
+  };
+
+  const auto zero = Get(manager.MakeInt(IntegerView(0)), "Int zero");
+  const auto one = Get(manager.MakeInt(IntegerView(1)), "Int one");
+  const auto six = Get(manager.MakeInt(IntegerView(6)), "Int six");
+  const auto seven = Get(manager.MakeInt(IntegerView(7)), "Int seven");
+  const auto sum = make(kIntAdd, six.Borrow(), seven.Borrow());
+  auto mul = make(kIntMul, sum.Borrow(), sum.Borrow());
+  auto sub = make(kIntSub, sum.Borrow(), six.Borrow());
+  const auto x = Get(manager.MakeFreshConstant("x", six.Borrow().GetSort()),
+                     "symbolic Int");
+  auto mixed_int = make(kIntAdd, x.Borrow(), sub.Borrow());
+  auto div_zero = make(kIntDiv, sub.Borrow(), zero.Borrow());
+  Node chain = zero;
+  for (int i = 0; i < 64; ++i)
+    chain = make(kIntAdd, chain.Borrow(), one.Borrow());
+
+  const auto bv8 = Get(manager.MakeBvSort(8), "BV8 sort");
+  const auto bv4 = Get(manager.MakeBvSort(4), "BV4 sort");
+  const auto a =
+      Get(manager.MakeBvWordValue(bv8.Borrow(), 0x9e), "BV8 literal");
+  const auto b = Get(manager.MakeBvWordValue(bv8.Borrow(), 5), "BV8 literal");
+  const auto bv_sum = make(kBvAdd, a.Borrow(), b.Borrow());
+  auto high = extract(bv_sum.Borrow(), 7, 4);
+  const auto low = Get(manager.MakeBvWordValue(bv4.Borrow(), 3), "BV4 literal");
+  auto concat = make(kBvConcat, high.Borrow(), low.Borrow());
+  const auto y =
+      Get(manager.MakeFreshConstant("y", bv4.Borrow()), "symbolic BV");
+  const auto mixed_concat = make(kBvConcat, concat.Borrow(), y.Borrow());
+  auto mixed_extract = extract(mixed_concat.Borrow(), 5, 2);
+  const auto all_ones =
+      Get(manager.MakeBvWordValue(bv8.Borrow(), 0xff), "BV8 all ones");
+  auto signed_bv = make(kSbvToInt, all_ones.Borrow());
+
+  const auto fp =
+      Get(manager.MakeFpSort(IntegerView(2), IntegerView(3)), "tiny FP sort");
+  const auto format = *fp.Borrow().GetFpFormat();
+  const auto rne = Get(manager.MakeRoundingMode(RoundingMode::kRne), "RNE");
+  const auto rtp = Get(manager.MakeRoundingMode(RoundingMode::kRtp), "RTP");
+  const auto fraction =
+      Get(numeric::Rational::Make(IntegerView(9), IntegerView(8)), "9/8");
+  const std::array indices{Integer(2), Integer(3)};
+  const auto convert = [&](NodeView rm) {
+    return Get(
+        manager.MakeBuiltin({kFpFromRational, indices, {}, fraction.Borrow()},
+                            std::array{rm}),
+        "build rational conversion");
+  };
+  auto nearest = convert(rne.Borrow());
+  auto up = convert(rtp.Borrow());
+  const auto quarter_value =
+      Get(numeric::FloatingPointValue::FromBits(format, IntegerView(1)), "1/4");
+  const auto quarter =
+      Get(manager.MakeFpValue(fp.Borrow(), quarter_value.Borrow()), "FP 1/4");
+  auto fp_sum = make(kFpAdd, rne.Borrow(), up.Borrow(), quarter.Borrow());
+  const auto z =
+      Get(manager.MakeFreshConstant("z", fp.Borrow()), "symbolic FP");
+  auto mixed_fp = make(kFpAdd, rne.Borrow(), z.Borrow(), fp_sum.Borrow());
+  const auto make_zero = [&](numeric::FpSpecial sign) {
+    return Get(
+        manager.MakeFpValue(
+            fp.Borrow(),
+            numeric::FloatingPointView::FromCanonicalSpecial(format, sign)),
+        "FP zero");
+  };
+  const auto positive_zero = make_zero(numeric::FpSpecial::kPositiveZero);
+  const auto negative_zero = make_zero(numeric::FpSpecial::kNegativeZero);
+  auto min = make(kFpMin, positive_zero.Borrow(), negative_zero.Borrow());
+
+  std::vector<Node> roots;
+  roots.reserve(15);
+  roots.push_back(std::move(mul));
+  roots.push_back(std::move(sub));
+  roots.push_back(std::move(mixed_int));
+  roots.push_back(std::move(div_zero));
+  roots.push_back(std::move(chain));
+  roots.push_back(one);
+  roots.push_back(std::move(high));
+  roots.push_back(std::move(concat));
+  roots.push_back(std::move(mixed_extract));
+  roots.push_back(std::move(signed_bv));
+  roots.push_back(std::move(nearest));
+  roots.push_back(std::move(up));
+  roots.push_back(std::move(fp_sum));
+  roots.push_back(std::move(mixed_fp));
+  roots.push_back(std::move(min));
+  return roots;
+}
+
+namespace {
+
+std::optional<Node> FoldInteger(NodeManager& manager, Kind kind,
+                                std::span<const NodeView> children) {
+  const auto value = [](NodeView node) {
+    return *node.GetValue()->GetInteger();
+  };
+  auto accumulator = value(children.front()).Copy();
+  for (const auto child : children.subspan(1)) {
+    const auto left = accumulator.Borrow();
+    const auto right = value(child);
+    switch (kind) {
+      case Kind::kIntAdd:
+        accumulator = Get(left + right, "Int add");
+        break;
+      case Kind::kIntSub:
+        accumulator = Get(left - right, "Int subtract");
+        break;
+      case Kind::kIntMul:
+        accumulator = Get(left * right, "Int multiply");
+        break;
+      case Kind::kIntDiv:
+        if (right.Sign() == 0) return std::nullopt;
+        accumulator =
+            Get(numeric::Integer::DivMod(left, right), "Int divide").first;
+        break;
+      default:
+        std::unreachable();
+    }
+  }
+  return Get(manager.MakeInt(accumulator.Borrow()), "Int result");
+}
+
+std::optional<Node> TryFold(NodeManager& manager, NodeView original,
+                            std::span<const NodeView> children) {
+  using enum Kind;
+  using numeric::BitVector;
+  using numeric::FloatingPointValue;
+  if (!std::ranges::all_of(children, [](NodeView node) {
+        return node.GetValue().has_value();
+      })) {
+    return std::nullopt;
+  }
+  const auto bv = [&](std::size_t i) {
+    return children[i].GetValue()->GetBitVector()->Copy();
+  };
+  const auto fp = [&](std::size_t i) {
+    return children[i].GetValue()->GetFloatingPoint()->Copy();
+  };
+  const auto rounding = [&] {
+    return *children[0].GetValue()->GetRoundingMode();
+  };
+  const auto make_bv = [&](const BitVector& result) {
+    return Get(manager.MakeBvValue(original.GetSort(), result.Borrow()),
+               "BV result");
+  };
+  const auto make_fp = [&](const FloatingPointValue& result) {
+    return Get(manager.MakeFpValue(original.GetSort(), result.Borrow()),
+               "FP result");
+  };
+  switch (original.GetKind()) {
+    case kIntAdd:
+    case kIntSub:
+    case kIntMul:
+    case kIntDiv:
+      return FoldInteger(manager, original.GetKind(), children);
+    case kBvAdd:
+      return make_bv(Get(BitVector::Add(bv(0), bv(1)), "BV add"));
+    case kBvConcat:
+      return make_bv(Get(BitVector::Concat(bv(0), bv(1)), "BV concat"));
+    case kBvExtract: {
+      const auto indices = original.GetIndices();
+      return make_bv(Get(
+          BitVector::Extract(bv(0), indices[0].Borrow(), indices[1].Borrow()),
+          "BV extract"));
+    }
+    case kSbvToInt: {
+      const auto result =
+          Get(BitVector::ToSignedInteger(bv(0)), "signed BV to Int");
+      return Get(manager.MakeInt(result.Borrow()), "Int result");
+    }
+    case kFpFromRational:
+      return make_fp(Get(numeric::RoundRationalToFp(
+                             *original.GetSort().GetFpFormat(), rounding(),
+                             *original.GetRationalParameter()),
+                         "rational to FP"));
+    case kFpAdd:
+      return make_fp(
+          Get(FloatingPointValue::Add(rounding(), fp(1), fp(2)), "FP add"));
+    case kFpMin: {
+      const auto result = Get(FloatingPointValue::Min(fp(0), fp(1)), "FP min");
+      if (result.Kind() != numeric::FpOutcomeKind::kDefined)
+        return std::nullopt;
+      return make_fp(result.Value());
+    }
+    default:
+      return std::nullopt;
+  }
+}
+
+}  // namespace
+
+std::vector<Node> FoldDag(NodeManager& manager, std::span<const Node> roots) {
+  std::unordered_map<NodeId, Node> folded;
+  std::vector<NodeView> children;
+  Get(VisitDagPostorder(
+          roots,
+          [&](NodeView original) -> Result<void> {
+            children.clear();
+            for (const auto child : original.GetChildren())
+              children.push_back(folded.at(child.GetId()).Borrow());
+            Node result;
+            if (children.empty()) {
+              result = Get(manager.RetainNode(original), "retain folding leaf");
+            } else if (auto evaluated = TryFold(manager, original, children)) {
+              result = std::move(*evaluated);
+            } else {
+              result =
+                  Get(manager.RebuildNode(original, children), "rebuild node");
+            }
+            folded.emplace(original.GetId(), std::move(result));
+            return {};
+          }),
+      "folding postorder");
+
+  std::vector<Node> results;
+  results.reserve(roots.size());
+  for (const auto& root : roots) results.push_back(folded.at(root.GetId()));
+  return results;
 }
 
 }  // namespace dandelion::node_bench

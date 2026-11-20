@@ -251,10 +251,72 @@ def check_run_output(output, case_names):
                 assert all(value > 0 for value in values), (name, key, values)
 
 
+def check_canonicalization(directory, executable):
+    import frontend_run
+
+    # Exercise argument parsing without a compiled benchmark executable.
+    for enabled in (False, True):
+        argv = ["frontend_run.py", "--build-dir", str(directory), "--manifest",
+                str(directory / "manifest.json"), "--output", str(directory / "out")]
+        if enabled:
+            argv.append("--canonicalize")
+        result = {"status": "ok", "batch": {"interrupted_signal": None}}
+        with patch.object(sys, "argv", argv), patch.object(
+                frontend_run, "_run_manifests", return_value=result) as run:
+            assert frontend_run.main() == 0
+            assert run.call_args.kwargs["canonicalize"] is enabled
+
+    if executable is None:
+        print("Canonicalization integration requires the benchmark executable.")
+        return
+
+    suite = directory / "canonical-suite"
+    suite.mkdir()
+    data = (b"(set-logic ALL)\n(declare-const a Int)\n(declare-const b Int)\n"
+            b"(declare-const p Bool)\n(declare-const q Bool)\n"
+            b"(assert (= (+ a b) (+ b a)))\n(assert (xor p q))\n"
+            b"(assert (xor q p))\n(check-sat)\n")
+    path = suite / "canonical.smt2"
+    path.write_bytes(data)
+    manifest = suite / "manifest.json"
+    manifest.write_text(json.dumps({
+        "schema": 1, "cases": [{"case": "canonical", "relative_path": path.name,
+                                "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}],
+    }), encoding="utf-8")
+
+    for enabled in (False, True):
+        flag = ["--canonicalize"] if enabled else []
+        for scenario in frontend_run.ADAPTERS:
+            result = subprocess.run(
+                [executable, "--input", path, "--inspect", "--scenario", scenario, *flag],
+                timeout=15, capture_output=True, text=True, check=False,
+            )
+            assert result.returncode == 0, (result.stdout, result.stderr)
+            metrics = json.loads(result.stdout)
+            assert metrics["schema_version"] == 2 and metrics["status"] == "ok", metrics
+            assert (metrics["nodes"], metrics["edges"]) == (
+                (7, 6) if enabled else (9, 10)), metrics
+        output = directory / ("canonical-on" if enabled else "canonical-off")
+        result = frontend_run.run_suite(
+            manifest_path=manifest, output_dir=output, benchmark_exe=executable,
+            mode="isolated", scenarios=frontend_run.ADAPTERS, samples=1,
+            canonicalize=enabled,
+        )
+        assert result["status"] == "ok", result
+        assert result["settings"].get("canonicalize", False) is enabled
+        case = result["cases"][0]
+        for sample in (case["inspect"], *case["samples"]):
+            assert ("--canonicalize" in sample["argv"]) is enabled, sample
+        report = (output / "report.md").read_text(encoding="utf-8")
+        assert ("Canonicalization enabled" in report) is enabled
+        check_run_output(output, {"canonical"})
+
+
 def runner_concurrent(directory, executable):
     from frontend_run import run_suite
 
     check_benchmark_sample(directory)
+    check_canonicalization(directory, executable)
     if executable is None:
         print("Runner concurrency requires the benchmark executable.")
         return

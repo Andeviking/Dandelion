@@ -12,7 +12,10 @@ target_sources(dandelion_frontend
     FILES ${frontend_private_interfaces}
   PRIVATE ${frontend_sources}
 )
-target_link_libraries(dandelion_frontend PUBLIC dandelion_node)
+target_link_libraries(dandelion_frontend
+  PUBLIC dandelion_node
+  PRIVATE dandelion_util
+)
 if(DANDELION_BUILD_TESTS)
   target_compile_definitions(dandelion_frontend PUBLIC DANDELION_FRONTEND_TESTING=1)
 endif()

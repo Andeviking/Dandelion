@@ -79,7 +79,7 @@ TokenKind Classify(std::string_view text, SourceSpan where,
   if (IsSimpleSymbol(text)) {
     descriptor = ClassifyReserved(text);
     if (descriptor != kUnknownSpelling) return TokenKind::kReserved;
-    descriptor = ClassifyOperator(text);
+    descriptor = ClassifySymbol(text);
     return TokenKind::kSymbol;
   }
   Fail(DiagnosticCode::kSyntax, where, "Invalid SMT-LIB token");
@@ -108,183 +108,148 @@ bool IsQuotedByte(int byte) noexcept {
   return (byte >= 32 && byte != 127) || Space(byte);
 }
 
-Syntax::Syntax(SyntaxPool& pool, std::string_view bytes,
-               SourceSpan start) noexcept
-    : pool_(pool),
-      bytes_(bytes),
-      start_(start),
-      tokens_(pool.tokens, pool.threshold, pool.stats),
-      expressions_(pool.expressions, pool.threshold, pool.stats),
-      edges_(pool.edges, pool.threshold, pool.stats),
-      lines_(pool.lines, pool.threshold, pool.stats) {}
+ExprId Syntax::Add(Token token, bool borrow) {
+  const auto id = free_ == kNoExpr ? slots_ : free_;
+  if (free_ == kNoExpr) {
+    if (slots_ / kPageSize == pages_.size())
+      pages_.push_back(std::make_unique_for_overwrite<Page>());
+    ++slots_;
+  } else {
+    free_ = Entry(id).token;
+  }
+  ++live_count_;
+  auto& entry = Entry(id);
+  entry.sort = std::monostate{};
+  entry.kind = token.kind;
+  entry.spelling = token.spelling_id;
+  entry.where = token.where;
+  if (borrow) {
+    entry.raw = token.raw;
+  } else {
+    entry.owned.assign(token.raw);
+    entry.raw = entry.owned;
+  }
+  Mark(id);
+  return id;
+}
 
-Syntax::~Syntax() {
-  for (auto& slab : slabs_) {
-    if (!slab.small) continue;
-    for (auto& spare : pool_.slabs) {
-      if (spare) continue;
-      spare = std::move(slab.small);
-      break;
-    }
+void Syntax::Close(ExprId id, SourcePosition end) noexcept {
+  auto& entry = Entry(id);
+  entry.where.end = end;
+  entry.last_token = captured_.size();
+}
+
+void Syntax::DiscardChildren(ExprId id) noexcept {
+  // Chain the descendants through an unused mark as they leave the live set.
+  auto work = kNoExpr;
+  const auto enqueue = [&](Expression& entry) {
+    for (const auto child : entry.children.Range())
+      Entry(child).last_token = std::exchange(work, child);
+    entry.children.Clear();
+  };
+  enqueue(Entry(id));
+  while (work != kNoExpr) {
+    const auto child = work;
+    auto& entry = Entry(child);
+    work = entry.last_token;
+    enqueue(entry);
+    entry.owned.clear();
+    if (entry.owned.capacity() > 4096) std::string{}.swap(entry.owned);
+    entry.token = std::exchange(free_, child);
+    --live_count_;
   }
 }
 
-Token Syntax::GetToken(std::size_t index) const noexcept {
-  const auto [offset, storage, length, classification] = tokens_.Get(index);
-  return {offset, storage, length,
-          static_cast<TokenKind>(classification & 0xff),
-          static_cast<SpellingId>(classification >> 8)};
+void Syntax::RemoveLast(ExprId parent) noexcept {
+  auto& siblings = Entry(parent).children;
+  const auto id = siblings.Range().back();
+  siblings.Pop();
+  Discard(id);
 }
-void Syntax::AddToken(Token token) {
-  tokens_.Append({token.offset, token.storage, token.length,
-                  (static_cast<SyntaxWord>(token.spelling_id) << 8) |
-                      std::to_underlying(token.kind)});
+
+void Syntax::Discard(ExprId id) noexcept {
+  DiscardChildren(id);
+  auto& entry = Entry(id);
+  entry.owned.clear();
+  entry.token = std::exchange(free_, id);
+  --live_count_;
 }
-Expression Syntax::GetExpression(ExprId id) const noexcept {
-  const auto [first, last, child, count] = expressions_.Get(id);
-  return {static_cast<std::size_t>(first), static_cast<std::size_t>(last),
-          static_cast<std::size_t>(child), static_cast<std::size_t>(count)};
-}
-SyntaxWord Syntax::Store(std::string_view bytes, std::string& scratch) {
-  if (bytes.size() <= inline_bytes_.size() - inline_used_) {
-    const auto start = inline_used_;
-    std::ranges::copy(bytes, inline_bytes_.data() + start);
-    inline_used_ += bytes.size();
-    return start;
+
+void Syntax::Reset() noexcept {
+  constexpr std::size_t kRetainedFragments = 256;
+  constexpr auto kRetainedPages = kRetainedFragments / kPageSize;
+  constexpr std::size_t kRetainedTextBytes = 64 * 1024;
+  if (pages_.capacity() > 2 * kRetainedPages) {
+    std::vector<std::unique_ptr<Page>>{}.swap(pages_);
+    slots_ = 0;
+  } else if (slots_ > kRetainedFragments) {
+    pages_.resize(kRetainedPages);
+    slots_ = kRetainedFragments;
   }
-  if (bytes.size() > kSlabSize || bytes.size() > kSlabSize - slab_used_) {
-    if (slabs_.size() >= std::numeric_limits<SyntaxWord>::max() / kSlabSize)
-      throw std::length_error("Syntax spelling offsets");
-    if (bytes.size() > kSlabSize) {
-      const auto start = static_cast<SyntaxWord>(slabs_.size() + 1) * kSlabSize;
-      Slab slab;
-      if (bytes.data() == scratch.data())
-        slab.large = std::move(scratch);
-      else
-        slab.large.assign(bytes);
-      slabs_.push_back(std::move(slab));
-      slab_used_ = kSlabSize;
-      if (pool_.stats) ++pool_.stats->syntax_page_allocations;
-      return start;
-    }
-    Slab slab;
-    for (auto& spare : pool_.slabs) {
-      if (!spare) continue;
-      slab.small = std::move(spare);
-      break;
-    }
-    if (!slab.small) {
-      slab.small = std::make_unique_for_overwrite<char[]>(kSlabSize);
-      if (pool_.stats) ++pool_.stats->syntax_page_allocations;
-    }
-    slabs_.push_back(std::move(slab));
-    slab_used_ = 0;
+  if (captured_.capacity() > kRetainedTextBytes) std::string{}.swap(captured_);
+  ClearCapture();
+  free_ = kNoExpr;
+  for (auto index = slots_; index != 0;) {
+    auto& entry = Entry(--index);
+    entry.owned.clear();
+    if (entry.owned.capacity() > 4096) std::string{}.swap(entry.owned);
+    entry.children.Clear();
+    entry.raw = {};
   }
-  const auto start =
-      static_cast<SyntaxWord>(slabs_.size()) * kSlabSize + slab_used_;
-  std::ranges::copy(bytes, slabs_.back().small.get() + slab_used_);
-  slab_used_ += bytes.size();
-  return start;
+  slots_ = 0;
+  live_count_ = 0;
 }
-std::string_view Syntax::Stored(SyntaxWord start,
-                                SyntaxWord length) const noexcept {
-  const auto page = static_cast<std::size_t>(start / kSlabSize);
-  if (page == 0)
-    return {inline_bytes_.data() + start, static_cast<std::size_t>(length)};
-  const auto& slab = slabs_[page - 1];
-  const auto* data = slab.small ? slab.small.get() : slab.large.data();
-  return {data + start % kSlabSize, static_cast<std::size_t>(length)};
+
+void Syntax::Capture(Token token) {
+  if (!captured_.empty() && previous_ != TokenKind::kLeft &&
+      token.kind != TokenKind::kRight)
+    captured_.push_back(' ');
+  mark_ = captured_.size();
+  captured_.append(token.raw);
+  previous_ = token.kind;
 }
-std::string_view Syntax::RawToken(std::size_t i) const noexcept {
-  const auto token = GetToken(i);
-  if (token.kind == TokenKind::kLeft) return "(";
-  if (token.kind == TokenKind::kRight) return ")";
-  return bytes_.empty() ? Stored(token.storage, token.length)
-                        : bytes_.substr(static_cast<std::size_t>(token.offset),
-                                        static_cast<std::size_t>(token.length));
+
+void Syntax::Mark(ExprId id) noexcept {
+  auto& entry = Entry(id);
+  entry.token = mark_;
+  entry.last_token = captured_.size();
 }
-std::string_view Syntax::Name(ExprId id) const noexcept {
-  const auto raw = Raw(id);
-  return Type(id) == TokenKind::kQuoted ? raw.substr(1, raw.size() - 2) : raw;
-}
-void Syntax::LineBreak(SyntaxWord offset, bool continuation) {
-  if (continuation)
-    lines_.Set(lines_.Size() - 1, {offset - 1, 1});
-  else
-    lines_.Append({offset, 0});
-}
-SourcePosition Syntax::Position(SyntaxWord offset) const noexcept {
-  std::size_t first = 0;
-  auto last = lines_.Size();
-  while (first != last) {
-    const auto middle = first + (last - first) / 2;
-    if (lines_.Get(middle)[0] <= offset)
-      first = middle + 1;
-    else
-      last = middle;
-  }
-  const auto base = start_.begin;
-  if (first == 0)
-    return {offset, base.line, base.column + (offset - base.offset)};
-  const auto [line_start, continuation] = lines_.Get(first - 1);
-  const auto effective_start = std::min(offset, line_start + continuation);
-  return {offset, base.line + first, offset - effective_start + 1};
-}
-SourceSpan Syntax::Span(ExprId id) const noexcept {
-  const auto expression = GetExpression(id);
-  const auto first = GetToken(expression.token);
-  const auto last = GetToken(expression.last_token);
-  return {start_.source, Position(first.offset),
-          Position(last.offset + last.length)};
-}
-ChildRange Syntax::Children(ExprId id) const noexcept {
-  const auto expression = GetExpression(id);
-  return {edges_, expression.first_child, expression.child_count};
-}
-bool Syntax::Is(ExprId id, std::string_view unquoted) const noexcept {
-  return Type(id) != TokenKind::kQuoted && Raw(id) == unquoted;
-}
-bool Syntax::IsSymbol(ExprId id) const noexcept {
-  return Type(id) == TokenKind::kSymbol || Type(id) == TokenKind::kQuoted;
-}
+
 std::string Syntax::Render(
-    ExprId id,
-    const std::unordered_map<std::size_t, Replacement>* replacements) const {
-  const auto expression = GetExpression(id);
+    ExprId id, const std::map<std::size_t, Replacement>* replacements) const {
+  const auto& entry = GetExpression(id);
+  if (entry.token == entry.last_token) return std::string(entry.raw);
+  const auto text = std::string_view(captured_);
+  if (!replacements)
+    return std::string(
+        text.substr(entry.token, entry.last_token - entry.token));
   std::string result;
-  auto previous = TokenKind::kLeft;
-  for (auto index = expression.token; index <= expression.last_token; ++index) {
-    const auto kind = GetToken(index).kind;
-    if (previous != TokenKind::kLeft && kind != TokenKind::kRight)
-      result.push_back(' ');
-    if (replacements) {
-      const auto replacement = replacements->find(index);
-      if (replacement != replacements->end()) {
-        result.append(replacement->second.spelling);
-        index = replacement->second.last_token;
-        previous = TokenKind::kRight;
-        continue;
-      }
-    }
-    result.append(RawToken(index));
-    previous = kind;
+  auto cursor = entry.token;
+  for (auto it = replacements->lower_bound(cursor);
+       it != replacements->end() && it->first < entry.last_token; ++it) {
+    result.append(text.substr(cursor, it->first - cursor));
+    result.append(it->second.spelling);
+    cursor = it->second.last_token;
   }
+  result.append(text.substr(cursor, entry.last_token - cursor));
   return result;
 }
 
 Identifier GetIdentifier(const Syntax& syntax, ExprId id) {
-  if (!syntax.List(id)) return {id, {}};
-  const auto children = syntax.Children(id);
-  if (syntax.Is(children[0], "as")) {
-    auto name = GetIdentifier(syntax, children[1]);
-    name.qualifier = children[2];
-    return name;
+  auto children = syntax.Children(id);
+  if (children.empty()) return {id, {}};
+  auto qualifier = kNoExpr;
+  if (syntax.Spelling(children[0]) == SpellingId::kAs) {
+    qualifier = children[2];
+    id = children[1];
+    children = syntax.Children(id);
+    if (children.empty()) return {id, {}, qualifier};
   }
-  return {children[1], children.subspan(2)};
+  return {children[1], children.subspan(2), qualifier};
 }
 
 Scanner::Scanner(std::string_view input, std::uint32_t source)
-    : text_(input), window_(input), source_(source) {}
+    : window_(input), source_(source) {}
 Scanner::Scanner(Reader reader, std::uint32_t source)
     : reader_(std::move(reader)),
       buffer_(std::make_unique<std::array<char, kReaderCapacity>>()),
@@ -295,6 +260,7 @@ int Scanner::Peek() {
   if (cursor_ < window_.size())
     return static_cast<unsigned char>(window_[cursor_]);
   if (!reader_ || eof_) return kEnd;
+  SaveHeldToken();
   SaveTokenPart();
   ReadResult count;
   try {
@@ -317,9 +283,56 @@ int Scanner::Peek() {
   if (token_start_) token_start_ = 0;
   return static_cast<unsigned char>(window_.front());
 }
+#ifdef DANDELION_FRONTEND_TESTING
+void Scanner::Checkpoint() {
+  if (!fail_after_) return;
+  if (*fail_after_ == 0) {
+    fail_after_.reset();
+    throw std::bad_alloc{};
+  }
+  --*fail_after_;
+}
+#endif
+void Scanner::HoldToken(std::string_view bytes) {
+  held_ = bytes;
+  held_borrowed_ = static_cast<bool>(reader_);
+  if (held_borrowed_ && !scratch_.empty()) SaveHeldToken();
+}
+
+void Scanner::SaveHeldToken() noexcept {
+  if (!held_borrowed_) return;
+  held_borrowed_ = false;
+  try {
+    held_text_.assign(held_);
+    held_ = held_text_;
+  } catch (const std::bad_alloc&) {
+    held_error_ = ResourceKind::kCppAllocation;
+  } catch (const std::length_error&) {
+    held_error_ = ResourceKind::kSize;
+  }
+}
+
+std::string_view Scanner::HeldToken(SourceSpan where) const {
+  if (held_error_ != ResourceKind::kNone)
+    NodeFailure({ErrorCode::kResourceLimit, held_error_}, where);
+  return held_;
+}
+
+void Scanner::ReleaseToken() noexcept {
+  held_ = {};
+  held_borrowed_ = false;
+  held_error_ = ResourceKind::kNone;
+  held_text_.clear();
+  if (held_text_.capacity() > kReaderCapacity) std::string{}.swap(held_text_);
+}
+
 void Scanner::SaveTokenPart() {
   if (!token_start_) return;
-  scratch_.append(window_.substr(*token_start_, cursor_ - *token_start_));
+  const auto part = window_.substr(*token_start_, cursor_ - *token_start_);
+#ifdef DANDELION_FRONTEND_TESTING
+  if (part.size() > scratch_.capacity() - scratch_.size()) Checkpoint();
+#endif
+  scratch_.append(part);
   token_start_ = cursor_;
 }
 std::string_view Scanner::TokenBytes() {
@@ -337,7 +350,7 @@ void Scanner::Advance(std::size_t count) {
   cursor_ += count;
   after_cr_ = false;
 }
-void Scanner::TakeByte(int byte, Syntax* syntax) {
+void Scanner::TakeByte(int byte) {
   if (byte != '\r' && byte != '\n') {
     Advance(1);
     return;
@@ -351,32 +364,31 @@ void Scanner::TakeByte(int byte, Syntax* syntax) {
   after_cr_ = byte == '\r';
   ++position_.offset;
   ++cursor_;
-  if (syntax) syntax->LineBreak(position_.offset, continuation);
 }
-void Scanner::Scalar(int first, Syntax* syntax) {
+void Scanner::Scalar(int first) {
   const auto start = Here();
   if (first == 0) Fail(DiagnosticCode::kSyntax, start, "NUL in input");
   if (first < 128) {
-    TakeByte(first, syntax);
+    TakeByte(first);
     return;
   }
   const auto size = Utf8Size(first);
   if (size == 0)
     Fail(DiagnosticCode::kSyntax, start, "Invalid UTF-8 leading byte");
   auto scalar = static_cast<unsigned>(first & (0x7f >> size));
-  TakeByte(first, syntax);
+  TakeByte(first);
   for (std::size_t i = 1; i < size; ++i) {
     const auto byte = Peek();
     if (!IsUtf8Continuation(byte))
       Fail(DiagnosticCode::kSyntax, start,
            "Invalid or incomplete UTF-8 sequence");
     scalar = (scalar << 6) | static_cast<unsigned>(byte & 0x3f);
-    TakeByte(byte, syntax);
+    TakeByte(byte);
   }
   if (!IsUtf8Scalar(scalar, size))
     Fail(DiagnosticCode::kSyntax, start, "Invalid UTF-8 scalar");
 }
-void Scanner::Trivia(Syntax* syntax) {
+void Scanner::Trivia() {
   for (auto byte = Peek(); byte != kEnd; byte = Peek()) {
     if (Space(byte)) {
       const auto rest = window_.substr(cursor_);
@@ -384,7 +396,7 @@ void Scanner::Trivia(Syntax* syntax) {
       if (horizontal != 0) {
         Advance(std::min(horizontal, rest.size()));
       } else {
-        TakeByte(byte, syntax);
+        TakeByte(byte);
       }
       continue;
     }
@@ -397,36 +409,34 @@ void Scanner::Trivia(Syntax* syntax) {
       if (count != 0)
         Advance(count);
       else
-        Scalar(byte, syntax);
+        Scalar(byte);
       byte = Peek();
     } while (byte != kEnd && byte != '\r' && byte != '\n');
   }
 }
-Token Scanner::ScanToken(Syntax& syntax, int first) {
+Token Scanner::ScanToken(int first) {
   const auto begin = position_;
   if (first == '(' || first == ')') {
     Advance(1);
-    return {begin.offset, 0, 1,
-            first == '(' ? TokenKind::kLeft : TokenKind::kRight};
+    return {first == '(' ? TokenKind::kLeft : TokenKind::kRight,
+            kUnknownSpelling,
+            first == '(' ? "(" : ")",
+            {source_, begin, position_}};
   }
 
   if (reader_) {
+    if (scratch_.capacity() > kReaderCapacity) std::string{}.swap(scratch_);
     scratch_.clear();
     token_start_ = cursor_;
   }
   const auto bytes = [&] {
-    return reader_
-               ? TokenBytes()
-               : text_.substr(
-                     static_cast<std::size_t>(begin.offset),
-                     static_cast<std::size_t>(position_.offset - begin.offset));
+    auto length = static_cast<std::size_t>(position_.offset - begin.offset);
+    return reader_ ? TokenBytes() : window_.substr(cursor_ - length, length);
   };
   const auto token = [&](TokenKind kind, std::string_view raw,
                          SpellingId descriptor = kUnknownSpelling) {
     token_start_.reset();
-    const auto storage = reader_ ? syntax.Store(raw, scratch_) : 0;
-    return Token{begin.offset, storage, position_.offset - begin.offset, kind,
-                 descriptor};
+    return Token{kind, descriptor, raw, {source_, begin, position_}};
   };
   if (first == '|' || first == '"') {
     const auto kind = first == '|' ? TokenKind::kQuoted : TokenKind::kString;
@@ -434,8 +444,14 @@ Token Scanner::ScanToken(Syntax& syntax, int first) {
     for (auto byte = Peek(); byte != kEnd; byte = Peek()) {
       if (byte == first) {
         Advance(1);
-        if (kind == TokenKind::kQuoted || Peek() != '"')
-          return token(kind, bytes());
+        if (kind == TokenKind::kQuoted || Peek() != '"') {
+          const auto raw = bytes();
+          const auto spelling =
+              kind == TokenKind::kQuoted
+                  ? ClassifySymbol(raw.substr(1, raw.size() - 2))
+                  : kUnknownSpelling;
+          return token(kind, raw, spelling);
+        }
         Advance(1);
         continue;
       }
@@ -451,7 +467,7 @@ Token Scanner::ScanToken(Syntax& syntax, int first) {
       if (count != 0)
         Advance(count);
       else
-        Scalar(byte, &syntax);
+        Scalar(byte);
     }
     Fail(DiagnosticCode::kSyntax, {source_, begin, position_},
          "Unterminated quoted token");
@@ -461,7 +477,7 @@ Token Scanner::ScanToken(Syntax& syntax, int first) {
     if (byte == 0) Fail(DiagnosticCode::kSyntax, Here(), "NUL in input");
     if (byte >= 128) {
       const auto where = Here();
-      Scalar(byte, &syntax);
+      Scalar(byte);
       Fail(DiagnosticCode::kSyntax, where,
            "Non-ASCII character outside quoted data");
     }
@@ -478,67 +494,11 @@ Token Scanner::ScanToken(Syntax& syntax, int first) {
   return token(kind, raw, descriptor);
 }
 
-void Scanner::ReadCommand(std::optional<Syntax>& pending) {
+std::optional<Token> Scanner::Next() {
   Trivia();
-  auto first = Peek();
-  if (first == kEnd) return;
-  if (first != '(')
-    Fail(DiagnosticCode::kSyntax, Here(), "Expected a command list");
-  auto& syntax = pending.emplace(pool_, text_, Here());
-  struct Frame {
-    // NOLINTBEGIN(readability-identifier-naming): Struct fields, snake_case.
-    ExprId expression;
-    std::size_t token;
-    std::size_t children = 0;
-    // NOLINTEND(readability-identifier-naming)
-  };
-  std::vector<Frame> frames;
-  for (;;) {
-    auto token = ScanToken(syntax, first);
-    const auto token_index = syntax.tokens_.Size();
-    if (token.kind == TokenKind::kRight) {
-      const auto [expression, opening, count] = frames.back();
-      // A closing token records the preorder successor of its entire list.
-      // This lets the parent emit each child's edge directly into its range.
-      token.storage = syntax.expressions_.Size();
-      const auto start = syntax.edges_.Size();
-      auto child = expression + 1;
-      for (std::size_t i = 0; i < count; ++i) {
-        syntax.edges_.Append({child});
-        const auto subtree = syntax.GetExpression(child);
-        child = subtree.token == subtree.last_token
-                    ? child + 1
-                    : static_cast<ExprId>(
-                          syntax.GetToken(subtree.last_token).storage);
-      }
-      syntax.expressions_.Set(expression, {opening, token_index, start, count});
-      frames.pop_back();
-      syntax.AddToken(token);
-      if (frames.empty()) return;
-    } else {
-      syntax.AddToken(token);
-      const auto id = syntax.expressions_.Size();
-      syntax.expressions_.Append({token_index, token_index, 0, 0});
-      if (!frames.empty()) ++frames.back().children;
-      if (token.kind == TokenKind::kLeft) frames.push_back({id, token_index});
-    }
-    Trivia(&syntax);
-    first = Peek();
-    if (first == kEnd)
-      Fail(DiagnosticCode::kSyntax, Here(),
-           "Incomplete command at end of input");
-  }
-}
-
-void Scanner::Next(std::optional<Syntax>& pending) {
-  try {
-    ReadCommand(pending);
-  } catch (...) {
-    std::string{}.swap(scratch_);
-    token_start_.reset();
-    throw;
-  }
-  if (pending) ValidateSyntax(*pending);
+  const auto first = Peek();
+  if (first == kEnd) return std::nullopt;
+  return ScanToken(first);
 }
 
 }  // namespace dandelion::frontend::detail

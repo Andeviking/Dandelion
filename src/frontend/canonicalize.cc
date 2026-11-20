@@ -4,8 +4,8 @@ import std;
 
 namespace dandelion::frontend::detail {
 
-std::span<NodeView> CommutativeOperands(Kind kind,
-                                        std::span<NodeView> operands) noexcept {
+std::span<Node> CommutativeOperands(Kind kind,
+                                    std::span<Node> operands) noexcept {
   using enum Kind;
   switch (kind) {
     case kAnd:
@@ -39,7 +39,7 @@ std::span<NodeView> CommutativeOperands(Kind kind,
   }
 }
 
-bool OrderCommutative(std::span<NodeView> operands) noexcept {
+bool OrderCommutative(std::span<Node> operands) noexcept {
   const auto swap = [&](std::size_t left, std::size_t right) {
     if (operands[left].GetId() <= operands[right].GetId()) return false;
     std::swap(operands[left], operands[right]);
@@ -58,8 +58,8 @@ bool OrderCommutative(std::span<NodeView> operands) noexcept {
       return first || second || third;
     }
     default:
-      if (std::ranges::is_sorted(operands, {}, &NodeView::GetId)) return false;
-      std::ranges::sort(operands, {}, &NodeView::GetId);
+      if (std::ranges::is_sorted(operands, {}, &Node::GetId)) return false;
+      std::ranges::sort(operands, {}, &Node::GetId);
       return true;
   }
 }
@@ -98,31 +98,19 @@ class Canonicalizer {
     operands_.clear();
     bool changed = false;
     for (auto child : node.GetChildren()) {
-      const auto rewritten = memo_.at(child.GetId()).Borrow();
-      changed |= rewritten != child;
+      const auto& rewritten = memo_.at(child.GetId());
+      changed |= rewritten.Borrow() != child;
       operands_.push_back(rewritten);
     }
     changed |= OrderCommutative(CommutativeOperands(node.GetKind(), operands_));
     if (!changed) return Take(manager_.RetainNode(node), {});
-    if (const auto decl = node.GetDeclaration())
-      return Take(manager_.MakeApply(*decl, operands_), {});
-    indices_.clear();
-    for (const auto index : node.GetIndices())
-      indices_.push_back(index.Borrow().Copy());
-    const auto qualifier = node.GetKind() == Kind::kArrayConst
-                               ? std::optional(node.GetSort())
-                               : std::nullopt;
-    return Take(manager_.MakeBuiltin({node.GetKind(), indices_, qualifier,
-                                      node.GetRationalParameter()},
-                                     operands_),
-                {});
+    return Take(manager_.RebuildNodeConsuming(node, operands_), {});
   }
 
   NodeManager manager_;
   std::vector<std::pair<NodeView, std::size_t>> work_;
   std::unordered_map<NodeId, Node> memo_;
-  std::vector<NodeView> operands_;
-  std::vector<Integer> indices_;
+  std::vector<Node> operands_;
 };
 }  // namespace
 }  // namespace dandelion::frontend::detail

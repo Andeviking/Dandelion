@@ -43,8 +43,7 @@ TEST_F(NodeTest,
     EXPECT_EQ(Take(manager_.RetainSort(sort)), sorts[category]);
     Error(other.RetainSort(sort), ErrorCode::kForeignManager);
     EXPECT_EQ(sort.GetWidth().has_value(), category == 3);
-    EXPECT_EQ(sort.GetFpExponentWidth().has_value(), category == 4);
-    EXPECT_EQ(sort.GetFpSignificandWidth().has_value(), category == 4);
+    EXPECT_EQ(sort.GetFpFormat().has_value(), category == 4);
     EXPECT_EQ(sort.GetArrayIndex().has_value(), category == 5);
     EXPECT_EQ(sort.GetArrayElement().has_value(), category == 5);
     EXPECT_EQ(sort.GetSortConstructor().has_value(), category >= 6);

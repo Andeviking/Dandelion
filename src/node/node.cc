@@ -1,8 +1,33 @@
 module dandelion.node;
 import :internal;
+import dandelion.util.numeric;
 import std;
 
 namespace dandelion::detail {
+NodeError TranslateNumericError(numeric::NumericError error, bool literal,
+                                std::uint64_t operand,
+                                std::uint64_t parameter) noexcept {
+  using numeric::NumericError;
+  switch (error) {
+    case NumericError::kInvalidText:
+    case NumericError::kInvalidArgument:
+    case NumericError::kValueOutOfRange:
+      return {
+          literal ? ErrorCode::kInvalidLiteral : ErrorCode::kInvalidParameter,
+          ResourceKind::kNone, operand, parameter};
+    case NumericError::kDivisionByZero:
+      return {ErrorCode::kInvalidParameter, ResourceKind::kNone, operand,
+              parameter};
+    case NumericError::kSizeLimit:
+      return {ErrorCode::kResourceLimit, ResourceKind::kSize, operand,
+              parameter};
+    case NumericError::kCppAllocation:
+      return {ErrorCode::kResourceLimit, ResourceKind::kCppAllocation, operand,
+              parameter};
+  }
+  std::unreachable();
+}
+
 #ifdef DANDELION_NODE_TESTING
 std::atomic<std::uint64_t> destroyed_states{0};
 thread_local std::optional<std::size_t> creation_failure;
@@ -29,29 +54,10 @@ StateHandle<View> Retained(ManagerState* state, View view) {
   RetainState(state);
   return Access::Own<View>(state, view.GetId());
 }
-bool Bit(IntegerView value, std::uint64_t position) noexcept {
-  return ((value.MagnitudeChunk(position / 64) >> (position % 64)) & 1) != 0;
-}
-bool Field(IntegerView value, std::uint64_t start, std::uint64_t count,
-           bool all) noexcept {
-  if (all && value.BitLength() < start + count) return false;
-  const auto end = std::min(start + count, value.BitLength());
-  for (auto position = start; position < end;) {
-    const auto take =
-        std::min(std::uint64_t{64} - position % 64, end - position);
-    const auto mask = take == 64 ? std::numeric_limits<std::uint64_t>::max()
-                                 : (std::uint64_t{1} << take) - 1;
-    const auto part =
-        (value.MagnitudeChunk(position / 64) >> (position % 64)) & mask;
-    if (all && part != mask) return false;
-    if (!all && part != 0) return true;
-    position += take;
-  }
-  return all;
-}
 }  // namespace
 
-SortId CompleteKeySort(ManagerState* state, const QueryKey& key) {
+template <class Child>
+SortId CompleteKeySort(ManagerState* state, const QueryKey<Child>& key) {
   if (key.kind >= Kind::kNot) return InferBuiltinSort(state, key);
   if (key.kind == Kind::kApply) {
 #ifdef DANDELION_NODE_TESTING
@@ -60,30 +66,24 @@ SortId CompleteKeySort(ManagerState* state, const QueryKey& key) {
     const auto [domain, range] = SignatureAt(state, key.declaration);
     Require(domain.size() == key.children.size(), ErrorCode::kInvalidArity);
     for (std::size_t i = 0; i < domain.size(); ++i) {
-      const auto operand = i;
-      const auto* child = CheckNode(state, key.children[i], operand);
-      Require(child->sort_id == domain[i], ErrorCode::kSortMismatch, operand);
+      const auto* child = CheckNode(state, Access::Data(key.children[i]), i);
+      Require(child->sort_id == domain[i], ErrorCode::kSortMismatch, i);
     }
     return range;
   }
-  if (key.kind == Kind::kBvValue) {
-    const auto& sort = SortAt(state, key.input_sort);
-    Require(sort.kind == SortKind::kBitVector, ErrorCode::kSortMismatch);
-    if (key.tag == PayloadTag::kBvWord) {
-      Require(
-          static_cast<std::uint32_t>(std::bit_width(key.word)) <= sort.first,
-          ErrorCode::kInvalidLiteral);
-    } else {
-      Require(key.integer.Sign() >= 0 && key.integer.BitLength() <= sort.first,
-              ErrorCode::kInvalidLiteral);
-    }
-  }
   return key.input_sort;
 }
+
+template SortId CompleteKeySort(ManagerState*, const QueryKey<>&);
+template SortId CompleteKeySort(ManagerState*, const QueryKey<Node>&);
 }  // namespace dandelion::detail
 
 namespace dandelion {
 using namespace detail;
+const char* ReferenceLimit::what() const noexcept {
+  return "Node manager reference count exhausted";
+}
+
 ManagerRef::ManagerRef(ManagerState* state) noexcept : state_(state) {}
 ManagerRef::ManagerRef(const ManagerRef& other) : state_(other.state_) {
   if (state_) detail::RetainState(state_);
@@ -188,7 +188,7 @@ Result<ManagerRef> NodeManager::RetainState() const {
 Result<Node> NodeManager::RetainNode(NodeView node) {
   return Guard<Node>([&] {
     auto* state = CheckedState(*this);
-    auto* data = CheckNode(state, node, 0);
+    auto* data = CheckNode(state, Access::Data(node), 0);
     RetainNodeData(data);
     return Access::OwnNode(data);
   });
@@ -208,12 +208,8 @@ Result<void> NodeManager::ReleaseRoots(
   auto* state = Access::State(manager);
   if (!state) return std::unexpected(NodeError{ErrorCode::kNullObject});
   for (const auto& range : ranges) {
-    if (range.count != 0 && !range.at)
-      return std::unexpected(NodeError{ErrorCode::kInvalidParameter});
-  }
-  for (const auto& range : ranges) {
-    for (std::size_t i = 0; i < range.count; ++i) {
-      const auto* node = Access::Data(range.at(range.context, i)->Borrow());
+    for (std::size_t i = 0; i < Access::RootCount(range); ++i) {
+      const auto* node = Access::Data(Access::RootAt(range, i));
       if (node && node->state != state)
         return std::unexpected(NodeError{ErrorCode::kForeignManager});
     }
@@ -334,6 +330,8 @@ std::size_t NodeIndices::size() const noexcept {
       return 1;
     case PayloadTag::kIndex2:
     case PayloadTag::kRationalConversion:
+    case PayloadTag::kRationalWidePositive:
+    case PayloadTag::kRationalWideNegative:
       return 2;
     default:
       return 0;
@@ -350,7 +348,9 @@ NodeIndices::Index NodeIndices::operator[](std::size_t index) const noexcept {
       return Index(
           IntegerView(Value<std::array<std::uint32_t, 2>>(node_)[index]));
     case PayloadTag::kRationalConversion:
-      return Index(IntegerView(Value<RationalPayload>(node_).indices[index]));
+    case PayloadTag::kRationalWidePositive:
+    case PayloadTag::kRationalWideNegative:
+      return Index(IntegerView(RationalIndices(node_)[index]));
     default:
       std::unreachable();  // A valid index requires a nonempty range.
   }
@@ -381,23 +381,20 @@ std::optional<DeclInstanceView> NodeView::GetDeclaration() const noexcept {
                                           Value<DeclInstanceId>(node_));
 }
 std::optional<LiteralView> NodeView::GetValue() const noexcept {
-  switch (node_->payload_tag) {
-    case PayloadTag::kBool:
-    case PayloadTag::kInteger:
-    case PayloadTag::kBvWord:
-    case PayloadTag::kFpSpecial:
-    case PayloadTag::kFpWord:
-    case PayloadTag::kFpWide:
-    case PayloadTag::kRoundingMode:
+  switch (node_->GetKind()) {
+    case Kind::kBoolValue:
+    case Kind::kIntValue:
+    case Kind::kBvValue:
+    case Kind::kFpValue:
+    case Kind::kRoundingModeValue:
       return LiteralView(node_);
     default:
       return std::nullopt;
   }
 }
 std::optional<RationalView> NodeView::GetRationalParameter() const noexcept {
-  if (node_->payload_tag != PayloadTag::kRationalConversion)
-    return std::nullopt;
-  return Value<RationalPayload>(node_).value.Borrow();
+  if (node_->GetKind() != Kind::kFpFromRational) return std::nullopt;
+  return ReadRational(node_);
 }
 bool NodeView::SameManager(NodeView other) const noexcept {
   return node_ && other.node_ && node_->state == other.node_->state;
@@ -431,27 +428,75 @@ std::optional<bool> LiteralView::GetBool() const noexcept {
   return Value<bool>(node_);
 }
 std::optional<IntegerView> LiteralView::GetInteger() const noexcept {
-  if (node_->payload_tag == PayloadTag::kBvWord)
-    return IntegerView::FromUnsigned(Value<std::uint64_t>(node_));
-  if (node_->payload_tag != PayloadTag::kInteger) return std::nullopt;
-  return Value<Integer>(node_).Borrow();
-}
-std::optional<FpCategory> LiteralView::GetFpCategory() const noexcept {
   switch (node_->payload_tag) {
-    case PayloadTag::kFpSpecial:
-      return Value<FpCategory>(node_);
-    case PayloadTag::kFpWord:
-    case PayloadTag::kFpWide:
-      return FpCategory::kFiniteBits;
+    case PayloadTag::kIntWord:
+      return IntegerView(Value<std::int64_t>(node_));
+    case PayloadTag::kIntWidePositive:
+    case PayloadTag::kIntWideNegative:
+      return IntegerView::FromCanonicalMagnitude(
+          LiteralLimbs(node_),
+          node_->payload_tag == PayloadTag::kIntWideNegative);
     default:
       return std::nullopt;
   }
 }
-std::optional<IntegerView> LiteralView::GetFpBits() const noexcept {
-  if (node_->payload_tag == PayloadTag::kFpWord)
-    return IntegerView::FromUnsigned(Value<std::uint64_t>(node_));
-  if (node_->payload_tag != PayloadTag::kFpWide) return std::nullopt;
-  return Value<Integer>(node_).Borrow();
+namespace {
+using numeric::FpCategory;
+
+// The consecutive FP tags follow the order of the corresponding util
+// categories. The tag is the entire payload for a special.
+constexpr PayloadTag FpSpecialTag(FpSpecial special) noexcept {
+  return static_cast<PayloadTag>(std::to_underlying(PayloadTag::kFpNaN) +
+                                 std::to_underlying(special));
+}
+constexpr FpSpecial ReadFpSpecial(PayloadTag tag) noexcept {
+  return static_cast<FpSpecial>(std::to_underlying(tag) -
+                                std::to_underlying(PayloadTag::kFpNaN));
+}
+
+static_assert(FpSpecialTag(static_cast<FpSpecial>(FpCategory::kNaN)) ==
+                  PayloadTag::kFpNaN &&
+              ReadFpSpecial(PayloadTag::kFpNaN) == FpSpecial::kNaN);
+static_assert(
+    FpSpecialTag(static_cast<FpSpecial>(FpCategory::kPositiveInfinity)) ==
+        PayloadTag::kFpPositiveInfinity &&
+    ReadFpSpecial(PayloadTag::kFpPositiveInfinity) ==
+        FpSpecial::kPositiveInfinity);
+static_assert(
+    FpSpecialTag(static_cast<FpSpecial>(FpCategory::kNegativeInfinity)) ==
+        PayloadTag::kFpNegativeInfinity &&
+    ReadFpSpecial(PayloadTag::kFpNegativeInfinity) ==
+        FpSpecial::kNegativeInfinity);
+static_assert(FpSpecialTag(static_cast<FpSpecial>(FpCategory::kPositiveZero)) ==
+                  PayloadTag::kFpPositiveZero &&
+              ReadFpSpecial(PayloadTag::kFpPositiveZero) ==
+                  FpSpecial::kPositiveZero);
+static_assert(FpSpecialTag(static_cast<FpSpecial>(FpCategory::kNegativeZero)) ==
+                  PayloadTag::kFpNegativeZero &&
+              ReadFpSpecial(PayloadTag::kFpNegativeZero) ==
+                  FpSpecial::kNegativeZero);
+
+BitVectorView ReadBits(const NodeData* node, std::uint32_t width) noexcept {
+  if (IsWideLiteral(node->payload_tag))
+    return BitVectorView::FromCanonicalLimbs(width, LiteralLimbs(node));
+  return BitVectorView::FromCanonicalWord(width, Value<std::uint64_t>(node));
+}
+}  // namespace
+std::optional<BitVectorView> LiteralView::GetBitVector() const noexcept {
+  if (node_->GetKind() != Kind::kBvValue) return std::nullopt;
+  const auto width = SortAt(node_->state, node_->sort_id).first;
+  return ReadBits(node_, static_cast<std::uint32_t>(width));
+}
+std::optional<FloatingPointView> LiteralView::GetFloatingPoint()
+    const noexcept {
+  if (node_->GetKind() != Kind::kFpValue) return std::nullopt;
+  const auto format =
+      *Access::ViewOf<SortView>(node_->state, node_->sort_id).GetFpFormat();
+  if (IsFpSpecial(node_->payload_tag))
+    return FloatingPointView::FromCanonicalSpecial(
+        format, ReadFpSpecial(node_->payload_tag));
+  return FloatingPointView::FromCanonicalBits(format,
+                                              ReadBits(node_, format.Width()));
 }
 std::optional<RoundingMode> LiteralView::GetRoundingMode() const noexcept {
   if (node_->payload_tag != PayloadTag::kRoundingMode) return std::nullopt;
@@ -461,7 +506,7 @@ std::optional<RoundingMode> LiteralView::GetRoundingMode() const noexcept {
 Result<Node> NodeManager::MakeBool(bool value) {
   return Guard<Node>([&] {
     auto* state = CheckedState(*this);
-    QueryKey key{Kind::kBoolValue, ScalarSortId(state, SortKind::kBool), {}};
+    QueryKey<> key{Kind::kBoolValue, ScalarSortId(state, SortKind::kBool), {}};
     key.tag = PayloadTag::kBool;
     key.boolean = value;
     return InternNode(state, key);
@@ -470,75 +515,65 @@ Result<Node> NodeManager::MakeBool(bool value) {
 Result<Node> NodeManager::MakeInt(IntegerView value) {
   return Guard<Node>([&] {
     auto* state = CheckedState(*this);
-    QueryKey key{Kind::kIntValue, ScalarSortId(state, SortKind::kInt), {}};
-    key.tag = PayloadTag::kInteger;
-    key.integer = value;
-    return InternNode(state, key);
-  });
-}
-Result<Node> NodeManager::MakeBvValue(SortView sort, IntegerView value) {
-  return Guard<Node>([&] {
-    auto* state = CheckedState(*this);
-    CheckView(state, sort);
-    QueryKey key{Kind::kBvValue, sort.GetId(), {}};
-    if (const auto word = value.TryUint64()) {
-      key.tag = PayloadTag::kBvWord;
-      key.word = *word;
+    const auto sort = ScalarSortId(state, SortKind::kInt);
+    QueryKey<> key{Kind::kIntValue, sort, {}};
+    if (const auto word = value.TryInt64()) {
+      key.tag = PayloadTag::kIntWord;
+      key.word = static_cast<std::uint64_t>(*word);
     } else {
-      key.tag = PayloadTag::kInteger;
+      key.tag = value.Sign() < 0 ? PayloadTag::kIntWideNegative
+                                 : PayloadTag::kIntWidePositive;
       key.integer = value;
     }
-    return InternNode(state, key);
+    return InternNode(state, key, sort);
   });
 }
-Result<Node> NodeManager::MakeFpBits(SortView sort, IntegerView bits) {
+namespace {
+void SetBitPayload(QueryKey<>& key, BitVectorView bits, PayloadTag word_tag,
+                   PayloadTag wide_tag) noexcept {
+  if (const auto word = bits.TryUint64()) {
+    key.tag = word_tag;
+    key.word = *word;
+  } else {
+    key.tag = wide_tag;
+    key.integer = IntegerView::FromCanonicalMagnitude(bits.Limbs(), false);
+  }
+}
+}  // namespace
+Result<Node> NodeManager::MakeBvValue(SortView sort, BitVectorView value) {
   return Guard<Node>([&] {
     auto* state = CheckedState(*this);
     CheckView(state, sort);
-    Require(sort.GetKind() == SortKind::kFloatingPoint,
-            ErrorCode::kSortMismatch);
-    const auto e = *sort.GetFpExponentWidth();
-    const auto s = *sort.GetFpSignificandWidth();
-    Require(bits.Sign() >= 0 &&
-                bits.BitLength() <= static_cast<std::uint64_t>(e) + s,
+    Require(sort.GetWidth() == value.Width(), ErrorCode::kSortMismatch);
+    QueryKey<> key{Kind::kBvValue, sort.GetId(), {}};
+    SetBitPayload(key, value, PayloadTag::kBvWord, PayloadTag::kBvWide);
+    return InternNode(state, key);
+  });
+}
+Result<Node> NodeManager::MakeBvWordValue(SortView sort, std::uint64_t value) {
+  return Guard<Node>([&] {
+    auto* state = CheckedState(*this);
+    CheckView(state, sort);
+    const auto width = sort.GetWidth();
+    Require(width.has_value(), ErrorCode::kSortMismatch);
+    Require(static_cast<std::uint32_t>(std::bit_width(value)) <= *width,
             ErrorCode::kInvalidLiteral);
-    const bool negative = Bit(bits, static_cast<std::uint64_t>(e) + s - 1);
-    const bool fraction = Field(bits, 0, s - 1, false);
-    FpCategory category = FpCategory::kFiniteBits;
-    if (Field(bits, s - 1, e, true)) {
-      category = fraction   ? FpCategory::kNaN
-                 : negative ? FpCategory::kNegativeInfinity
-                            : FpCategory::kPositiveInfinity;
-    } else if (!fraction && !Field(bits, s - 1, e, false)) {
-      category =
-          negative ? FpCategory::kNegativeZero : FpCategory::kPositiveZero;
-    }
-    QueryKey key{Kind::kFpValue, sort.GetId(), {}};
-    if (category != FpCategory::kFiniteBits) {
-      key.tag = PayloadTag::kFpSpecial;
-      key.fp_category = category;
-    } else if (const auto word = bits.TryUint64()) {
-      key.tag = PayloadTag::kFpWord;
-      key.word = *word;
+    QueryKey<> key{Kind::kBvValue, sort.GetId(), {}, PayloadTag::kBvWord};
+    key.word = value;
+    return InternNode(state, key);
+  });
+}
+Result<Node> NodeManager::MakeFpValue(SortView sort, FloatingPointView value) {
+  return Guard<Node>([&] {
+    auto* state = CheckedState(*this);
+    CheckView(state, sort);
+    Require(sort.GetFpFormat() == value.Format(), ErrorCode::kSortMismatch);
+    QueryKey<> key{Kind::kFpValue, sort.GetId(), {}};
+    if (const auto bits = value.FiniteBits()) {
+      SetBitPayload(key, *bits, PayloadTag::kFpWord, PayloadTag::kFpWide);
     } else {
-      key.tag = PayloadTag::kFpWide;
-      key.integer = bits;
+      key.tag = FpSpecialTag(static_cast<FpSpecial>(value.Category()));
     }
-    return InternNode(state, key);
-  });
-}
-Result<Node> NodeManager::MakeFpSpecial(SortView sort, FpSpecial value) {
-  return Guard<Node>([&] {
-    auto* state = CheckedState(*this);
-    CheckView(state, sort);
-    Require(sort.GetKind() == SortKind::kFloatingPoint,
-            ErrorCode::kSortMismatch);
-    Require(std::to_underlying(value) <=
-                std::to_underlying(FpSpecial::kNegativeZero),
-            ErrorCode::kInvalidLiteral);
-    QueryKey key{Kind::kFpValue, sort.GetId(), {}};
-    key.tag = PayloadTag::kFpSpecial;
-    key.fp_category = static_cast<FpCategory>(value);
     return InternNode(state, key);
   });
 }
@@ -547,28 +582,43 @@ Result<Node> NodeManager::MakeRoundingMode(RoundingMode value) {
     auto* state = CheckedState(*this);
     Require(std::to_underlying(value) <= std::to_underlying(RoundingMode::kRtz),
             ErrorCode::kInvalidLiteral);
-    QueryKey key{Kind::kRoundingModeValue,
-                 ScalarSortId(state, SortKind::kRoundingMode),
-                 {}};
+    QueryKey<> key{Kind::kRoundingModeValue,
+                   ScalarSortId(state, SortKind::kRoundingMode),
+                   {}};
     key.tag = PayloadTag::kRoundingMode;
     key.rounding_mode = value;
     return InternNode(state, key);
   });
 }
-Result<Sort> NodeManager::CheckBuiltin(BuiltinOpView op,
-                                       std::span<const NodeView> children) {
+namespace {
+template <class Child>
+Result<Sort> CheckBuiltinImpl(NodeManager& manager, BuiltinOpView op,
+                              std::span<Child> children) {
   return Guard<Sort>([&] {
-    auto* state = CheckedState(*this);
+    auto* state = CheckedState(manager);
     StateLease lease(state);
     const auto id = InferBuiltinSort(state, BuiltinKey(state, op, children));
     lease.Transfer();
     return Access::Own<SortView>(state, id);
   });
 }
-Result<Node> NodeManager::MakeBuiltin(BuiltinOpView op,
-                                      std::span<const NodeView> children) {
+}  // namespace
+
+Result<Sort> NodeManager::CheckBuiltin(BuiltinOpView op,
+                                       std::span<const NodeView> children) {
+  return CheckBuiltinImpl(*this, op, children);
+}
+Result<Sort> NodeManager::CheckBuiltinOperands(BuiltinOpView op,
+                                               std::span<const Node> children) {
+  return CheckBuiltinImpl(*this, op, children);
+}
+
+namespace {
+template <class Child>
+Result<Node> MakeBuiltinImpl(NodeManager& manager, BuiltinOpView op,
+                             std::span<Child> children) {
   return Guard<Node>([&] {
-    auto* state = CheckedState(*this);
+    auto* state = CheckedState(manager);
     // Const-array stores its explicit qualifier in the result sort, even
     // though its node has no additional payload.
     if (op.kind >= Kind::kNot && op.kind < Kind::kArrayConst &&
@@ -577,17 +627,121 @@ Result<Node> NodeManager::MakeBuiltin(BuiltinOpView op,
     return InternNode(state, BuiltinKey(state, op, children));
   });
 }
-Result<Node> NodeManager::MakeApply(DeclInstanceView declaration,
-                                    std::span<const NodeView> arguments) {
+template <class Child>
+Result<Node> MakeWordIndexedBuiltinImpl(NodeManager& manager, Kind kind,
+                                        std::span<const std::uint64_t> indices,
+                                        std::span<Child> children) {
+  if (indices.empty())
+    return MakeBuiltinImpl(manager, {kind, {}, {}, {}}, children);
   return Guard<Node>([&] {
-    auto* state = CheckedState(*this);
+    auto* state = CheckedState(manager);
+    return InternNode(state,
+                      WordIndexedBuiltinKey(state, kind, indices, children));
+  });
+}
+template <class Child>
+Result<Node> RebuildNodeImpl(NodeManager& manager, NodeView original,
+                             std::span<Child> children) {
+  return Guard<Node>([&] {
+    auto* state = CheckedState(manager);
+    auto* source = CheckNode(state, Access::Data(original),
+                             std::numeric_limits<std::uint64_t>::max());
+    const auto old_children = Children(source);
+    Require(children.size() == old_children.size(), ErrorCode::kInvalidArity);
+    bool changed = false;
+    for (std::size_t i = 0; i < children.size(); ++i) {
+      auto* child = Access::Data(children[i]);
+      if (child == old_children[i]) continue;
+      CheckNode(state, child, i);
+      Require(child->sort_id == old_children[i]->sort_id,
+              ErrorCode::kSortMismatch, i);
+      changed = true;
+    }
+    if (!changed) {
+      RetainNodeData(source);
+      return Access::OwnNode(source);
+    }
+
+    const auto kind = source->GetKind();
+    const auto qualifier = kind == Kind::kArrayConst ? source->sort_id : 0;
+    QueryKey<Child> key{kind, qualifier, children, source->payload_tag};
+    switch (key.tag) {
+      case PayloadTag::kNone:
+        break;
+      case PayloadTag::kDeclaration:
+        key.declaration = Value<DeclInstanceId>(source);
+        break;
+      case PayloadTag::kIndex1:
+        key.indices[0] = Value<std::uint32_t>(source);
+        break;
+      case PayloadTag::kIndex2:
+        key.indices = Value<std::array<std::uint32_t, 2>>(source);
+        break;
+      case PayloadTag::kIndexWide:
+        key.integer = Value<Integer>(source).Borrow();
+        break;
+      case PayloadTag::kRationalConversion:
+      case PayloadTag::kRationalWidePositive:
+      case PayloadTag::kRationalWideNegative:
+        key.indices = RationalIndices(source);
+        key.rational = ReadRational(source);
+        break;
+      default:
+        // Literal payloads only occur on nodes with no children.
+        std::unreachable();
+    }
+    return InternNode(state, key, source->sort_id);
+  });
+}
+template <class Child>
+Result<Node> MakeApplyImpl(NodeManager& manager, DeclInstanceView declaration,
+                           std::span<Child> arguments) {
+  return Guard<Node>([&] {
+    auto* state = CheckedState(manager);
     CheckView(state, declaration);
-    QueryKey key{Kind::kApply, 0, arguments};
+    QueryKey<Child> key{Kind::kApply, 0, arguments};
     key.tag = PayloadTag::kDeclaration;
     key.declaration = declaration.GetId();
     return InternNode(state, key);
   });
 }
+}  // namespace
+
+Result<Node> NodeManager::MakeBuiltin(BuiltinOpView op,
+                                      std::span<const NodeView> children) {
+  return MakeBuiltinImpl(*this, op, children);
+}
+Result<Node> NodeManager::MakeBuiltinConsuming(BuiltinOpView op,
+                                               std::span<Node> children) {
+  return MakeBuiltinImpl(*this, op, children);
+}
+Result<Node> NodeManager::MakeWordIndexedBuiltin(
+    Kind kind, std::span<const std::uint64_t> indices,
+    std::span<const NodeView> children) {
+  return MakeWordIndexedBuiltinImpl(*this, kind, indices, children);
+}
+Result<Node> NodeManager::MakeWordIndexedBuiltinConsuming(
+    Kind kind, std::span<const std::uint64_t> indices,
+    std::span<Node> children) {
+  return MakeWordIndexedBuiltinImpl(*this, kind, indices, children);
+}
+Result<Node> NodeManager::RebuildNode(NodeView original,
+                                      std::span<const NodeView> children) {
+  return RebuildNodeImpl(*this, original, children);
+}
+Result<Node> NodeManager::RebuildNodeConsuming(NodeView original,
+                                               std::span<Node> children) {
+  return RebuildNodeImpl(*this, original, children);
+}
+Result<Node> NodeManager::MakeApply(DeclInstanceView declaration,
+                                    std::span<const NodeView> arguments) {
+  return MakeApplyImpl(*this, declaration, arguments);
+}
+Result<Node> NodeManager::MakeApplyConsuming(DeclInstanceView declaration,
+                                             std::span<Node> arguments) {
+  return MakeApplyImpl(*this, declaration, arguments);
+}
+
 Result<Node> NodeManager::MakeFreshConstant(std::string_view name,
                                             SortView sort) {
   return Guard<Node>([&] {
@@ -602,10 +756,10 @@ Result<Node> NodeManager::MakeFreshConstant(std::string_view name,
     ReserveAppend(state, state->declarations);
     ReserveAppend(state, state->instances);
     state->table.EnsureSpace(state);
-    QueryKey key{Kind::kApply, 0, {}};
+    QueryKey<> key{Kind::kApply, 0, {}};
     key.tag = PayloadTag::kDeclaration;
     key.declaration = instance_id;
-    auto hash = HashKey(key);
+    auto hash = HashKey(state, key);
 #ifdef DANDELION_NODE_TESTING
     if (state->collision_hash) hash = *state->collision_hash;
 #endif

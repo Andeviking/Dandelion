@@ -7,9 +7,22 @@ The [project architecture](../architecture.md) describes the frontend's role
 in the solver as a whole. The separate [frontend testing design](../testing/frontend.md)
 describes testing requirements and remains part of the testing documentation.
 
-The [implementation record](implementation.md) documents the entry points,
-coverage, and bounded corpus evidence. Solving and production model semantics
-remain responsibilities of future providers.
+The frontend binds nullary definitions and `:named` directly to typed
+bodies and exposes a semantic `QueryContext`. Source history and strict
+metadata validation are independent session options. Model export uses
+canonical symbols, semantic ranks and available sort abbreviations.
+
+[`Session::ReadCommand`](design.md#phase-2-fused-command-reading) reads and
+publishes one typed command at a time. It preserves grammar precedence
+during recovery. The execution loop uses the same reader for prompt
+check responses and model-aware admission. `SyntaxValidator` serves
+grammar-only tools and tests. The
+[Phase 2 test design](../testing/frontend.md#phase-2-test-design) specifies
+the acceptance cases.
+
+The [implementation record](implementation.md) reports Phase 1 verification
+and the earlier bounded baseline evidence. Future providers will establish
+solving and production model semantics.
 
 | Document | Responsibility |
 | --- | --- |

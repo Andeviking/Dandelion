@@ -1,5 +1,6 @@
 module dandelion.frontend;
 import :internal;
+import dandelion.util.numeric;
 import std;
 
 namespace dandelion::frontend::detail {
@@ -39,11 +40,13 @@ SortSpelling ExpandSpelling(SortView sort) {
     case SortKind::kBitVector:
       spelling.head = "(_ BitVec " + std::to_string(*sort.GetWidth()) + ")";
       break;
-    case SortKind::kFloatingPoint:
+    case SortKind::kFloatingPoint: {
+      const auto format = *sort.GetFpFormat();
       spelling.head = "(_ FloatingPoint " +
-                      std::to_string(*sort.GetFpExponentWidth()) + " " +
-                      std::to_string(*sort.GetFpSignificandWidth()) + ")";
+                      std::to_string(format.ExponentWidth()) + " " +
+                      std::to_string(format.SignificandWidth()) + ")";
       break;
+    }
     case SortKind::kArray:
       spelling.head = "Array";
       spelling.arguments = {*sort.GetArrayIndex(), *sort.GetArrayElement()};
@@ -106,16 +109,25 @@ class SortPrinter {
   SessionState& session_;
   bool indexed_ = false;
   std::vector<AliasCandidate> aliases_;
+  std::unordered_map<SortId, std::pair<std::string, std::string_view>> nullary_;
   std::unordered_map<MatchKey, std::optional<Bindings>, MatchHash> matches_;
   std::unordered_map<SortId, SortSpelling> spellings_;
 };
 
 void SortPrinter::IndexAliases() {
   for (const auto& [name, binding] : signature_.sorts.Entries()) {
-    const auto* alias = std::get_if<Alias>(&binding);
-    // A parameter root would need the sort itself as a printed argument.
-    if (alias && alias->root->kind != RecipeKind::kParameter)
+    if (const auto* concrete = std::get_if<Sort>(&binding)) {
+      std::string head;
+      Symbol(head, name);
+      auto& best = nullary_[concrete->GetId()];
+      if (best.first.empty() || std::pair{head.size(), name} <
+                                    std::pair{best.first.size(), best.second})
+        best = {std::move(head), name};
+    } else if (const auto* alias = std::get_if<Alias>(&binding);
+               alias && alias->root->kind != RecipeKind::kParameter) {
+      // A parameter root would need the sort itself as a printed argument.
       aliases_.push_back({name, alias, alias->root->height});
+    }
   }
   std::ranges::sort(aliases_, {}, &AliasCandidate::height);
   indexed_ = true;
@@ -219,9 +231,19 @@ void SortPrinter::ChooseSpellings(SortView root) {
     }
     const auto expanded_size = Size(spelling.arguments);
     spelling.size = expanded_size;
-    const auto written = signature_.sort_spellings.find(sort.GetId());
-    auto best = std::tuple{expanded_size, true, spelling.head.size(), false,
+    auto best = std::tuple{expanded_size, spelling.head.size(), false,
                            std::string_view{}};
+    if (const auto found = nullary_.find(sort.GetId());
+        found != nullary_.end()) {
+      const auto& [head, name] = found->second;
+      const auto score = std::tuple{std::size_t{1}, head.size(), true, name};
+      if (score < best) {
+        spelling.head = head;
+        spelling.arguments.clear();
+        spelling.size = 1;
+        best = score;
+      }
+    }
     auto next = std::ranges::upper_bound(aliases_, spelling.height, {},
                                          &AliasCandidate::height);
     while (next != aliases_.begin()) {
@@ -240,17 +262,10 @@ void SortPrinter::ChooseSpellings(SortView root) {
       for (auto [parameter, argument] : *bindings)
         arguments[parameter] = argument;
       const auto size = Size(arguments);
-      const bool in_source =
-          written != signature_.sort_spellings.end() && written->second == name;
-      // Keep written compound spellings on ties. For atomic spellings a
-      // shorter name wins. Inferred applications must abbreviate structure.
-      if (size > spelling.size ||
-          (size == expanded_size && !in_source && alias->arity != 0))
-        continue;
+      if (size >= expanded_size || size > spelling.size) continue;
       std::string head;
       Symbol(head, name);
-      const auto score = std::tuple{size, !in_source || size == 1, head.size(),
-                                    true, std::string_view(name)};
+      const auto score = std::tuple{size, head.size(), true, name};
       if (score < best) {
         spelling.head = std::move(head);
         spelling.arguments = std::move(arguments);
@@ -292,7 +307,7 @@ void SortPrinter::Append(std::string& output, SortView sort) {
     }
   }
 }
-void IntegerText(std::string& out, IntegerView value,
+void IntegerText(std::string& out, numeric::IntegerView value,
                  bool binary_negative = false) {
   const auto text = value.ToDecimal();
   if (text.starts_with('-')) {
@@ -303,36 +318,54 @@ void IntegerText(std::string& out, IntegerView value,
   }
 }
 
-void Binary(std::string& out, IntegerView bits, std::uint32_t width,
+void Binary(std::string& out, numeric::BitVectorView bits, std::uint32_t width,
             std::uint64_t offset = 0) {
   out.append("#b");
   const auto start = out.size();
   if (width > out.max_size() - start)
     throw std::length_error("Binary literal size");
   out.resize(start + width, '0');
-  const auto end = std::min(offset + width, bits.BitLength());
+  const auto end =
+      std::min(offset + width, std::uint64_t{bits.EffectiveBitLength()});
   for (auto bit = offset; bit < end;) {
-    const auto chunk = bits.MagnitudeChunk(bit / 64);
+    const auto chunk = bits.Chunk(bit / 64);
     const auto until = std::min(end, (bit / 64 + 1) * 64);
     for (; bit < until; ++bit)
       out[start + width - 1 - static_cast<std::size_t>(bit - offset)] =
           ((chunk >> (bit % 64)) & 1) != 0 ? '1' : '0';
   }
 }
-void FpFields(std::string& out, bool negative, std::uint32_t exponent_width,
-              std::uint32_t significand_width, IntegerView exponent,
-              IntegerView fraction) {
+void FpText(std::string& out, numeric::FloatingPointView value) {
+  const auto format = value.Format();
+  const auto category = value.Category();
+  const auto fraction_width = format.SignificandWidth() - 1;
+  bool negative;
+  const auto bits = value.FiniteBits().value_or(
+      numeric::BitVectorView::FromCanonicalWord(format.Width(), 0));
+  switch (category) {
+    case numeric::FpCategory::kFiniteBits: {
+      const auto sign_offset = format.Width() - 1;
+      negative =
+          ((bits.Chunk(sign_offset / 64) >> (sign_offset % 64)) & 1) != 0;
+      break;
+    }
+    case numeric::FpCategory::kPositiveZero:
+    case numeric::FpCategory::kNegativeZero:
+      negative = category == numeric::FpCategory::kNegativeZero;
+      break;
+    default:
+      out.append("(_ ")
+          .append(SpecialSpelling(static_cast<numeric::FpSpecial>(category)))
+          .push_back(' ');
+      out.append(std::to_string(format.ExponentWidth())).push_back(' ');
+      out.append(std::to_string(format.SignificandWidth())).push_back(')');
+      return;
+  }
   out.append(negative ? "(fp #b1 " : "(fp #b0 ");
-  Binary(out, exponent, exponent_width);
+  Binary(out, bits, format.ExponentWidth(), fraction_width);
   out.push_back(' ');
-  Binary(out, fraction, significand_width - 1);
+  Binary(out, bits, fraction_width);
   out.push_back(')');
-}
-void FpSpecialText(std::string& out, FpSpecial value, std::uint32_t exp,
-                   std::uint32_t sig) {
-  out.append("(_ ").append(SpecialSpelling(value)).push_back(' ');
-  out.append(std::to_string(exp)).push_back(' ');
-  out.append(std::to_string(sig)).push_back(')');
 }
 void ScalarText(std::string& out, NodeView node, bool binary_negative) {
   const auto value = *node.GetValue();
@@ -343,37 +376,17 @@ void ScalarText(std::string& out, NodeView node, bool binary_negative) {
     case Kind::kIntValue:
       IntegerText(out, *value.GetInteger(), binary_negative);
       break;
-    case Kind::kBvValue:
-      Binary(out, *value.GetInteger(), *node.GetSort().GetWidth());
+    case Kind::kBvValue: {
+      const auto bits = *value.GetBitVector();
+      Binary(out, bits, bits.Width());
       break;
+    }
     case Kind::kRoundingModeValue:
       out.append(RoundingSpelling(*value.GetRoundingMode()));
       break;
-    case Kind::kFpValue: {
-      const auto sort = node.GetSort();
-      const auto e = *sort.GetFpExponentWidth();
-      const auto s = *sort.GetFpSignificandWidth();
-      const auto cat = *value.GetFpCategory();
-      if (cat == FpCategory::kPositiveZero ||
-          cat == FpCategory::kNegativeZero) {
-        FpFields(out, cat == FpCategory::kNegativeZero, e, s, IntegerView{},
-                 IntegerView{});
-      } else if (cat == FpCategory::kFiniteBits) {
-        const auto bits = *value.GetFpBits();
-        const auto sign_offset = static_cast<std::uint64_t>(e) + s - 1;
-        const bool negative =
-            ((bits.MagnitudeChunk(sign_offset / 64) >> (sign_offset % 64)) &
-             1) != 0;
-        out.append(negative ? "(fp #b1 " : "(fp #b0 ");
-        Binary(out, bits, e, s - 1);
-        out.push_back(' ');
-        Binary(out, bits, s - 1);
-        out.push_back(')');
-      } else {
-        FpSpecialText(out, static_cast<FpSpecial>(cat), e, s);
-      }
+    case Kind::kFpValue:
+      FpText(out, *value.GetFloatingPoint());
       break;
-    }
     default:
       std::unreachable();
   }
@@ -387,13 +400,10 @@ void IndexedHead(std::string& out, std::string_view op, NodeIndices indices) {
   }
   out.push_back(')');
 }
-bool RatioHasDivision(RationalView value) {
-  return value.Denominator().TryUint64() != 1;
-}
-void RatioText(std::string& out, RationalView value) {
+void RatioText(std::string& out, numeric::RationalView value) {
   const auto numerator = value.Numerator();
   const auto denominator = value.Denominator();
-  if (!RatioHasDivision(value)) {
+  if (value.IsInteger()) {
     IntegerText(out, numerator);
   } else {
     out.append("(/ ");
@@ -409,10 +419,7 @@ bool WorthSharing(NodeView node) noexcept {
   if (kind == Kind::kBvValue) return *node.GetSort().GetWidth() > 64;
   if (kind == Kind::kIntValue)
     return node.GetValue()->GetInteger()->BitLength() > 64;
-  if (kind == Kind::kFpValue)
-    return std::uint64_t{*node.GetSort().GetFpExponentWidth()} +
-               *node.GetSort().GetFpSignificandWidth() >
-           64;
+  if (kind == Kind::kFpValue) return node.GetSort().GetFpFormat()->Width() > 64;
   return false;
 }
 
@@ -428,6 +435,9 @@ class ModelPrinter {
         profile_(*signature_.profile),
         where_(where),
         sort_text_(signature_, session),
+#ifdef DANDELION_FRONTEND_TESTING
+        session_(session),
+#endif
         staged_keys_(0, state_.keys.hash_function()) {
     if (state_.writing_response) Bad("Model response is already in progress");
     state_.writing_response = true;
@@ -447,8 +457,7 @@ class ModelPrinter {
   bool NeedsQualifier(DeclInstanceView instance);
   void Constructor(std::string& out, DeclInstanceView instance);
   std::string Value(const ValueRef& value);
-  std::string Function(const ExportedFunction& record,
-                       const UserFunction& original);
+  std::string Function(const ExportedFunction& record);
   void Body(std::string& out, NodeView root);
   void Validate(NodeView node);
   std::vector<NodeView> Postorder(NodeView root);
@@ -462,6 +471,9 @@ class ModelPrinter {
   const Profile& profile_;
   SourceSpan where_;
   SortPrinter sort_text_;
+#ifdef DANDELION_FRONTEND_TESTING
+  SessionState& session_;
+#endif
   std::vector<ExposedValue> staged_;
   AbstractNames staged_keys_;
   ProxyBindings staged_proxies_;
@@ -491,6 +503,9 @@ std::string_view ModelPrinter::Expose(const ValueRef& value) {
   sort_text_.Append(text, value.GetSort());
   text.push_back(')');
   auto proxy = state_.RegisterProxy(value, staged_proxies_, where_);
+#ifdef DANDELION_FRONTEND_TESTING
+  session_.Checkpoint();
+#endif
   staged_keys_.emplace(key, ordinal);
   return staged_.emplace_back(std::move(proxy), value, std::move(text))
       .spelling;
@@ -665,12 +680,9 @@ std::vector<NodeView> ModelPrinter::Postorder(NodeView root) {
 }
 
 std::string ModelPrinter::RoundedSuffix(NodeView node, std::string_view name) {
-  constexpr std::array modes{RoundingMode::kRne, RoundingMode::kRna,
-                             RoundingMode::kRtp, RoundingMode::kRtn,
-                             RoundingMode::kRtz};
-  const auto sort = node.GetSort();
-  const auto exp = *sort.GetFpExponentWidth();
-  const auto sig = *sort.GetFpSignificandWidth();
+  using enum numeric::RoundingMode;
+  constexpr std::array modes{kRne, kRna, kRtp, kRtn, kRtz};
+  const auto format = *node.GetSort().GetFpFormat();
   const auto value = *node.GetRationalParameter();
   std::string text = ")) ";
   for (auto mode : modes) {
@@ -680,16 +692,9 @@ std::string ModelPrinter::RoundedSuffix(NodeView node, std::string_view name) {
           .append(" ")
           .append(RoundingSpelling(mode))
           .append(") ");
-    const auto actual = Take(RoundRationalToFp(exp, sig, mode, value), where_);
-    if (actual.infinite) {
-      FpSpecialText(text,
-                    actual.negative ? FpSpecial::kNegativeInfinity
-                                    : FpSpecial::kPositiveInfinity,
-                    exp, sig);
-    } else {
-      FpFields(text, actual.negative, exp, sig, actual.exponent.Borrow(),
-               actual.fraction.Borrow());
-    }
+    const auto rounded =
+        TakeNumericAt(numeric::RoundRationalToFp(format, mode, value), where_);
+    FpText(text, rounded.Borrow());
     if (mode != modes.back()) text.push_back(' ');
   }
   text.append(modes.size(), ')');
@@ -722,7 +727,7 @@ void ModelPrinter::Body(std::string& out, NodeView root) {
     if (node.GetKind() == Kind::kFpFromRational) {
       const auto value = *node.GetRationalParameter();
       if ((value.Numerator().Sign() < 0 && signature_.terms.contains("-")) ||
-          (RatioHasDivision(value) && signature_.terms.contains("/"))) {
+          (!value.IsInteger() && signature_.terms.contains("/"))) {
         const auto name = FreshName();
         out.append("(let ((").append(name).push_back(' ');
         work.push_back(RoundedSuffix(node, name));
@@ -782,8 +787,7 @@ void ModelPrinter::Body(std::string& out, NodeView root) {
   }
 }
 
-std::string ModelPrinter::Function(const ExportedFunction& record,
-                                   const UserFunction& original) {
+std::string ModelPrinter::Function(const ExportedFunction& record) {
   formals_.clear();
   references_.clear();
   shared_.clear();
@@ -795,9 +799,7 @@ std::string ModelPrinter::Function(const ExportedFunction& record,
       record.formals.size() != domain.size())
     Bad("Model definition does not have the original rank");
   std::string out = "(define-fun ";
-  if (original.source_name.IsQuoted()) out.push_back('|');
-  out.append(original.source_name.Canonical());
-  if (original.source_name.IsQuoted()) out.push_back('|');
+  Symbol(out, decl.GetNameHint());
   out.append(" (");
   for (std::size_t i = 0; i < domain.size(); ++i) {
     const auto formal = record.formals[i].Borrow();
@@ -809,9 +811,12 @@ std::string ModelPrinter::Function(const ExportedFunction& record,
     if (i != 0) out.push_back(' ');
     out.push_back('(');
     out.append(entry->second).push_back(' ');
-    out.append(original.source_rank[i]).push_back(')');
+    sort_text_.Append(out, domain[i]);
+    out.push_back(')');
   }
-  out.append(") ").append(original.source_rank.back()).push_back(' ');
+  out.append(") ");
+  sort_text_.Append(out, *decl.GetRange());
+  out.push_back(' ');
   for (const auto term : Postorder(body)) {
     if (references_.at(term.GetId()) < 2 || !WorthSharing(term)) continue;
     auto name = FreshName();
@@ -863,7 +868,7 @@ void ModelPrinter::Model(Response& response) {
         Signature::FunctionOrdinal(*state_.query, entry.declaration.Borrow());
     if (!ordinal || written_[*ordinal])
       Bad("Model export repeats or introduces a user symbol");
-    auto text = Function(entry, originals[*ordinal]);
+    auto text = Function(entry);
     text.insert(0, first ? "(" : " ");
     written_[*ordinal] = true;
     response.Write(text, where_);

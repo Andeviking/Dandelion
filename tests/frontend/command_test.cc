@@ -5,6 +5,7 @@ namespace {
 
 TEST(FrontendCommands, PrefixStateMetadataAndOwnedCheckContext) {
   std::shared_ptr<const QueryContext> query;
+  SourceRecords records;
   {
     const std::string input =
         "(set-option :print-success true)(set-info :status unsat)"
@@ -19,40 +20,45 @@ TEST(FrontendCommands, PrefixStateMetadataAndOwnedCheckContext) {
         "(declare-fun f (Alias Int) U)(declare-const unused Bool)"
         "(define-const n Int 1)(assert true)(assert true)(check-sat)"
         "(set-info :status sat)(get-model)(exit)";
-    auto session = Require(Session::FromText(input));
+    auto session = Require(
+        Session::FromText(input, ParseOptions{.capture_source_records = true}));
     EXPECT_EQ(session.GetPhase(), SessionPhase::kBeforeLogic);
     while (const auto command = Require(Next(session))) {
       if (command->query) {
         EXPECT_EQ(session.GetPhase(), SessionPhase::kAfterCheck);
         query = command->query;
+        EXPECT_EQ(session.GetSourceRecords()->metadata.size(), 12);
       }
     }
     EXPECT_EQ(session.GetPhase(), SessionPhase::kTerminated);
-    EXPECT_EQ(session.GetMetadata().size(), 13);
+    EXPECT_EQ(session.GetSourceRecords()->metadata.size(), 13);
+    records = *session.GetSourceRecords();
   }
   ASSERT_TRUE(query);
   EXPECT_EQ(query->GetLogic(), "ALL");
   EXPECT_TRUE(query->GetOptions().produce_models);
-  ASSERT_EQ(query->GetMetadata().size(), 12);
-  EXPECT_EQ(query->GetMetadata().front().value, "unsat");
-  EXPECT_EQ(query->GetMetadata()[4].value, "\"a\"\"b\"");
-  EXPECT_FALSE(query->GetMetadata()[9].value);
-  EXPECT_EQ(query->GetMetadata().back().value, "unknown");
+  ASSERT_EQ(records.metadata.size(), 13);
+  EXPECT_EQ(records.metadata.front().value, "unsat");
+  EXPECT_EQ(records.metadata[4].value, "\"a\"\"b\"");
+  EXPECT_FALSE(records.metadata[9].value);
+  EXPECT_EQ(records.metadata[11].value, "unknown");
+  EXPECT_EQ(records.metadata.back().value, "sat");
   ASSERT_EQ(query->GetUserSorts().size(), 1);
   ASSERT_EQ(query->GetFunctions().size(), 2);
-  const auto& function = query->GetFunctions()[0];
+  const auto& function = records.functions[0];
   EXPECT_EQ(function.source_name, "f");
   ASSERT_EQ(function.source_rank.size(), 3);
   EXPECT_EQ(function.source_rank[0], "Alias");
   EXPECT_EQ(function.source_rank[1], "Int");
   EXPECT_EQ(function.source_rank[2], "U");
   ASSERT_EQ(query->GetAssertions().size(), 2);
-  EXPECT_EQ(query->GetAssertions()[0].term, query->GetAssertions()[1].term);
-  EXPECT_LT(query->GetAssertions()[0].where.begin.offset,
-            query->GetAssertions()[1].where.begin.offset);
-  ASSERT_EQ(query->GetDefinitions().size(), 1);
-  EXPECT_EQ(query->FindDefinition(query->GetDefinitions()[0].decl.GetId()),
-            &query->GetDefinitions()[0]);
+  EXPECT_EQ(query->GetAssertions()[0], query->GetAssertions()[1]);
+  EXPECT_LT(records.assertions[0].where.begin.offset,
+            records.assertions[1].where.begin.offset);
+  EXPECT_EQ(query->GetDefinitionCount(), 0);
+  ASSERT_EQ(records.definitions.size(), 1);
+  EXPECT_EQ(records.definitions[0].source_name, "n");
+  EXPECT_FALSE(records.definitions[0].definition_ordinal);
   EXPECT_FALSE(query->GetManager().IsNull());
 }
 
@@ -103,7 +109,8 @@ TEST(FrontendCommands, StatusLogicOptionAndDeclarationErrorsPreservePrefix) {
   };
   for (const auto& [input, code] : cases) {
     SCOPED_TRACE(input);
-    auto session = Require(Session::FromText(input));
+    auto session = Require(
+        Session::FromText(input, ParseOptions{.strict_metadata = true}));
     auto command = Next(session);
     while (command && *command) command = Next(session);
     ExpectError(command, code);
@@ -125,7 +132,9 @@ TEST(FrontendCommands, FixedFalseOptionsGettersAndHarmlessUnsupportedQueries) {
     RequireNext(session, CommandKind::kSetOption);
     EXPECT_TRUE(session.GetOptions().print_success);
     RequireNext(session, CommandKind::kSetOption);
-    EXPECT_EQ(RequireNext(session, CommandKind::kGetOption).text, "false");
+    EXPECT_EQ(
+        RequireNext(session, CommandKind::kGetOption).response,
+        (std::variant<CommandResponse, std::string>(CommandResponse::kFalse)));
     RequireNext(session, CommandKind::kSetLogic);
     ExpectError(Next(session), DiagnosticCode::kInvalidState);
     const auto enabling =
@@ -144,13 +153,20 @@ TEST(FrontendCommands, FixedFalseOptionsGettersAndHarmlessUnsupportedQueries) {
       ":version)"
       "(get-info :authors)(get-info :error-behavior)(set-logic "
       "ALL)(check-sat)"));
-  for (const auto* expected : {"false", "false", "false", "0", "0", "0",
-                               "\"stdout\"", "\"stderr\"", "unsupported"})
-    EXPECT_EQ(RequireNext(session, CommandKind::kGetOption).text, expected);
-  for (const auto* expected :
-       {"unsupported", "(:name \"Dandelion\")", "(:version \"development\")",
-        "(:authors \"\")", "(:error-behavior immediate-exit)"})
-    EXPECT_EQ(RequireNext(session, CommandKind::kGetInfo).text, expected);
+  for (auto expected :
+       {CommandResponse::kFalse, CommandResponse::kFalse,
+        CommandResponse::kFalse, CommandResponse::kZero, CommandResponse::kZero,
+        CommandResponse::kZero, CommandResponse::kStdout,
+        CommandResponse::kStderr, CommandResponse::kUnsupported})
+    EXPECT_EQ(std::get<CommandResponse>(
+                  RequireNext(session, CommandKind::kGetOption).response),
+              expected);
+  for (auto expected : {CommandResponse::kUnsupported, CommandResponse::kName,
+                        CommandResponse::kVersion, CommandResponse::kAuthors,
+                        CommandResponse::kErrorBehavior})
+    EXPECT_EQ(std::get<CommandResponse>(
+                  RequireNext(session, CommandKind::kGetInfo).response),
+              expected);
   RequireNext(session, CommandKind::kSetLogic);
   EXPECT_TRUE(RequireCheck(session));
 }
@@ -165,19 +181,17 @@ TEST(FrontendCommands, SyntacticallyValidExcludedCommandsAreUnsupported) {
         "(get-unsat-assumptions)", "(unregistered-command a)"}) {
     SCOPED_TRACE(input);
     auto session = Require(Session::FromText(input));
-    ASSERT_TRUE(Require(session.NextSyntax()));
-    ExpectError(session.Apply(), DiagnosticCode::kUnsupported);
+    auto validator = Require(SyntaxValidator::FromText(input));
+    ASSERT_TRUE(Require(validator.ReadNext()));
+    ExpectError(session.ReadCommand(), DiagnosticCode::kUnsupported);
   }
 }
 
-TEST(FrontendCommands, SyntaxPendingAndRecoveringAfterFailedApply) {
+TEST(FrontendCommands, CommandBoundaryAndRecoveryAfterFailedRead) {
   auto session = Require(Session::FromText(
       "(set-logic ALL)(set-logic QF_SAT)(declare-const x Bool)(check-sat)"));
-  ExpectError(session.Apply(), DiagnosticCode::kInvalidState);
-  ASSERT_TRUE(Require(session.NextSyntax()));
   EXPECT_EQ(session.GetPhase(), SessionPhase::kBeforeLogic);
-  ExpectError(session.NextSyntax(), DiagnosticCode::kInvalidState);
-  Require(session.Apply());
+  RequireNext(session, CommandKind::kSetLogic);
   EXPECT_EQ(session.GetPhase(), SessionPhase::kBuilding);
   ExpectError(Next(session), DiagnosticCode::kInvalidState);
   RequireNext(session, CommandKind::kDeclareConst);
@@ -195,25 +209,20 @@ TEST(FrontendCommands, AllocationFailuresLeaveEachPublicationBoundaryAtomic) {
     SCOPED_TRACE(::testing::Message() << "FE-ROLLBACK-02 " << input);
     for (std::size_t checkpoint = 0; checkpoint < 64; ++checkpoint) {
       SCOPED_TRACE(checkpoint);
-      auto session = Require(Session::FromText(input));
-      const auto pending_target = [&] {
-        for (;;) {
-          const auto header = Require(session.NextSyntax());
-          if (!header) throw std::runtime_error("Missing rollback fixture");
-          if (header->where.begin.offset >= prefix.size()) {
-            EXPECT_EQ(header->kind, kind);
-            break;
-          }
-          Require(session.Apply());
-        }
-      };
-      pending_target();
+      auto session = Require(Session::FromText(
+          input, ParseOptions{.capture_source_records = true}));
+      auto validator = Require(SyntaxValidator::FromText(prefix));
+      while (const auto header = Require(validator.ReadNext())) {
+        RequireNext(session, header->kind);
+      }
       const auto before = inspect(session, nullptr);
       session.FailAllocationAfter(checkpoint);
-      const auto first = session.Apply();
+      const auto first = session.ReadCommand();
       if (first) {
         EXPECT_GT(checkpoint, 0u) << "No publication checkpoint was exercised";
-        inspect(session, &*first);
+        ASSERT_TRUE(*first);
+        EXPECT_EQ((**first).header.kind, kind);
+        inspect(session, &**first);
         return;
       }
       ExpectError(first, DiagnosticCode::kResource);
@@ -221,10 +230,9 @@ TEST(FrontendCommands, AllocationFailuresLeaveEachPublicationBoundaryAtomic) {
       EXPECT_EQ(first.error().node_error->resource,
                 ResourceKind::kCppAllocation);
       EXPECT_EQ(inspect(session, nullptr), before);
-      ExpectError(session.Apply(), DiagnosticCode::kInvalidState);
       const auto retry = RequireNext(session, kind);
       inspect(session, &retry);
-      EXPECT_FALSE(Require(session.NextSyntax()));
+      EXPECT_FALSE(Require(session.ReadCommand()));
     }
     ADD_FAILURE() << "Allocation checkpoint sweep never reached success";
   };
@@ -238,14 +246,15 @@ TEST(FrontendCommands, AllocationFailuresLeaveEachPublicationBoundaryAtomic) {
           EXPECT_TRUE(options.produce_models);
           EXPECT_FALSE(options.global_declarations);
           if (committed) {
-            EXPECT_EQ(committed->text, "success");
+            EXPECT_EQ(std::get<CommandResponse>(committed->response),
+                      CommandResponse::kSuccess);
           }
           return options.print_success;
         });
   sweep("(set-info :tag first)(set-info :tag second)", "(set-info :tag third)",
         CommandKind::kSetInfo,
         [](const Session& session, const TypedCommand* committed) {
-          const auto metadata = session.GetMetadata();
+          const auto metadata = session.GetSourceRecords()->metadata;
           const std::array expected{"first", "second", "third"};
           EXPECT_EQ(metadata.size(), committed ? 3u : 2u);
           for (std::size_t i = 0;
@@ -260,7 +269,7 @@ TEST(FrontendCommands, AllocationFailuresLeaveEachPublicationBoundaryAtomic) {
           EXPECT_EQ(session.GetPhase(), committed ? SessionPhase::kBuilding
                                                   : SessionPhase::kBeforeLogic);
           EXPECT_EQ(session.GetPrefix().GetLogic(), committed ? "ALL" : "");
-          EXPECT_EQ(session.GetMetadata().size(), 1);
+          EXPECT_EQ(session.GetSourceRecords()->metadata.size(), 1);
           return session.GetPhase();
         });
   sweep(
@@ -280,14 +289,13 @@ TEST(FrontendCommands, AllocationFailuresLeaveEachPublicationBoundaryAtomic) {
           EXPECT_EQ(metadata[0].value, "first");
           EXPECT_EQ(metadata[1].value, "second");
         };
-        check_metadata(session.GetMetadata(), 2);
-        check_metadata(prefix.GetMetadata(), committed ? 2u : 0u);
+        check_metadata(session.GetSourceRecords()->metadata, 2);
         if (committed) {
           EXPECT_EQ(committed->query.get(), &prefix);
           EXPECT_TRUE(prefix.GetOptions().produce_models);
         }
         if (prefix.GetAssertions().empty()) return NodeView{};
-        const auto root = prefix.GetAssertions()[0].term.Borrow();
+        const auto root = prefix.GetAssertions()[0].Borrow();
         EXPECT_EQ(root.GetKind(), Kind::kBoolValue);
         if (const auto value = root.GetValue()) {
           EXPECT_EQ(value->GetBool(), false);
@@ -298,7 +306,7 @@ TEST(FrontendCommands, AllocationFailuresLeaveEachPublicationBoundaryAtomic) {
   sweep("(set-logic ALL)(declare-sort Prior 1)", "(declare-sort Fresh 0)",
         CommandKind::kDeclareSort,
         [](const Session& session, const TypedCommand* committed) {
-          const auto sorts = session.GetPrefix().GetUserSorts();
+          const auto sorts = session.GetSourceRecords()->user_sorts;
           EXPECT_EQ(sorts.size(), committed ? 2u : 1u);
           if (sorts.empty()) return SortConstructorView{};
           EXPECT_EQ(sorts[0].source_name, "Prior");
@@ -314,7 +322,7 @@ TEST(FrontendCommands, AllocationFailuresLeaveEachPublicationBoundaryAtomic) {
         "(declare-fun fresh (Bool Int) Bool)", CommandKind::kDeclareFun,
         [](const Session& session, const TypedCommand* committed) {
           const auto& prefix = session.GetPrefix();
-          const auto functions = prefix.GetFunctions();
+          const auto& functions = session.GetSourceRecords()->functions;
           EXPECT_EQ(functions.size(), committed ? 2u : 1u);
           if (functions.empty()) return DeclView{};
           EXPECT_EQ(functions[0].source_name, "prior");
@@ -337,30 +345,34 @@ TEST(FrontendCommands, InvalidDefinitionResultRollsBackInnerAnnotation) {
       "(define-fun f ((x Int)) Bool (and (! prior :named staged) true))"
       "(assert (and staged (f 7)))(check-sat)";
   SCOPED_TRACE(::testing::Message() << "FE-ROLLBACK-02 " << input);
-  auto session = Require(Session::FromText(input));
+  auto session = Require(
+      Session::FromText(input, ParseOptions{.capture_source_records = true}));
   RequireNext(session, CommandKind::kSetLogic);
   RequireNext(session, CommandKind::kDefineConst);
-  const auto prior = session.GetPrefix().GetDefinitions()[0].decl;
+  const auto prior = session.GetSourceRecords()->definitions[0].body;
   for (int i = 0; i < 2; ++i) {
     ExpectError(Next(session), DiagnosticCode::kInvalidInput);
     const auto& prefix = session.GetPrefix();
-    ASSERT_EQ(prefix.GetDefinitions().size(), 1);
-    EXPECT_EQ(prefix.GetDefinitions()[0].decl, prior);
-    EXPECT_TRUE(prefix.GetAnnotations().empty());
-    EXPECT_TRUE(prefix.GetNamedTerms().empty());
+    ASSERT_EQ(prefix.GetDefinitionCount(), 0);
+    ASSERT_EQ(session.GetSourceRecords()->definitions.size(), 1);
+    EXPECT_EQ(session.GetSourceRecords()->definitions[0].body, prior);
+    EXPECT_TRUE(session.GetSourceRecords()->annotations.empty());
+    EXPECT_TRUE(session.GetSourceRecords()->named_terms.empty());
     EXPECT_TRUE(prefix.GetAssertions().empty());
   }
   RequireNext(session, CommandKind::kDefineFun);
   RequireNext(session, CommandKind::kAssert);
   const auto query = RequireCheck(session);
-  ASSERT_EQ(query->GetDefinitions().size(), 2);
-  ASSERT_EQ(query->GetAnnotations().size(), 1);
-  ASSERT_EQ(query->GetNamedTerms().size(), 1);
+  ASSERT_EQ(query->GetDefinitionCount(), 1);
+  ASSERT_EQ(session.GetSourceRecords()->definitions.size(), 2);
+  ASSERT_EQ(session.GetSourceRecords()->annotations.size(), 1);
+  ASSERT_EQ(session.GetSourceRecords()->named_terms.size(), 1);
   ASSERT_EQ(query->GetAssertions().size(), 1);
-  EXPECT_EQ(query->GetDefinitions()[0].decl, prior);
-  EXPECT_EQ(query->GetDefinitions()[1].source_name, "f");
-  EXPECT_EQ(query->GetNamedTerms()[0].name, "staged");
-  EXPECT_EQ(query->GetAnnotations()[0].term, query->GetNamedTerms()[0].term);
+  EXPECT_EQ(session.GetSourceRecords()->definitions[0].body, prior);
+  EXPECT_EQ(session.GetSourceRecords()->definitions[1].source_name, "f");
+  EXPECT_EQ(session.GetSourceRecords()->named_terms[0].name, "staged");
+  EXPECT_EQ(session.GetSourceRecords()->annotations[0].term,
+            session.GetSourceRecords()->named_terms[0].term);
 }
 
 }  // namespace

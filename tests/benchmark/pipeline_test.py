@@ -373,10 +373,62 @@ end
     assert rejected.returncode != 0
 
 
+def numeric_node(directory):
+    binary = sys.argv[2]
+    names = [
+        "integer/hit", "integer/create_release",
+        "integer/wide_hit", "integer/wide_create_release",
+        "bv/word_hit", "bv/word_highbit_create_release",
+        "bv/wide_hit", "bv/wide_create_release",
+        "fp/special_create_release", "fp/word_create_release",
+        "fp/wide_create_release",
+        "rational_conv/small_create_release", "rational_conv/wide_create_release",
+        "dag/postorder", "dag/constant_fold",
+    ]
+    expected = {"node/" + name for name in names}
+    listing = subprocess.check_output([binary, "--benchmark_list_tests"], text=True)
+    assert set(listing.splitlines()) == expected, listing
+    report = directory / "numeric node.json"
+    subprocess.run(
+        [binary, "--benchmark_dry_run", f"--benchmark_out={report}",
+         "--benchmark_out_format=json"], check=True)
+    rows = json.loads(report.read_text())["benchmarks"]
+    assert len(rows) == len(expected), rows
+    by_name = {row["name"]: row for row in rows}
+    assert by_name.keys() == expected, by_name.keys()
+    for row in rows:
+        assert row["iterations"] == 1 and row["time_unit"] == "ns", row
+        assert not row.get("error_occurred") and not row.get("skipped"), row
+
+    for name in names[2:-2]:
+        row = by_name["node/" + name]
+        baseline = int(name.startswith("rational_conv/"))  # Rounding-mode child.
+        assert row["live_nodes"] == baseline + 1, row
+        assert row["released_live_nodes"] == baseline, row
+        assert row["node_bytes"] > row["released_node_bytes"], row
+        assert row["numeric_backing_bytes"] == 0, row  # Packed node tails.
+        assert row["released_numeric_backing_bytes"] == 0, row
+    for name in names[-2:]:
+        row = by_name["node/" + name]
+        assert [row[key] for key in ("roots", "live_nodes", "live_edges", "depth")] == [
+            15, 96, 157, 65], row
+        assert row["node_bytes"] > 0 and row["numeric_backing_bytes"] == 0, row
+    folded = by_name["node/dag/constant_fold"]
+    assert folded["folded_live_nodes"] > folded["live_nodes"], folded
+    assert folded["folded_node_bytes"] > folded["node_bytes"], folded
+    assert folded["folded_numeric_backing_bytes"] == 0, folded
+
+    unmatched = subprocess.run(
+        [binary, "--benchmark_dry_run", "--benchmark_filter=^node/no-such-benchmark$"],
+        capture_output=True, text=True, check=False)
+    assert unmatched.returncode != 0, unmatched
+
+
 if __name__ == "__main__":
     checks = {"conversion": conversion, "reporting": reporting,
               "lookup": lookup, "lookup-conversion": lookup_conversion,
               "processes": processes, "reference": reference,
-              "snapshot": snapshot, "memory-inspection": memory_inspection}
+              "snapshot": snapshot, "memory-inspection": memory_inspection,
+              "numeric-node": numeric_node}
     with tempfile.TemporaryDirectory(prefix="dandelion-benchmark-test-") as temp:
         checks[sys.argv[1]](Path(temp))

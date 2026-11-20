@@ -4,9 +4,14 @@ import std;
 
 namespace dandelion::frontend::detail {
 
-void SessionState::ApplySemantic(const Syntax& syntax, TypedCommand& command) {
+void SessionState::ApplySemantic(const Syntax& syntax, TypedCommand& command,
+                                 Node term, PendingTerms& pending,
+                                 DefinitionInputs* definition,
+                                 PendingDatatypeGroup* datatypes,
+                                 PendingSortAlias* alias) {
   const auto [kind, where] = command.header;
   Transaction txn(*this);
+  pending.Publish(txn);
   const auto args = syntax.Children(0).subspan(1);
   switch (kind) {
     case CommandKind::kDeclareSort: {
@@ -20,35 +25,30 @@ void SessionState::ApplySemantic(const Syntax& syntax, TypedCommand& command) {
       auto constructor =
           Take(manager.DeclareUninterpretedSort(name, arity), where);
       txn.AddSort(name, constructor.Borrow());
-      txn.AddUserSort(
-          {std::move(constructor), std::string(syntax.Raw(args[0])), where});
+      txn.AddUserSort(std::move(constructor), syntax.Raw(args[0]), where);
       break;
     }
     case CommandKind::kDefineSort: {
       CheckSortName(*this, syntax, args[0], true);
-      Parameters parameters;
-      const auto names = syntax.Children(args[1]);
-      for (auto parameter : names) {
-        CheckSortName(*this, syntax, parameter, false);
-        const auto index = parameters.size();
-        if (!parameters.emplace(syntax.Name(parameter), index).second)
-          Fail(DiagnosticCode::kInvalidInput, syntax.Span(parameter),
-               "Duplicate sort parameter");
+      if (alias) {
+        alias->Publish(txn, args[0], args[2]);
+      } else {
+        const auto sort = ResolveSort(*this, syntax, args[2]);
+        txn.AddSort(syntax.Name(args[0]),
+                    TakeAt(manager.RetainSort(sort), {syntax, args[2]}));
       }
-      const auto alias = ResolveAlias(*this, txn, syntax, args[2], parameters);
-      txn.AddSort(syntax.Name(args[0]), alias);
       break;
     }
     case CommandKind::kDeclareDatatype:
     case CommandKind::kDeclareDatatypes:
-      DeclareDatatypes(*this, txn, syntax);
+      datatypes->Publish(txn, where);
       break;
     case CommandKind::kDeclareFun:
     case CommandKind::kDeclareConst:
     case CommandKind::kDefineFun:
     case CommandKind::kDefineConst:
     case CommandKind::kAssert:
-      ApplyTerms(*this, syntax, command, txn);
+      ApplyTerms(*this, syntax, command, txn, std::move(term), definition);
       break;
     default:
       std::unreachable();

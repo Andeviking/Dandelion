@@ -1,5 +1,6 @@
 module dandelion.frontend;
 import :internal;
+import dandelion.util.numeric;
 import std;
 
 namespace dandelion::frontend::detail {
@@ -137,19 +138,65 @@ constexpr auto kLongRounding = std::to_array<std::string_view>(
      "roundTowardNegative", "roundTowardZero"});
 constexpr auto kSpecials =
     std::to_array<std::string_view>({"NaN", "+oo", "-oo", "+zero", "-zero"});
+constexpr auto kSpecialSymbols =
+    std::to_array<std::pair<std::string_view, SpellingId>>({
+        {"is", SpellingId::kIs},
+        {"true", SpellingId::kTrue},
+        {"false", SpellingId::kFalse},
+        {"Bool", SpellingId::kBool},
+        {"Int", SpellingId::kInt},
+        {"Array", SpellingId::kArray},
+        {"BitVec", SpellingId::kBitVec},
+        {"FloatingPoint", SpellingId::kFloatingPoint},
+        {"RoundingMode", SpellingId::kRoundingMode},
+        {"Float16", SpellingId::kFloat16},
+        {"Float32", SpellingId::kFloat32},
+        {"Float64", SpellingId::kFloat64},
+        {"Float128", SpellingId::kFloat128},
+        {"Real", SpellingId::kReal},
+        {"String", SpellingId::kString},
+        {"RegLan", SpellingId::kRegLan},
+        {"->", SpellingId::kFunctionSort},
+    });
+constexpr auto kSymbols = [] {
+  std::array<std::string_view, kByName.size() + kSpecialSymbols.size() +
+                                   kShortRounding.size() + kLongRounding.size()>
+      symbols{};
+  std::size_t next = 0;
+  for (const auto& op : kByName) symbols[next++] = op.name;
+  for (const auto& [name, id] : kSpecialSymbols) symbols[next++] = name;
+  for (auto name : kShortRounding) symbols[next++] = name;
+  for (auto name : kLongRounding) symbols[next++] = name;
+  return symbols;
+}();
+constexpr auto kSymbolSpelling = std::identity{};
+constexpr auto kSymbolBuckets = SpellingBuckets(kSymbols, kSymbolSpelling);
 }  // namespace
 
-SpellingId ClassifyOperator(std::string_view name) noexcept {
-  static constexpr auto kBuckets =
-      SpellingBuckets(kByName, std::mem_fn(&Operator::name));
-  return LookupSpelling(kByName, std::mem_fn(&Operator::name), kBuckets, name);
+SpellingId ClassifySymbol(std::string_view name) noexcept {
+  const auto ordinal =
+      LookupSpelling(kSymbols, kSymbolSpelling, kSymbolBuckets, name);
+  if (ordinal == 0) return kUnknownSpelling;
+  const auto index = static_cast<std::size_t>(ordinal - 1);
+  if (index < kByName.size())
+    return static_cast<SpellingId>(
+        std::to_underlying(SpellingId::kOperatorBase) + index);
+  const auto special = index - kByName.size();
+  if (special < kSpecialSymbols.size()) return kSpecialSymbols[special].second;
+  const auto rounding =
+      (special - kSpecialSymbols.size()) % kShortRounding.size();
+  return static_cast<SpellingId>(std::to_underlying(SpellingId::kRne) +
+                                 rounding);
 }
 const Operator* GetOperator(SpellingId id) noexcept {
-  return id == kUnknownSpelling ? nullptr : &kByName[id - 1];
+  const auto index = static_cast<std::size_t>(std::to_underlying(id)) -
+                     std::to_underlying(SpellingId::kOperatorBase);
+  return index < kByName.size() ? &kByName[index] : nullptr;
 }
-const Operator* FindOperator(std::string_view name, bool indexed) noexcept {
-  const auto* op = GetOperator(ClassifyOperator(name));
-  return op && indexed == (op->indices != 0) ? op : nullptr;
+std::optional<numeric::RoundingMode> GetRoundingMode(SpellingId id) noexcept {
+  if (id < SpellingId::kRne || id > SpellingId::kRtz) return std::nullopt;
+  return static_cast<numeric::RoundingMode>(
+      std::to_underlying(id) - std::to_underlying(SpellingId::kRne));
 }
 const Operator& OperatorFor(Kind kind) noexcept {
   return *kByKind[std::to_underlying(kind)];
@@ -158,9 +205,12 @@ bool IsRestrictedInt(Kind kind) noexcept {
   return kind == Kind::kIntAdd || kind == Kind::kIntSub ||
          (kind >= Kind::kIntLt && kind <= Kind::kIntGe);
 }
-bool IsActiveTerm(const Profile& profile, std::string_view name) noexcept {
-  if (name == "true" || name == "false") return true;
-  if (profile.Has(kFloats) && (FindRoundingMode(name) || name == "fp.to_real"))
+bool IsActiveTerm(const Profile& profile, std::string_view name,
+                  SpellingId spelling) noexcept {
+  if (spelling == SpellingId::kTrue || spelling == SpellingId::kFalse)
+    return true;
+  if (profile.Has(kFloats) &&
+      (GetRoundingMode(spelling) || name == "fp.to_real"))
     return true;
   if (profile.Has(kReals) &&
       (name == "/" || name == "+" || name == "-" || name == "*" ||
@@ -169,7 +219,7 @@ bool IsActiveTerm(const Profile& profile, std::string_view name) noexcept {
   if (profile.Has(kRealInt) &&
       (name == "to_real" || name == "to_int" || name == "is_int"))
     return true;
-  if (const auto* op = FindOperator(name, false))
+  if (const auto* op = GetOperator(spelling); op && op->indices == 0)
     return profile.Has(op->features) ||
            (profile.Has(kRestrictedIntegers) && IsRestrictedInt(op->kind));
   return false;
@@ -221,21 +271,16 @@ bool IsKnownExcludedTerm(std::string_view name) noexcept {
                                                           "re.loop"});
   return std::ranges::find(known, name) != known.end();
 }
-std::optional<RoundingMode> FindRoundingMode(std::string_view name) noexcept {
-  for (std::size_t i = 0; i < kShortRounding.size(); ++i)
-    if (name == kShortRounding[i] || name == kLongRounding[i])
-      return static_cast<RoundingMode>(i);
-  return std::nullopt;
-}
-std::optional<FpSpecial> FindFpSpecial(std::string_view name) noexcept {
+std::optional<numeric::FpSpecial> FindFpSpecial(
+    std::string_view name) noexcept {
   const auto found = std::ranges::find(kSpecials, name);
   if (found == kSpecials.end()) return std::nullopt;
-  return static_cast<FpSpecial>(found - kSpecials.begin());
+  return static_cast<numeric::FpSpecial>(found - kSpecials.begin());
 }
-std::string_view RoundingSpelling(RoundingMode mode) noexcept {
+std::string_view RoundingSpelling(numeric::RoundingMode mode) noexcept {
   return kShortRounding[std::to_underlying(mode)];
 }
-std::string_view SpecialSpelling(FpSpecial special) noexcept {
+std::string_view SpecialSpelling(numeric::FpSpecial special) noexcept {
   return kSpecials[std::to_underlying(special)];
 }
 }  // namespace dandelion::frontend::detail

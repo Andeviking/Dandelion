@@ -1,8 +1,8 @@
 # Node Kinds, Operators, and Input Profile
 
-Status: **implemented node representation and typing specification**. This document is
-part of the [node design](design.md). It specifies representation and typing;
-the later solver still must implement each accepted operator's semantics.
+The first-version node representation and typing rules and the Phase 1
+construction and definition boundary changes are implemented. The later
+solver still must implement each accepted operator's semantics. [Node design](design.md)
 The [implementation plan](implementation.md) and [node test design](../testing/node.md)
 apply to every kind below.
 
@@ -57,6 +57,15 @@ consecutive values beginning at one in the order of the tables below, visiting
 each grouped row's kinds left to right. Check at compile time that all kinds
 fit; `kInvalid` is never a publishable node kind.
 
+In Phase 1, `MakeWordIndexedBuiltin` supplies the exact indices as
+`std::uint64_t` words. The ordinary arity, payload, operand, and range checks
+apply with the qualifier and rational fields absent. For every index
+sequence representable by both APIs, the same kind and children produce
+the same structural key. The general factory remains available for wider
+indices and for the qualifier or rational fields. `RebuildNode` preserves
+the already established operator rank and payload with same-sort
+replacement children. [Phase 1 rebuild contract](design.md#phase-1-payload-preserving-rebuild)
+
 ## 2. Values and declaration applications
 
 | Input or category | Kind | Children, payload, result |
@@ -69,12 +78,13 @@ fit; `kInvalid` is never a publishable node kind.
 | Resolved declaration application | `kApply` | Ordered domain arguments; `DeclInstanceId`; instance range. |
 
 `#bX` has one bit per digit, and `#xX` has four bits per digit.
-`(_ bvN w)` requires `w > 0` and `0 <= N < 2^w`; `(_ bv256 8)` is invalid,
-not zero. Check numeric and width overflow without first narrowing. The QF_BV
-extension gives this bound explicitly. Equivalent literal spellings with the
-same width and exact value share. Integer surface `(- numeral)` is an Int
-negation operation where unary minus is admitted; the QF_UFIDL value-query
-exception directly constructs its negative Int value. Programmatic
+The Node value factories require `w > 0` and `0 <= v < 2^w`.
+The [frontend profile](../frontend/logic-profile.md) reduces the unsigned
+numeral in `(_ bvN w)` modulo `2^w` before calling these factories. Equivalent
+literal spellings with the same width and exact value share.
+The surface form `(- numeral)` is an Int negation operation where unary minus
+is admitted. The QF_UFIDL value-query exception directly constructs its
+negative Int value. Programmatic
 `kIntNeg` remains an operation node.
 [QF_BV definition](https://smt-lib.org/logics-all.shtml)
 
@@ -83,6 +93,16 @@ selectors, and testers through the referenced declaration category. Its
 arguments must exactly match the instance domain and manager. A wrong-DT-
 constructor selector application remains well-sorted when its argument has the
 selector's domain sort; its value is underspecified, not a type error.
+
+The Phase 1 frontend definition boundary requires an internal declaration,
+concrete instance, and owning definition-table entry for calls to definitions
+with formal parameters. A closed nullary definition may resolve directly to
+its typed body. Source name and occurrence information stay in the frontend.
+Any retained calls reached through that body still need the definition table.
+
+Phase 1's `MakeBvWordValue` constructs the same `kBvValue` key and enforces
+the same exact width bound as `MakeBvValue`. A word wider than the target
+sort is rejected before publication.
 
 ## 3. Core
 
@@ -181,19 +201,13 @@ formats. Rounding-mode aliases map to the five canonical values:
 `roundTowardZero`/`RTZ`. `Float16`, `Float32`, `Float64`, and `Float128`
 resolve respectively to `F(5,11)`, `F(8,24)`, `F(11,53)`, and `F(15,113)`,
 not new sort identities.
-```cpp
-enum class RoundingMode : std::uint8_t {
-  kRne = 0, kRna, kRtp, kRtn, kRtz,
-};
-enum class FpSpecial : std::uint8_t {
-  kNaN = 0, kPositiveInfinity, kNegativeInfinity,
-  kPositiveZero, kNegativeZero,
-};
-```
 
-The internal FP value-category enum uses the same five values followed by
-finite bits. Public `FpSpecial` names the first five categories; finite bits
-are created through `MakeFpBits`.
+`numeric::FpCategory` distinguishes NaN, positive and negative infinity,
+positive and negative zero, and finite nonzero bits. For packed input, use
+`numeric::FloatingPointValue::FromBits` to validate and classify the bits.
+For an explicit special, use `numeric::FloatingPointValue::Special` with
+its category. Pass the resulting value's borrowed view to `MakeFpValue`
+with a matching FP sort. [Typed literal API](design.md#phase-1c-typed-literal-and-sort-api)
 
 | Input | Kind | Ordered children, indices and result |
 | --- | --- | --- |

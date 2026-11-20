@@ -1,8 +1,11 @@
 #include "test_support.h"
 
+#include "../node/node_test_peer.h"
+
 namespace dandelion::frontend::testing {
 namespace {
 
+constexpr ParseOptions kCapture{.capture_source_records = true};
 constexpr std::uint32_t kSource = 73;
 constexpr std::size_t kWindow = 64 * 1024;
 constexpr std::array<std::size_t, 4> kIrregularChunks{3, 1, 29, 7};
@@ -70,20 +73,15 @@ std::string StreamingScript(const std::string& symbol) {
 void ExpectStreamingScript(Session session, std::string_view text,
                            const std::string& symbol) {
   const auto apply = [&](CommandKind kind, std::string_view spelling) {
-    const auto syntax = Require(session.NextSyntax());
-    if (!syntax) throw std::runtime_error("Missing streaming command");
-    EXPECT_EQ(syntax->kind, kind);
-    ExpectSpan(syntax->where, text, spelling);
-    auto typed = Require(session.Apply());
-    EXPECT_EQ(typed.header.kind, kind);
-    EXPECT_EQ(typed.header.where, syntax->where);
+    auto typed = RequireNext(session, kind);
+    ExpectSpan(typed.header.where, text, spelling);
     return typed;
   };
 
   apply(CommandKind::kSetOption, kProduceModels);
   apply(CommandKind::kSetLogic, kLogic);
   apply(CommandKind::kSetInfo, kMetadata);
-  const auto metadata = session.GetMetadata();
+  const auto metadata = session.GetSourceRecords()->metadata;
   ASSERT_EQ(metadata.size(), 1u);
   EXPECT_EQ(metadata[0].key, ":tag");
   EXPECT_EQ(metadata[0].value, "(|π;\r\nx| \"a\"\"🌱\")");
@@ -98,9 +96,11 @@ void ExpectStreamingScript(Session session, std::string_view text,
   const auto query = RequireQuery(checked.query);
   ASSERT_EQ(query->GetFunctions().size(), 1u);
   ASSERT_EQ(query->GetAssertions().size(), 1u);
-  EXPECT_EQ(query->GetFunctions()[0].source_name, std::string_view(symbol));
-  ExpectSpan(query->GetFunctions()[0].where, text, declaration);
-  ExpectSpan(query->GetAssertions()[0].where, text, asserted_term);
+  EXPECT_EQ(session.GetSourceRecords()->functions[0].source_name,
+            std::string_view(symbol));
+  ExpectSpan(session.GetSourceRecords()->functions[0].where, text, declaration);
+  ExpectSpan(session.GetSourceRecords()->assertions[0].where, text,
+             asserted_term);
 
   const auto operand = "(+ " + symbol + " ; comment\r\n 7)";
   const auto request = "(get-value (  " + operand + "\t" + symbol + "))";
@@ -119,32 +119,36 @@ void ExpectStreamingScript(Session session, std::string_view text,
   EXPECT_EQ(children[0], values.values[1].term.Borrow());
   EXPECT_EQ(IntegerValue(children[1]), "7");
 
-  EXPECT_EQ(apply(CommandKind::kEcho, kEcho).text, "\"a\"\"🌱\"");
+  EXPECT_EQ(std::get<std::string>(apply(CommandKind::kEcho, kEcho).response),
+            "\"a\"\"🌱\"");
   apply(CommandKind::kExit, "(exit)");
-  EXPECT_FALSE(Require(session.NextSyntax()));
+  EXPECT_FALSE(Require(session.ReadCommand()));
 }
 
 TEST(FrontendOverhaul, ExactSpansAndRenderingAtEverySmallSplit) {
   SCOPED_TRACE("FE-OVERHAUL-01");
   const std::string symbol = "|α;🌱|";
   const auto text = StreamingScript(symbol);
-  ExpectStreamingScript(Require(Session::FromText(text, kSource)), text,
-                        symbol);
+  ExpectStreamingScript(Require(Session::FromText(text, kCapture, kSource)),
+                        text, symbol);
   constexpr std::array full_window{kWindow};
   for (std::size_t split = 1; split < text.size(); ++split) {
     SCOPED_TRACE(split);
-    ExpectStreamingScript(Require(Session::FromReader(
-                              Chunked(text, full_window, split), kSource)),
-                          text, symbol);
+    ExpectStreamingScript(
+        Require(Session::FromReader(Chunked(text, full_window, split), kCapture,
+                                    kSource)),
+        text, symbol);
   }
   for (const auto chunk : {std::size_t{1}, std::size_t{4096}, kWindow}) {
     SCOPED_TRACE(chunk);
-    ExpectStreamingScript(Require(Session::FromReader(
-                              Chunked(text, std::span(&chunk, 1)), kSource)),
-                          text, symbol);
+    ExpectStreamingScript(
+        Require(Session::FromReader(Chunked(text, std::span(&chunk, 1)),
+                                    kCapture, kSource)),
+        text, symbol);
   }
   ExpectStreamingScript(
-      Require(Session::FromReader(Chunked(text, kIrregularChunks), kSource)),
+      Require(Session::FromReader(Chunked(text, kIrregularChunks), kCapture,
+                                  kSource)),
       text, symbol);
 }
 
@@ -161,27 +165,29 @@ TEST(FrontendOverhaul, ReaderWindowBoundariesAndMultiWindowToken) {
     for (std::size_t byte = 0; byte <= target.size(); ++byte) {
       SCOPED_TRACE(::testing::Message() << target << " at byte " << byte);
       const auto text = std::string(kWindow - marker - byte, ' ') + unpadded;
-      ExpectStreamingScript(Require(Session::FromText(text, kSource)), text,
-                            symbol);
-      ExpectStreamingScript(
-          Require(Session::FromReader(Chunked(text, full_window), kSource)),
-          text, symbol);
+      ExpectStreamingScript(Require(Session::FromText(text, kCapture, kSource)),
+                            text, symbol);
+      ExpectStreamingScript(Require(Session::FromReader(
+                                Chunked(text, full_window), kCapture, kSource)),
+                            text, symbol);
     }
   }
 
   const auto long_symbol =
       "|" + std::string(2 * kWindow + 17, 'x') + "🌱\r\nend|";
   const auto text = StreamingScript(long_symbol);
-  ExpectStreamingScript(Require(Session::FromText(text, kSource)), text,
-                        long_symbol);
+  ExpectStreamingScript(Require(Session::FromText(text, kCapture, kSource)),
+                        text, long_symbol);
   for (const auto chunk : {std::size_t{1}, std::size_t{4096}, kWindow}) {
     SCOPED_TRACE(chunk);
-    ExpectStreamingScript(Require(Session::FromReader(
-                              Chunked(text, std::span(&chunk, 1)), kSource)),
-                          text, long_symbol);
+    ExpectStreamingScript(
+        Require(Session::FromReader(Chunked(text, std::span(&chunk, 1)),
+                                    kCapture, kSource)),
+        text, long_symbol);
   }
   ExpectStreamingScript(
-      Require(Session::FromReader(Chunked(text, kIrregularChunks), kSource)),
+      Require(Session::FromReader(Chunked(text, kIrregularChunks), kCapture,
+                                  kSource)),
       text, long_symbol);
 }
 
@@ -200,28 +206,28 @@ TEST(FrontendOverhaul, ReadErrorsAndMalformedUtf8HaveExactPositions) {
           if (count == 0u) return std::unexpected(io_error);
           return count;
         },
-        kSource));
+        kCapture, kSource));
     RequireNext(session, CommandKind::kSetInfo);
-    const auto failed = session.NextSyntax();
+    const auto failed = session.ReadCommand();
     ASSERT_FALSE(failed);
     EXPECT_EQ(failed.error().code, DiagnosticCode::kInputIo);
     EXPECT_EQ(failed.error().io_error, io_error);
     EXPECT_EQ(failed.error().where, SpanAt(text, stop, 0));
-    ASSERT_EQ(session.GetMetadata().size(), 1u);
-    EXPECT_EQ(session.GetMetadata()[0].value, "committed");
+    ASSERT_EQ(session.GetSourceRecords()->metadata.size(), 1u);
+    EXPECT_EQ(session.GetSourceRecords()->metadata[0].value, "committed");
     EXPECT_EQ(session.GetPhase(), SessionPhase::kTerminated);
-    EXPECT_FALSE(Require(session.NextSyntax()));
+    EXPECT_FALSE(Require(session.ReadCommand()));
   }
 
   const auto incomplete = std::string(prefix) + "\r\n(echo \"\xf0\x9f";
   const auto check = [&](Session session) {
     RequireNext(session, CommandKind::kSetInfo);
-    const auto failed = session.NextSyntax();
+    const auto failed = session.ReadCommand();
     ASSERT_FALSE(failed);
     EXPECT_EQ(failed.error().code, DiagnosticCode::kSyntax);
     EXPECT_EQ(failed.error().where,
               SpanAt(incomplete, incomplete.size() - 2, 0));
-    EXPECT_FALSE(Require(session.NextSyntax()));
+    EXPECT_FALSE(Require(session.ReadCommand()));
   };
   check(Require(Session::FromText(incomplete, kSource)));
   constexpr std::array full_window{kWindow};
@@ -253,13 +259,13 @@ TEST(FrontendOverhaul, ExitLeavesSuffixUnreadEvenWithBufferedGarbage) {
     const auto command = RequireNext(session, CommandKind::kExit);
     ExpectSpan(command.header.where, text, "(exit)");
     EXPECT_EQ(session.GetPhase(), SessionPhase::kTerminated);
-    EXPECT_FALSE(Require(session.NextSyntax()));
+    EXPECT_FALSE(Require(session.ReadCommand()));
     EXPECT_EQ(calls, 1u);
     EXPECT_EQ(cursor, first.size());
   }
 }
 
-TEST(FrontendOverhaul, PagedGrowthAndForcedWideningPreserveLists) {
+TEST(FrontendOverhaul, LiveFrameGrowthPreservesWideAndDeepLists) {
   SCOPED_TRACE("FE-OVERHAUL-03");
   constexpr std::size_t kWidth = 2304;
   constexpr std::size_t kDepth = 1024;
@@ -274,49 +280,38 @@ TEST(FrontendOverhaul, PagedGrowthAndForcedWideningPreserveLists) {
                     "(check-sat)" + request;
 
   for (const bool reader : {false, true}) {
-    for (const bool promote : {false, true}) {
-      SCOPED_TRACE(::testing::Message()
-                   << "reader=" << reader << " promote=" << promote);
-      auto session = Require(
-          reader ? Session::FromReader(Chunked(text, kIrregularChunks), kSource)
-                 : Session::FromText(text, kSource));
-      if (promote) session.ForceSyntaxPromotionThreshold(257);
-      RequireNext(session, CommandKind::kSetOption);
-      RequireNext(session, CommandKind::kSetLogic);
-      RequireCheck(session);
-      const auto before = session.GetStats();
-      const auto values = RequireNext(session, CommandKind::kGetValue);
-      ExpectSpan(values.header.where, text, request);
-      ASSERT_EQ(values.values.size(), 2u);
-      ExpectSpan(values.values[0].where, text, wide);
-      ExpectSpan(values.values[1].where, text, deep);
-      EXPECT_EQ(values.values[0].input, wide);
-      EXPECT_EQ(values.values[1].input, deep);
+    SCOPED_TRACE(reader);
+    auto session = Require(
+        reader ? Session::FromReader(Chunked(text, kIrregularChunks), kSource)
+               : Session::FromText(text, kSource));
+    RequireNext(session, CommandKind::kSetOption);
+    RequireNext(session, CommandKind::kSetLogic);
+    RequireCheck(session);
+    const auto values = RequireNext(session, CommandKind::kGetValue);
+    ExpectSpan(values.header.where, text, request);
+    ASSERT_EQ(values.values.size(), 2u);
+    ExpectSpan(values.values[0].where, text, wide);
+    ExpectSpan(values.values[1].where, text, deep);
+    EXPECT_EQ(values.values[0].input, wide);
+    EXPECT_EQ(values.values[1].input, deep);
 
-      const auto root = values.values[0].term.Borrow();
-      ASSERT_EQ(root.GetKind(), Kind::kDistinct);
-      const auto children = root.GetChildren();
-      ASSERT_EQ(children.size(), kWidth);
-      for (std::size_t i = 0; i < kWidth; ++i)
-        EXPECT_EQ(IntegerValue(children[i]), std::to_string(i)) << i;
-      auto nested = values.values[1].term.Borrow();
-      for (std::size_t i = 0; i < kDepth; ++i) {
-        ASSERT_EQ(nested.GetKind(), Kind::kNot) << i;
-        ASSERT_EQ(nested.GetChildren().size(), 1u);
-        nested = nested.GetChildren()[0];
-      }
-      ASSERT_EQ(nested.GetKind(), Kind::kBoolValue);
-      EXPECT_EQ(nested.GetValue()->GetBool(), false);
-      const auto stats = session.GetStats();
-      EXPECT_GT(stats.syntax_page_allocations - before.syntax_page_allocations,
-                1u);
-      if (promote) {
-        EXPECT_GT(stats.syntax_promoted_pages, before.syntax_promoted_pages);
-      } else {
-        EXPECT_EQ(stats.syntax_promoted_pages, 0u);
-        EXPECT_EQ(stats.syntax_page_copies, 0u);
-      }
+    const auto root = values.values[0].term.Borrow();
+    ASSERT_EQ(root.GetKind(), Kind::kDistinct);
+    const auto children = root.GetChildren();
+    ASSERT_EQ(children.size(), kWidth);
+    for (std::size_t i = 0; i < kWidth; ++i)
+      EXPECT_EQ(IntegerValue(children[i]), std::to_string(i)) << i;
+    auto nested = values.values[1].term.Borrow();
+    for (std::size_t i = 0; i < kDepth; ++i) {
+      ASSERT_EQ(nested.GetKind(), Kind::kNot) << i;
+      ASSERT_EQ(nested.GetChildren().size(), 1u);
+      nested = nested.GetChildren()[0];
     }
+    ASSERT_EQ(nested.GetKind(), Kind::kBoolValue);
+    EXPECT_EQ(nested.GetValue()->GetBool(), false);
+    const auto stats = session.GetStats();
+    EXPECT_EQ(stats.peak_live_operands, kWidth);
+    EXPECT_GE(stats.peak_grammar_depth, kDepth);
   }
 }
 
@@ -340,14 +335,14 @@ TEST(FrontendOverhaul, FrameLocalBindingsAndUnreachableBranches) {
       "                  (empty (! 9 :named unreachable)))) :named wholeMatch))"
       "(assert (= (retry 42) staged wholeMatch))(assert (= unreachable 9))"
       "(check-sat)";
-  auto session = Require(Session::FromText(text, kSource));
+  auto session = Require(Session::FromText(text, kCapture, kSource));
   RequireNext(session, CommandKind::kSetLogic);
   RequireNext(session, CommandKind::kDeclareDatatype);
   RequireNext(session, CommandKind::kDefineFun);
 
   const auto& prefix = session.GetPrefix();
-  ASSERT_EQ(prefix.GetDefinitions().size(), 1u);
-  const auto body = prefix.GetDefinitions()[0].body.Borrow();
+  ASSERT_EQ(prefix.GetDefinitionCount(), 1u);
+  const auto body = prefix.GetDefinition(0).body.Borrow();
   ASSERT_EQ(body.GetKind(), Kind::kIntAdd);
   const auto children = body.GetChildren();
   ASSERT_EQ(children.size(), 3u);
@@ -371,9 +366,9 @@ TEST(FrontendOverhaul, FrameLocalBindingsAndUnreachableBranches) {
   EXPECT_EQ(open_match.error().code, DiagnosticCode::kInvalidInput);
   ExpectSpan(open_match.error().where, text,
              "(match empty ((_ (! 1 :named staged)) (empty outer)))");
-  ASSERT_EQ(prefix.GetNamedTerms().size(), 2u);
-  ASSERT_EQ(prefix.GetAnnotations().size(), 2u);
-  ASSERT_EQ(prefix.GetDefinitions().size(), 1u);
+  ASSERT_EQ(session.GetSourceRecords()->named_terms.size(), 2u);
+  ASSERT_EQ(session.GetSourceRecords()->annotations.size(), 2u);
+  ASSERT_EQ(prefix.GetDefinitionCount(), 1u);
   EXPECT_TRUE(prefix.GetAssertions().empty());
   ExpectError(Next(session), DiagnosticCode::kInvalidInput);
 
@@ -381,21 +376,21 @@ TEST(FrontendOverhaul, FrameLocalBindingsAndUnreachableBranches) {
   RequireNext(session, CommandKind::kAssert);
   RequireNext(session, CommandKind::kAssert);
   const auto query = RequireCheck(session);
-  const auto names = query->GetNamedTerms();
+  const auto names = session.GetSourceRecords()->named_terms;
   constexpr std::array expected{"closedUnused", "closedUsed", "staged",
                                 "unreachable", "wholeMatch"};
   ASSERT_EQ(names.size(), expected.size());
-  ASSERT_EQ(query->GetAnnotations().size(), expected.size());
+  ASSERT_EQ(session.GetSourceRecords()->annotations.size(), expected.size());
   for (std::size_t i = 0; i < names.size(); ++i) {
     EXPECT_EQ(names[i].name, expected[i]);
-    EXPECT_EQ(query->GetAnnotations()[i].term, names[i].term);
+    EXPECT_EQ(session.GetSourceRecords()->annotations[i].term, names[i].term);
   }
-  ASSERT_EQ(query->GetDefinitions().size(), 2u);
-  EXPECT_EQ(query->GetDefinitions()[1].body, names[2].term);
+  ASSERT_EQ(query->GetDefinitionCount(), 2u);
+  EXPECT_EQ(query->GetDefinition(1).body, names[2].term);
   EXPECT_EQ(names[2].term, names[4].term);
   EXPECT_EQ(IntegerValue(names[3].term.Borrow()), "9");
   ASSERT_EQ(query->GetAssertions().size(), 2u);
-  ExpectChildren(query->GetAssertions()[1].term.Borrow(),
+  ExpectChildren(query->GetAssertions()[1].Borrow(),
                  {names[3].term.Borrow(), names[3].term.Borrow()});
 }
 
@@ -408,21 +403,22 @@ TEST(FrontendOverhaul, NestedAnnotationsVisitOnceAndPublishInsideOut) {
   for (std::size_t i = 0; i < kDepth; ++i)
     text += " :named nested" + std::to_string(i) + ")";
   text += ")(check-sat)";
-  auto session = Require(Session::FromReader(Chunked(text, kIrregularChunks)));
+  auto session =
+      Require(Session::FromReader(Chunked(text, kIrregularChunks), kCapture));
   RequireNext(session, CommandKind::kSetLogic);
   RequireNext(session, CommandKind::kAssert);
   EXPECT_EQ(session.GetStats().closure_visits, kDepth);
   const auto query = RequireCheck(session);
-  const auto names = query->GetNamedTerms();
-  const auto annotations = query->GetAnnotations();
+  const auto names = session.GetSourceRecords()->named_terms;
+  const auto annotations = session.GetSourceRecords()->annotations;
   const auto assertions = query->GetAssertions();
   ASSERT_EQ(names.size(), kDepth);
   ASSERT_EQ(annotations.size(), kDepth);
   ASSERT_EQ(assertions.size(), 1u);
   for (std::size_t i = 0; i < kDepth; ++i) {
     EXPECT_EQ(names[i].name, "nested" + std::to_string(i));
-    EXPECT_EQ(names[i].term, assertions[0].term);
-    EXPECT_EQ(annotations[i].term, assertions[0].term);
+    EXPECT_EQ(names[i].term, assertions[0]);
+    EXPECT_EQ(annotations[i].term, assertions[0]);
     if (i > 0) {
       EXPECT_LT(annotations[i].where.begin.offset,
                 annotations[i - 1].where.begin.offset);
@@ -432,12 +428,13 @@ TEST(FrontendOverhaul, NestedAnnotationsVisitOnceAndPublishInsideOut) {
   }
 }
 
-TEST(FrontendOverhaul, PooledRankViewsSurviveSourceAndSparseDeclarationIds) {
+TEST(FrontendOverhaul, OwnedRankRecordsSurviveSourceAndSparseDeclarationIds) {
   SCOPED_TRACE("FE-OVERHAUL-05");
-  static_assert(!std::same_as<decltype(UserFunction::source_rank),
-                              std::vector<std::string>>,
-                "UserFunction rank records borrow their spelling storage");
+  static_assert(std::same_as<decltype(UserFunction::source_rank),
+                             std::vector<std::string>>,
+                "UserFunction rank records own their spelling storage");
   std::shared_ptr<const QueryContext> query;
+  SourceRecords records;
   {
     const std::string text =
         "(set-logic ALL)(declare-const first Bool)"
@@ -450,8 +447,8 @@ TEST(FrontendOverhaul, PooledRankViewsSurviveSourceAndSparseDeclarationIds) {
         "(assert (= (|pooled name| middle (_ bv2 32) afterFailure)"
         "           (_ bv2 32)))"
         "(check-sat)";
-    auto session =
-        Require(Session::FromReader(Chunked(text, kIrregularChunks), kSource));
+    auto session = Require(Session::FromReader(Chunked(text, kIrregularChunks),
+                                               kCapture, kSource));
     RequireNext(session, CommandKind::kSetLogic);
     RequireNext(session, CommandKind::kDeclareConst);
     RequireNext(session, CommandKind::kDefineFun);
@@ -461,18 +458,19 @@ TEST(FrontendOverhaul, PooledRankViewsSurviveSourceAndSparseDeclarationIds) {
     RequireNext(session, CommandKind::kDeclareDatatype);
     const auto declaration = RequireNext(session, CommandKind::kDeclareFun);
     ASSERT_EQ(session.GetPrefix().GetFunctions().size(), 4u);
-    ExpectSpan(session.GetPrefix().GetFunctions()[3].where, text,
+    ExpectSpan(session.GetSourceRecords()->functions[3].where, text,
                "(declare-fun |pooled name| (Int (_ BitVec 32) Int)"
                " (_ BitVec 32))");
-    EXPECT_EQ(session.GetPrefix().GetFunctions()[3].where,
+    EXPECT_EQ(session.GetSourceRecords()->functions[3].where,
               declaration.header.where);
     RequireNext(session, CommandKind::kAssert);
     query = RequireCheck(session);
+    records = *session.GetSourceRecords();
   }
 
   const auto functions = query->GetFunctions();
   ASSERT_EQ(functions.size(), 4u);
-  const auto& function = functions[3];
+  const auto& function = records.functions[3];
   EXPECT_EQ(function.source_name, std::string_view("|pooled name|"));
   EXPECT_EQ(function.source_name, std::string("|pooled name|"));
   const std::vector<std::string> rank{"Int", "(_ BitVec 32)", "Int",
@@ -488,18 +486,16 @@ TEST(FrontendOverhaul, PooledRankViewsSurviveSourceAndSparseDeclarationIds) {
     EXPECT_EQ(spelling, rank[i++]);
   }
   EXPECT_EQ(i, rank.size());
-  EXPECT_EQ(functions[0].source_rank.back(), "Bool");
+  EXPECT_EQ(records.functions[0].source_rank.back(), "Bool");
   for (const auto& declared : functions)
-    EXPECT_TRUE(query->HasFunction(declared.decl.Borrow()));
+    EXPECT_TRUE(query->HasFunction(declared.Borrow()));
   for (std::size_t index = 1; index < functions.size(); ++index)
-    EXPECT_GT(functions[index].decl.GetId(),
-              functions[index - 1].decl.GetId() + 1)
+    EXPECT_GT(functions[index].GetId(), functions[index - 1].GetId() + 1)
         << index;
-  ASSERT_EQ(query->GetDefinitions().size(), 1u);
-  EXPECT_FALSE(query->HasFunction(query->GetDefinitions()[0].decl.Borrow()));
-  ASSERT_EQ(query->GetDefinitions()[0].formals.size(), 1u);
-  EXPECT_FALSE(
-      query->HasFunction(query->GetDefinitions()[0].formals[0].Borrow()));
+  ASSERT_EQ(query->GetDefinitionCount(), 1u);
+  EXPECT_FALSE(query->HasFunction(query->GetDefinition(0).decl.Borrow()));
+  ASSERT_EQ(query->GetDefinition(0).formals.size(), 1u);
+  EXPECT_FALSE(query->HasFunction(query->GetDefinition(0).formals[0].Borrow()));
   ASSERT_EQ(query->GetDatatypeGroups().size(), 1u);
   const auto group = query->GetDatatypeGroups()[0].Borrow();
   EXPECT_FALSE(query->HasFunction(Require(group.GetConstructor(0, 0))));
@@ -509,12 +505,12 @@ TEST(FrontendOverhaul, PooledRankViewsSurviveSourceAndSparseDeclarationIds) {
   const auto other = RequireQuery(
       Parse("(set-logic ALL)(declare-const first Bool)(check-sat)"));
   ASSERT_EQ(other->GetFunctions().size(), 1u);
-  const auto foreign = other->GetFunctions()[0].decl.Borrow();
-  EXPECT_EQ(foreign.GetId(), functions[0].decl.GetId());
+  const auto foreign = other->GetFunctions()[0].Borrow();
+  EXPECT_EQ(foreign.GetId(), functions[0].GetId());
   EXPECT_FALSE(query->HasFunction(foreign));
 
   ASSERT_EQ(query->GetAssertions().size(), 1u);
-  const auto equality = query->GetAssertions()[0].term.Borrow();
+  const auto equality = query->GetAssertions()[0].Borrow();
   ASSERT_EQ(equality.GetKind(), Kind::kEqual);
   ASSERT_EQ(equality.GetChildren().size(), 2u);
   EXPECT_EQ(Applied(equality.GetChildren()[0]), function.decl.Borrow());
@@ -528,7 +524,7 @@ TEST(FrontendOverhaul, SpellingAndLiteralIdentitiesSurviveHashCollisions) {
       "(declare-const |collisionA| Int)(check-sat)"
       "(get-value (collisionA |collisionA| collisionB |collisionB|"
       " 41041 41041 41042 #b1111 #xf (_ bv15 4) #x0f (_ bv15 8)))";
-  auto session = Require(Session::FromText(text));
+  auto session = Require(Session::FromText(text, kCapture));
   auto manager = Require(NodeManager::Attach(session.GetPrefix().GetManager()));
   NodeTestPeer::ForceCollisions(manager, 7);
   RequireNext(session, CommandKind::kSetOption);
@@ -543,10 +539,12 @@ TEST(FrontendOverhaul, SpellingAndLiteralIdentitiesSurviveHashCollisions) {
   ASSERT_EQ(query->GetFunctions().size(), 2u);
   const auto& first = query->GetFunctions()[0];
   const auto& second = query->GetFunctions()[1];
-  EXPECT_EQ(first.source_name, std::string_view("collisionA"));
-  EXPECT_EQ(second.source_name, std::string_view("|collisionB|"));
-  EXPECT_EQ(Applied(values[0].term.Borrow()), first.decl.Borrow());
-  EXPECT_EQ(Applied(values[2].term.Borrow()), second.decl.Borrow());
+  EXPECT_EQ(session.GetSourceRecords()->functions[0].source_name,
+            std::string_view("collisionA"));
+  EXPECT_EQ(session.GetSourceRecords()->functions[1].source_name,
+            std::string_view("|collisionB|"));
+  EXPECT_EQ(Applied(values[0].term.Borrow()), first.Borrow());
+  EXPECT_EQ(Applied(values[2].term.Borrow()), second.Borrow());
   EXPECT_EQ(values[0].term, values[1].term);
   EXPECT_EQ(values[2].term, values[3].term);
   EXPECT_NE(values[0].term, values[2].term);
@@ -639,7 +637,7 @@ TEST(FrontendOverhaul, ConcreteSortCachePreservesRankAndExactSorts) {
       " (_ BitVec 32) (_ FloatingPoint 8 24) (_ BitVec 33)) (_ BitVec 32))"
       "(declare-const wrong (_ BitVec 0))"
       "(declare-const wrong (_ BitVec 32))(check-sat)";
-  auto session = Require(Session::FromText(text, kSource));
+  auto session = Require(Session::FromText(text, kCapture, kSource));
   RequireNext(session, CommandKind::kSetLogic);
   const auto before = session.GetStats().sort_cache_hits;
   RequireNext(session, CommandKind::kDeclareFun);
@@ -652,11 +650,11 @@ TEST(FrontendOverhaul, ConcreteSortCachePreservesRankAndExactSorts) {
   const auto query = RequireCheck(session);
   const auto functions = query->GetFunctions();
   ASSERT_EQ(functions.size(), 2u);
-  EXPECT_EQ(functions[0].source_rank,
+  EXPECT_EQ(session.GetSourceRecords()->functions[0].source_rank,
             (std::vector<std::string>{"(_ BitVec 32)", "(_ FloatingPoint 8 24)",
                                       "(_ BitVec 32)", "(_ FloatingPoint 8 24)",
                                       "(_ BitVec 33)", "(_ BitVec 32)"}));
-  const auto declaration = functions[0].decl.Borrow();
+  const auto declaration = functions[0].Borrow();
   const auto domain = declaration.GetDomain();
   ASSERT_EQ(domain.size(), 5u);
   EXPECT_EQ(domain[0].GetWidth(), 32u);
@@ -664,10 +662,10 @@ TEST(FrontendOverhaul, ConcreteSortCachePreservesRankAndExactSorts) {
   EXPECT_NE(domain[0], domain[4]);
   EXPECT_EQ(domain[0], domain[2]);
   EXPECT_EQ(domain[1], domain[3]);
-  EXPECT_EQ(domain[1].GetFpExponentWidth(), 8u);
-  EXPECT_EQ(domain[1].GetFpSignificandWidth(), 24u);
+  EXPECT_EQ(domain[1].GetFpFormat().value().ExponentWidth(), 8u);
+  EXPECT_EQ(domain[1].GetFpFormat().value().SignificandWidth(), 24u);
   EXPECT_EQ(declaration.GetRange(), domain[0]);
-  EXPECT_EQ(functions[1].decl.Borrow().GetRange(), domain[0]);
+  EXPECT_EQ(functions[1].Borrow().GetRange(), domain[0]);
 }
 
 TEST(FrontendOverhaul, ConcreteSortCacheEvictsUnderDistinctKeyPressure) {
@@ -698,7 +696,7 @@ TEST(FrontendOverhaul, ConcreteSortCacheEvictsUnderDistinctKeyPressure) {
   ASSERT_GE(total_hits, warm_hits);
   EXPECT_LT(total_hits - warm_hits, kKeys);
   ASSERT_EQ(query->GetFunctions().size(), 1u);
-  const auto domain = query->GetFunctions()[0].decl.Borrow().GetDomain();
+  const auto domain = query->GetFunctions()[0].Borrow().GetDomain();
   ASSERT_EQ(domain.size(), 3 * kKeys);
   for (std::size_t i = 0; i < kKeys; ++i) {
     EXPECT_EQ(domain[2 * i].GetWidth(), i + 1);
@@ -719,19 +717,18 @@ TEST(FrontendOverhaul, AllocationFailureRollsBackCachedCommandsAndAllowsRetry) {
     for (std::size_t checkpoint = 0; checkpoint < kMaxCheckpoints;
          ++checkpoint) {
       SCOPED_TRACE(checkpoint);
-      auto session = Require(Session::FromText(text));
+      auto session = Require(Session::FromText(text, kCapture));
       RequireNext(session, CommandKind::kSetLogic);
       RequireNext(session, CommandKind::kDeclareConst);
       RequireNext(session, CommandKind::kAssert);
-      const auto prior_id = session.GetPrefix().GetAssertions()[0].term.GetId();
-      const auto header = Require(session.NextSyntax());
-      ASSERT_TRUE(header);
-      ASSERT_EQ(header->kind, kind);
+      const auto prior_id = session.GetPrefix().GetAssertions()[0].GetId();
       session.FailAllocationAfter(checkpoint);
-      const auto attempted = session.Apply();
+      const auto attempted = session.ReadCommand();
       if (attempted) {
+        ASSERT_TRUE(*attempted);
+        EXPECT_EQ((**attempted).header.kind, kind);
         EXPECT_GT(checkpoint, 0u);
-        inspect(session.GetPrefix());
+        inspect(session.GetPrefix(), *session.GetSourceRecords());
         return;
       }
 
@@ -741,32 +738,36 @@ TEST(FrontendOverhaul, AllocationFailureRollsBackCachedCommandsAndAllowsRetry) {
                 ResourceKind::kCppAllocation);
       const auto& committed = session.GetPrefix();
       ASSERT_EQ(committed.GetFunctions().size(), 1u);
-      EXPECT_EQ(committed.GetFunctions()[0].source_name, std::string("prior"));
-      EXPECT_TRUE(
-          committed.HasFunction(committed.GetFunctions()[0].decl.Borrow()));
+      EXPECT_EQ(session.GetSourceRecords()->functions[0].source_name,
+                std::string("prior"));
+      EXPECT_TRUE(committed.HasFunction(committed.GetFunctions()[0].Borrow()));
       ASSERT_EQ(committed.GetAssertions().size(), 1u);
-      ASSERT_EQ(committed.GetNamedTerms().size(), 1u);
-      ASSERT_EQ(committed.GetAnnotations().size(), 1u);
-      EXPECT_EQ(committed.GetNamedTerms()[0].name, "keep");
-      EXPECT_EQ(committed.GetAssertions()[0].term.GetId(), prior_id);
-      EXPECT_EQ(committed.GetNamedTerms()[0].term.GetId(), prior_id);
-      EXPECT_EQ(committed.GetAnnotations()[0].term.GetId(), prior_id);
+      ASSERT_EQ(session.GetSourceRecords()->named_terms.size(), 1u);
+      ASSERT_EQ(session.GetSourceRecords()->annotations.size(), 1u);
+      EXPECT_EQ(session.GetSourceRecords()->named_terms[0].name, "keep");
+      EXPECT_EQ(committed.GetAssertions()[0].GetId(), prior_id);
+      EXPECT_EQ(session.GetSourceRecords()->named_terms[0].term.GetId(),
+                prior_id);
+      EXPECT_EQ(session.GetSourceRecords()->annotations[0].term.GetId(),
+                prior_id);
       RequireNext(session, kind);
-      inspect(session.GetPrefix());
-      EXPECT_FALSE(Require(session.NextSyntax()));
+      inspect(session.GetPrefix(), *session.GetSourceRecords());
+      EXPECT_FALSE(Require(session.ReadCommand()));
     }
     ADD_FAILURE() << "The allocation checkpoint sweep never reached success";
   };
 
   sweep("(declare-fun |new rank| ((_ BitVec 32) (_ BitVec 32)) (_ BitVec 32))",
-        CommandKind::kDeclareFun, [](const QueryContext& query) {
+        CommandKind::kDeclareFun,
+        [](const QueryContext& query, const SourceRecords& records) {
           const auto functions = query.GetFunctions();
           ASSERT_EQ(functions.size(), 2u);
-          EXPECT_EQ(functions[1].source_name, std::string_view("|new rank|"));
-          EXPECT_EQ(functions[1].source_rank,
+          EXPECT_EQ(records.functions[1].source_name,
+                    std::string_view("|new rank|"));
+          EXPECT_EQ(records.functions[1].source_rank,
                     (std::vector<std::string>{"(_ BitVec 32)", "(_ BitVec 32)",
                                               "(_ BitVec 32)"}));
-          const auto declaration = functions[1].decl.Borrow();
+          const auto declaration = functions[1].Borrow();
           EXPECT_TRUE(query.HasFunction(declaration));
           ASSERT_EQ(declaration.GetDomain().size(), 2u);
           EXPECT_EQ(declaration.GetDomain()[0], declaration.GetDomain()[1]);
@@ -776,19 +777,20 @@ TEST(FrontendOverhaul, AllocationFailureRollsBackCachedCommandsAndAllowsRetry) {
         });
 
   sweep("(assert (and (! (= 7447 7447) :named fresh) (= 7448 7448)))",
-        CommandKind::kAssert, [](const QueryContext& query) {
+        CommandKind::kAssert,
+        [](const QueryContext& query, const SourceRecords& records) {
           ASSERT_EQ(query.GetFunctions().size(), 1u);
           ASSERT_EQ(query.GetAssertions().size(), 2u);
-          ASSERT_EQ(query.GetNamedTerms().size(), 2u);
-          ASSERT_EQ(query.GetAnnotations().size(), 2u);
-          EXPECT_EQ(query.GetNamedTerms()[1].name, "fresh");
-          const auto root = query.GetAssertions()[1].term.Borrow();
+          ASSERT_EQ(records.named_terms.size(), 2u);
+          ASSERT_EQ(records.annotations.size(), 2u);
+          EXPECT_EQ(records.named_terms[1].name, "fresh");
+          const auto root = query.GetAssertions()[1].Borrow();
           ASSERT_EQ(root.GetKind(), Kind::kAnd);
           ASSERT_EQ(root.GetChildren().size(), 2u);
           const auto first = root.GetChildren()[0];
           const auto second = root.GetChildren()[1];
-          EXPECT_EQ(first, query.GetNamedTerms()[1].term.Borrow());
-          EXPECT_EQ(first, query.GetAnnotations()[1].term.Borrow());
+          EXPECT_EQ(first, records.named_terms[1].term.Borrow());
+          EXPECT_EQ(first, records.annotations[1].term.Borrow());
           for (const auto& [node, literal] :
                {std::pair{first, "7447"}, {second, "7448"}}) {
             ASSERT_EQ(node.GetKind(), Kind::kEqual);
@@ -816,18 +818,19 @@ TEST(FrontendOverhaul, BatchTeardownPreservesExternalOwnersAndDetachesTable) {
         retained == Retained::kRoot || retained == Retained::kBoth;
     const auto keep_child =
         retained == Retained::kChild || retained == Retained::kBoth;
-    auto query = RequireQuery(Parse(text));
+    SourceRecords records;
+    auto query = RequireQuery(Parse(text, &records));
     auto manager = Require(NodeManager::Attach(query->GetManager()));
-    ASSERT_EQ(query->GetDefinitions().size(), 1u);
-    ASSERT_EQ(query->GetNamedTerms().size(), 2u);
-    ASSERT_EQ(query->GetAnnotations().size(), 2u);
+    ASSERT_EQ(query->GetDefinitionCount(), 0u);
+    ASSERT_EQ(records.named_terms.size(), 2u);
+    ASSERT_EQ(records.annotations.size(), 2u);
     ASSERT_EQ(query->GetAssertions().size(), 3u);
-    const auto& seed = query->GetDefinitions()[0].body;
-    EXPECT_EQ(query->GetAssertions()[0].term, seed);
-    EXPECT_EQ(query->GetAssertions()[1].term, seed);
-    for (const auto& named : query->GetNamedTerms())
-      EXPECT_EQ(named.term, seed);
-    for (const auto& annotation : query->GetAnnotations())
+    ASSERT_EQ(records.definitions.size(), 1u);
+    const auto& seed = records.definitions[0].body;
+    EXPECT_EQ(query->GetAssertions()[0], seed);
+    EXPECT_EQ(query->GetAssertions()[1], seed);
+    for (const auto& named : records.named_terms) EXPECT_EQ(named.term, seed);
+    for (const auto& annotation : records.annotations)
       EXPECT_EQ(annotation.term, seed);
 
     const auto root_id = seed.GetId();
@@ -837,6 +840,7 @@ TEST(FrontendOverhaul, BatchTeardownPreservesExternalOwnersAndDetachesTable) {
     const auto before = NodeTestPeer::GetStats(manager);
     EXPECT_EQ(before.live_nodes, kDepth + 3);
     ASSERT_GT(before.table_capacity, 0u);
+    records = {};
     query.reset();
 
     const auto after = NodeTestPeer::GetStats(manager);
@@ -1064,9 +1068,9 @@ TEST(FrontendOverhaul, FloatingMinAndMaxPreserveOppositeZeroOrder) {
       ASSERT_EQ(children.size(), 2u);
       for (std::size_t j = 0; j < children.size(); ++j) {
         ASSERT_EQ(children[j].GetKind(), kFpValue);
-        EXPECT_EQ(children[j].GetValue()->GetFpCategory(),
-                  (i + j) % 2 == 0 ? FpCategory::kPositiveZero
-                                   : FpCategory::kNegativeZero);
+        EXPECT_EQ(children[j].GetValue()->GetFloatingPoint().value().Category(),
+                  (i + j) % 2 == 0 ? numeric::FpCategory::kPositiveZero
+                                   : numeric::FpCategory::kNegativeZero);
       }
     }
     EXPECT_NE(typed.values[0].term, typed.values[1].term);
@@ -1176,9 +1180,11 @@ TEST(FrontendOverhaul, EnabledParsingPublishesCanonicalQueryTerms) {
       "(assert (= (+ true a) 3))"
       "(assert (! (= sumLeft 3) :named equalityLeft))"
       "(assert (! (= 3 sumRight) :named equalityRight))(check-sat)";
-  auto session = Require(Session::FromReader(
-      Chunked(text, kIrregularChunks),
-      ParseOptions{.canonicalize_commutative = true}, kSource));
+  auto session =
+      Require(Session::FromReader(Chunked(text, kIrregularChunks),
+                                  ParseOptions{.canonicalize_commutative = true,
+                                               .capture_source_records = true},
+                                  kSource));
   RequireNext(session, CommandKind::kSetLogic);
   RequireNext(session, CommandKind::kDeclareConst);
   RequireNext(session, CommandKind::kDeclareConst);
@@ -1192,10 +1198,11 @@ TEST(FrontendOverhaul, EnabledParsingPublishesCanonicalQueryTerms) {
   RequireNext(session, CommandKind::kAssert);
   const auto query = RequireCheck(session);
 
-  const auto definitions = query->GetDefinitions();
-  const auto names = query->GetNamedTerms();
-  const auto annotations = query->GetAnnotations();
-  const auto assertions = query->GetAssertions();
+  const auto definitions = session.GetSourceRecords()->definitions;
+  const auto names = session.GetSourceRecords()->named_terms;
+  const auto annotations = session.GetSourceRecords()->annotations;
+  EXPECT_EQ(query->GetDefinitionCount(), 0u);
+  const auto& assertions = session.GetSourceRecords()->assertions;
   ASSERT_EQ(definitions.size(), 2u);
   ASSERT_EQ(names.size(), 4u);
   ASSERT_EQ(annotations.size(), 4u);

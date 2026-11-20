@@ -32,7 +32,7 @@ BENCHMARK_BINARY = Path("benchmarks/frontend/dandelion_frontend_benchmarks")
 CPU_SYSFS = Path("/sys/devices/system/cpu")
 ADAPTERS = ("text", "reader_64k", "reader_4k", "reader_irregular")
 SCENARIOS = (*ADAPTERS, "phases", "teardown")
-PHASES = ("next_syntax_ns", "apply_ns", "teardown_ns")
+PHASES = ("read_command_ns", "teardown_ns")
 RSS_FIELDS = (
     "baseline_rss_kib", "peak_rss_kib", "retained_rss_kib",
     "post_teardown_rss_kib", "transient_rss_kib",
@@ -50,7 +50,7 @@ COUNTS = {
     "expected_definitions": "definitions",
 }
 INSPECT_COUNTS = (
-    *COUNTS.values(), *PHASES, "tokens", "applied_commands", "checks", "reader_calls",
+    *COUNTS.values(), *PHASES, "tokens", "committed_end_offset", "checks", "reader_calls",
     "user_sorts", "user_functions", "datatype_groups", "named_terms", "annotations",
     "metadata", "roots", "nodes", "edges", "depth", "max_fanout",
 )
@@ -256,7 +256,7 @@ def verified_input(case):
 def inspect_sample(path, expected):
     metrics = decode_json(path.read_bytes())
     if (not isinstance(metrics, dict) or type(metrics.get("schema_version")) is not int
-            or metrics["schema_version"] != 1 or metrics.get("status") not in INSPECT_STATUSES):
+            or metrics["schema_version"] != 2 or metrics.get("status") not in INSPECT_STATUSES):
         raise ValueError("Invalid frontend inspection schema or status")
     if not isinstance(metrics.get("diagnostic_message"), str):
         raise ValueError("Invalid frontend inspection diagnostic")
@@ -273,7 +273,7 @@ def inspect_sample(path, expected):
             raise ValueError(f"Invalid frontend inspection memory ratio {key}")
     if (not isinstance(metrics.get("logic"), str) or not metrics["logic"]
             or metrics["diagnostic_message"] or metrics["checks"] != 1
-            or metrics["commands"] != metrics["applied_commands"]
+            or not 0 < metrics["committed_end_offset"] <= metrics["bytes"]
             or metrics["diagnostic_code"] is not None or metrics["diagnostic_span"] is not None):
         raise ValueError("Inconsistent successful frontend inspection")
     if "logic" in expected and metrics["logic"] != expected["logic"]:
@@ -529,6 +529,8 @@ def execute(cases, binary, output, settings, slots, timed):
                     directory = output / "cases" / f"{index + 1:04d}"
                     directory.mkdir(parents=True, exist_ok=True)
                     argv = [str(binary), "--input", case["input_path"]]
+                    if settings.get("canonicalize", False):
+                        argv.append("--canonicalize")
                     if ordinal < 0:
                         scenario = "inspect"
                         prefix = directory / scenario
@@ -668,6 +670,8 @@ def report(result):
         f"Successful samples per second {display(batch['successful_samples_per_s'])}. "
         f"Batch adapter throughput {display(batch['adapter_mib_per_s'])} MiB/s.", "",
     ]
+    if settings.get("canonicalize", False):
+        lines[2] += " Canonicalization enabled."
     for kind, counts in result["status_counts"].items():
         counts_text = ", ".join(f"{status} {count}" for status, count in sorted(counts.items()))
         lines.append(f"- {kind.capitalize()} outcomes — {counts_text or 'none'}")
@@ -727,7 +731,7 @@ def report(result):
 
 def _run_manifests(manifest_paths, *, output_dir, benchmark_exe=None, build_dir=None,
                    jobs=None, mode="throughput", scenarios=None, samples=3, timeout=60,
-                   memory_mib=8192, memory_budget_mib=None, cases=None):
+                   memory_mib=8192, memory_budget_mib=None, cases=None, canonicalize=False):
     output = outside_dataset(output_dir)
     if mode not in ("throughput", "isolated"):
         raise ValueError(f"Unknown execution mode {mode!r}")
@@ -775,6 +779,8 @@ def _run_manifests(manifest_paths, *, output_dir, benchmark_exe=None, build_dir=
         "scenarios": scenarios, "samples": samples, "timeout_s": timeout, "memory_mib": memory_mib,
         "memory_budget_mib": memory_budget_mib, "benchmark_iterations": 1,
     }
+    if canonicalize:
+        settings["canonicalize"] = True
     result = {"schema": 1, "command": [sys.executable, *sys.argv], "environment": environment,
               "settings": settings, "manifests": manifests, "cases": inputs}
     timed = [(scenario, repeat) for scenario in scenarios for repeat in range(1, samples + 1)]
@@ -789,11 +795,12 @@ def run_suite(*, manifest_path: Path, output_dir: Path, benchmark_exe: Path | No
               build_dir: Path | None = None, jobs: int | None = None, mode: str = "throughput",
               scenarios: tuple[str, ...] | list[str] | None = None, samples: int = 3, timeout: int = 60,
               memory_mib: int = 8192, memory_budget_mib: int | None = None,
-              cases: list[str] | None = None) -> dict:
+              cases: list[str] | None = None, canonicalize: bool = False) -> dict:
     return _run_manifests(
         (manifest_path,), output_dir=output_dir, benchmark_exe=benchmark_exe, build_dir=build_dir,
         jobs=jobs, mode=mode, scenarios=scenarios, samples=samples, timeout=timeout,
         memory_mib=memory_mib, memory_budget_mib=memory_budget_mib, cases=cases,
+        canonicalize=canonicalize,
     )
 
 
@@ -810,6 +817,7 @@ def main():
     parser.add_argument("--memory-mib", type=int, default=8192)
     parser.add_argument("--memory-budget-mib", type=int)
     parser.add_argument("--case", action="append")
+    parser.add_argument("--canonicalize", action="store_true")
     args = parser.parse_args()
     scenarios = [scenario for item in args.scenario for scenario in item.split(",")] if args.scenario else None
     try:
@@ -817,6 +825,7 @@ def main():
             args.manifest, output_dir=args.output, build_dir=args.build_dir, jobs=args.jobs,
             mode=args.mode, scenarios=scenarios, samples=args.samples, timeout=args.timeout,
             memory_mib=args.memory_mib, memory_budget_mib=args.memory_budget_mib, cases=args.case,
+            canonicalize=args.canonicalize,
         )
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
         parser.error(str(error))

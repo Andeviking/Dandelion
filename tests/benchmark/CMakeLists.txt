@@ -39,7 +39,7 @@ gtest_discover_tests(dandelion_benchmark_integration_tests
 
 add_executable(dandelion_node_workload_tests node_workload_test.cc)
 target_link_libraries(dandelion_node_workload_tests PRIVATE
-  dandelion_node_workload ${DANDELION_GTEST_MAIN_TARGET}
+  dandelion_node_workload dandelion_util ${DANDELION_GTEST_MAIN_TARGET}
 )
 dandelion_configure_target(dandelion_node_workload_tests
   SOURCES node_workload_test.cc
@@ -54,7 +54,7 @@ target_include_directories(dandelion_frontend_workload_tests PRIVATE
   "${CMAKE_CURRENT_BINARY_DIR}"
 )
 target_link_libraries(dandelion_frontend_workload_tests PRIVATE
-  dandelion_frontend_workload ${DANDELION_GTEST_MAIN_TARGET}
+  dandelion_frontend_workload dandelion_util ${DANDELION_GTEST_MAIN_TARGET}
 )
 if(DANDELION_BUILD_BENCHMARKS)
   target_compile_definitions(dandelion_frontend_workload_tests PRIVATE

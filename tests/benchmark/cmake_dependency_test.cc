@@ -387,6 +387,14 @@ TEST_F(BenchmarkIntegrationTest, RealNodeWorkloadsPassDryRun) {
   EXPECT_EQ(json.find("\"error_occurred\": true"), std::string::npos);
   EXPECT_EQ(json.find("\"skipped\": true"), std::string::npos);
 }
+
+TEST_F(BenchmarkIntegrationTest, NumericNodeSuitesPassDryRun) {
+  const auto result = Run(
+      {"python3",
+       std::string(kDandelionSourceDir) + "/tests/benchmark/pipeline_test.py",
+       "numeric-node", DANDELION_BENCHMARK_EXECUTABLE});
+  EXPECT_EQ(result.exit_code, 0) << result.output;
+}
 #endif
 
 #ifdef DANDELION_FRONTEND_BENCHMARK_EXECUTABLE

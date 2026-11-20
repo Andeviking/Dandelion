@@ -12,8 +12,8 @@ TEST(FrontendDriver, CheckWritesAndFlushesBeforeReadingAnOpenStream) {
   std::size_t reads = 0;
   int checks = 0;
   CapturedSink sink;
-  auto session =
-      Require(Session::FromReader([&](std::span<char> buffer) -> ReadResult {
+  auto session = Require(Session::FromReader(
+      [&](std::span<char> buffer) -> ReadResult {
         if (reads == chunks.size())
           return std::unexpected(std::make_error_code(std::errc::io_error));
         if (reads == 1) {
@@ -27,7 +27,8 @@ TEST(FrontendDriver, CheckWritesAndFlushesBeforeReadingAnOpenStream) {
         const auto chunk = chunks[reads++];
         std::copy(chunk.begin(), chunk.end(), buffer.begin());
         return chunk.size();
-      }));
+      },
+      ParseOptions{.capture_source_records = true}));
   const auto result = dandelion::frontend::Run(
       session,
       [&](const QueryContext& query,
@@ -35,7 +36,7 @@ TEST(FrontendDriver, CheckWritesAndFlushesBeforeReadingAnOpenStream) {
         ++checks;
         EXPECT_EQ(query.GetLogic(), "QF_BV");
         EXPECT_FALSE(options.produce_models);
-        EXPECT_EQ(query.GetMetadata()[0].value, "unsat");
+        EXPECT_EQ(session.GetSourceRecords()->metadata[0].value, "unsat");
         EXPECT_EQ(query.GetAssertions().size(), 1);
         return CheckResult{CheckAnswer::kSat, UnknownReason::kUnknown, nullptr};
       },
@@ -282,10 +283,9 @@ TEST(FrontendDriver, ExactResponsesAndFlushesFromCommittedState) {
     ++checks;
     EXPECT_FALSE(options.print_success);
     const auto roots = query.GetAssertions();
-    const bool has_false =
-        roots.size() == 1 &&
-        roots[0].term.Borrow().GetKind() == Kind::kBoolValue &&
-        roots[0].term.Borrow().GetValue()->GetBool() == false;
+    const bool has_false = roots.size() == 1 &&
+                           roots[0].Borrow().GetKind() == Kind::kBoolValue &&
+                           roots[0].Borrow().GetValue()->GetBool() == false;
     return CheckResult{has_false ? CheckAnswer::kUnsat : CheckAnswer::kSat,
                        UnknownReason::kUnknown, nullptr};
   };
@@ -299,7 +299,7 @@ TEST(FrontendDriver, ExactResponsesAndFlushesFromCommittedState) {
     checks = 0;
     auto session = Require(Session::FromText(script));
     CapturedSink sink;
-    const auto result = dandelion::frontend::Run(session, engine, sink.Get());
+    const auto result = session.Run(engine, sink.Get());
     auto expected =
         std::string("success\nsuccess\nsuccess\nunsupported\nunsat\n");
     EXPECT_EQ(result.status, bad_tail ? 1 : 0);
@@ -322,7 +322,7 @@ TEST(FrontendDriver, ExactResponsesAndFlushesFromCommittedState) {
   auto session = Require(Session::FromText(exit));
   CapturedSink sink;
   checks = 0;
-  const auto result = dandelion::frontend::Run(session, engine, sink.Get());
+  const auto result = session.Run(engine, sink.Get());
   EXPECT_EQ(result.status, 0);
   EXPECT_FALSE(result.diagnostic);
   EXPECT_EQ(session.GetPhase(), SessionPhase::kTerminated);
@@ -347,8 +347,8 @@ TEST(FrontendDriver, ResetAssertionsPreservesFalseAndStopsBeforeCheck) {
           const auto roots = query.GetAssertions();
           const bool has_false =
               roots.size() == 1 &&
-              roots[0].term.Borrow().GetKind() == Kind::kBoolValue &&
-              roots[0].term.Borrow().GetValue()->GetBool() == false;
+              roots[0].Borrow().GetKind() == Kind::kBoolValue &&
+              roots[0].Borrow().GetValue()->GetBool() == false;
           return CheckResult{
               has_false ? CheckAnswer::kUnsat : CheckAnswer::kSat,
               UnknownReason::kUnknown, nullptr};
@@ -366,8 +366,8 @@ TEST(FrontendDriver, ResetAssertionsPreservesFalseAndStopsBeforeCheck) {
     EXPECT_EQ(calls, reset ? 0 : 1);
     const auto roots = session.GetPrefix().GetAssertions();
     ASSERT_EQ(roots.size(), 1);
-    ASSERT_EQ(roots[0].term.Borrow().GetKind(), Kind::kBoolValue);
-    EXPECT_EQ(roots[0].term.Borrow().GetValue()->GetBool(), false);
+    ASSERT_EQ(roots[0].Borrow().GetKind(), Kind::kBoolValue);
+    EXPECT_EQ(roots[0].Borrow().GetValue()->GetBool(), false);
   }
 }
 
@@ -533,9 +533,9 @@ TEST(FrontendDriver,
     EXPECT_EQ(session.GetPrefix().GetLogic(), "QF_SAT");
     const auto roots = session.GetPrefix().GetAssertions();
     ASSERT_EQ(roots.size(), 1);
-    ASSERT_EQ(roots[0].term.Borrow().GetKind(), Kind::kBoolValue);
-    EXPECT_EQ(roots[0].term.Borrow().GetValue()->GetBool(), false);
-    EXPECT_FALSE(Require(session.NextSyntax()));
+    ASSERT_EQ(roots[0].Borrow().GetKind(), Kind::kBoolValue);
+    EXPECT_EQ(roots[0].Borrow().GetValue()->GetBool(), false);
+    EXPECT_FALSE(Require(session.ReadCommand()));
     EXPECT_EQ(reads, 2);
   }
 }

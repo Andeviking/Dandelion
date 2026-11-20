@@ -43,10 +43,11 @@ project and the actual developer-check script.
 ## Real library and workloads
 
 In an explicitly enabled benchmark build, the actual pinned Google Benchmark
-library is built and linked with the Node module. A GoogleTest case runs the
-benchmark executable with `--benchmark_dry_run` and a temporary JSON output;
-it requires both documented workloads to appear, with no error or skip. A
-dry run checks only construction and reporting, not performance.
+library is built and linked with the Node benchmark. A GoogleTest case runs
+the executable with `--benchmark_dry_run` and a temporary JSON output and
+checks both original Integer workloads. The numeric inventory check covers
+all 15 built-in cases, each with one completed iteration and no error or
+skip. A dry run checks setup, execution, and reporting.
 
 The `node/integer/hit` workload keeps an owning reference alive and verifies
 that an identical construction resolves to the same node before timing. The
@@ -74,6 +75,183 @@ process exit status alone is insufficient.
 - Build and run the applicable tests with GCC and Clang, and run existing
   project tests appropriate to the change. Record unavailable checks and
   preserve all existing tests. No benchmark data set is required.
+
+## Phase 1A pre-refactor baseline
+
+Measured on 2026-11-20 UTC from the working tree at `8057bf8f01c6` with
+pre-existing local changes. The Node benchmark target was rebuilt in
+`build/benchmark` with GCC 16.2.0, CMake 4.5.0, Ninja 1.13.2, GMP 6.3.0,
+and Google Benchmark 1.10.0. The build used Release, benchmarks ON, tests OFF,
+and sanitizers OFF. The run used logical CPU 123 on a shared Linux x86-64
+host with AMD EPYC 7763 processors and ASLR enabled.
+
+```sh
+cmake --build build/benchmark --target dandelion_node_benchmarks
+taskset -c 123 build/benchmark/benchmarks/node/dandelion_node_benchmarks \
+  --benchmark_filter="node/integer" --benchmark_repetitions=3 \
+  --benchmark_out=/path/to/experiment-output/node-integer.json \
+  --benchmark_out_format=json
+```
+
+All three repetitions for each workload completed successfully in one
+process. Times are nanoseconds per iteration, rounded to three decimal
+places.
+
+| Workload | CPU samples (ns) | Median CPU (ns) | Median wall (ns) |
+| --- | --- | ---: | ---: |
+| `node/integer/hit` | 34.571, 34.574, 34.576 | 34.574 | 34.575 |
+| `node/integer/create_release` | 61.656, 61.380, 61.391 | 61.391 | 61.392 |
+
+CTest ran with `--output-on-failure`. GCC Debug was rebuilt before its
+reported run. The Clang Debug cache had benchmarks enabled and registered
+seven additional benchmark integration tests. Both runs skipped four
+opt-in reference capture and real-workload checks.
+
+| Preset | Configuration | Passed | Failed | Skipped |
+| --- | --- | ---: | ---: | ---: |
+| `debug` | GCC 16.2.0, ASan+UBSan, benchmarks OFF | 887 | 0 | 4 |
+| `clang-debug` | Clang 23.1.5, sanitizers OFF, benchmarks ON | 894 | 0 | 4 |
+
+## Numeric and constant-evaluation benchmarks
+
+Phase 5 implemented standalone construction and computation workloads
+(Phase 5A) and typed Node interning, postorder traversal, and benchmark-local
+constant folding workloads (Phase 5B). Phase 6 uses these workloads to
+measure arithmetic (Phase 6A) and Node interning (Phase 6B) optimizations.
+The historical dry runs and Release samples are under `dandelion-phase5-util`,
+`dandelion-phase5-node`, `dandelion-phase6a-util`, and
+`dandelion-phase6b-node` in the experiment output directory.
+[Standalone workload guide](../../benchmarks/util/README.md),
+[Node acceptance](node-acceptance.md#phases-4b-5-and-6)
+
+The cases below specify test coverage using deterministic fixtures and
+independent expectations. Benchmark preflights verify their fixtures before
+timing. GoogleTest verifies values, identities, lifetime transitions, and
+failure categories. [Numeric testing](util.md), [Node testing](node.md)
+
+### Suite A — Value construction and Node interning
+
+Give checked value construction, literal decoding, copy, move, and
+destruction distinct cases. Prepare source values and input buffers before
+timing. For move and destruction, prepare fresh owners outside the measured
+region for each operation. Keep the number of live owners bounded across
+iterations. Record the type, operation, input size, and width or format.
+
+| Boundary | Fixtures and checks |
+| --- | --- |
+| Value creation and parsing | Use Integer `42` and `9223372036854775808`, Rational components `(-2,-4)` and decimal text `1.250`, and BV64/BV65 at the upper bit boundary. Check exact values, normalized fractions `1/2` and `5/4`, and width-preserving bit decoding. Decode FP fields through the documented bit decoder and typed constructor. In format `(2,3)`, `00000` and `10000` are the two signed zeros, and `01101` and `11111` both represent NaN. Reject malformed digits, a denominator of zero, BV64 payload `2^64`, and a mismatched FP bit width through their owning APIs. |
+| Copy, move, and destroy | Use small and wide payloads for all four types. Destroy the source of a copy and verify the copy still has the exact original value and type. Check the destination of a move and that the source resets to Integer zero, Rational `0/1`, BV1 zero, or FP `(2,2)` positive zero, respectively. Check destruction in both orders. Exercise a recoverable copy failure and verify the destination retains its previous value. |
+| Node interning | Keep the two existing Integer workloads as controls and add narrow and wide payload cases. For hits, keep a seed owner alive and check the same ID and unchanged live nodes after dropping the result. For a miss, check a new ID and one additional live node. For final release, check that live counts return to the starting value and reconstruction gets a new ID. Use BV width and FP format changes as distinct keys, same-format NaN encodings as a hit, and opposite FP zeros as distinct keys. Use a normalized Rational payload with the same rounding-mode child and FP format to check an equivalent-key hit. For rejected construction, verify that existing owners and published storage stay valid. |
+
+Keep parsing, sort preparation, and seed creation outside the Node timing
+region. For an isolated miss, start with the key absent and release the
+result outside timing. For an isolated final release, prepare the sole owner
+outside timing. Report the timed operation and any included cleanup. The
+legacy `create_release` case measures the factory and final owner release
+together.
+
+The current Node registrations cover the original Integer pair, the wide
+Integer hit and create/release pair, BV64 word hit and high-bit create/release,
+and BV65 hit and create/release. FP create/release covers a special, a word,
+and a wide encoding. Rational conversion create/release covers compact and
+wide fractions. NaN hits, signed-zero key distinctions, and normalized
+Rational hits are correctness checks in the Node suite and candidates for
+separate timing workloads. [Node numeric tests](node.md#phase-1c-typed-literals-and-inline-numeric-payloads)
+
+### Suite B — Pure numeric computation
+
+Use prebuilt standalone operands, explicit indices, widths, formats, and
+rounding modes. Each timed call performs a named numeric operation and
+uses its result. Link the workload through the numeric library. Keep Node,
+frontend, literal decoding, and formatting outside the computation.
+Record operand sizes and distinguish small, boundary, and multi-limb cases.
+
+| Domain | Initial cases and independent expectations |
+| --- | --- |
+| Integer | Measure add, multiply, and Euclidean division on small and wide operands. Check `INT64_MAX + 1 = 2^63`, `2^128 * 2^128 = 2^256`, and `DivMod(-7, 3) = (-3, 2)`. Check zero divisor rejection separately. |
+| Rational | Measure add, multiply, and divide with reducible small and wide values. Check `1/6 + 1/3 = 1/2`, `(-2/3) * (9/4) = -3/2`, and `(2/3) / (-4/5) = -5/6`. Adding `2^128/(2^128+1)` and `1/(2^128+1)` gives `1/1`. Check zero divisor rejection separately. |
+| BitVector | Measure wrapping addition, shifts, and signed and unsigned division at widths 8, 63, 64, 65, and 256. All ones plus one wraps to zero. A logical right shift by the width gives zero, and signed arithmetic right shift of the sign bit by the width gives all ones. For an all-ones dividend and divisor two, unsigned division gives `2^(w-1)-1` and signed division gives zero. Unsigned division by zero yields all ones. Check mismatched width rejection. |
+| FloatingPoint | Measure ordinary finite arithmetic, a rounding-sensitive operation, and a special-value path. In format `(2,3)`, RNE fused multiply-add on `(3/2, 3/2, -2)` gives `1/4`. Rational `9/8` rounds to `1` under RNE and `5/4` under RTP. In format `(8,24)`, `1 + 2^-24` rounds to `1` under RNE. A positive finite value divided by negative zero gives negative infinity. Separately verify the allowed signed-zero choice for `min(+0,-0)`, unspecified conversion of NaN to BV, and rejection of incompatible formats. |
+
+Derive expected values from the mathematical operations and the tiny FP
+reference cases. In the harness, pass the prebuilt runtime operands and
+results through optimization barriers so the calls remain in the loop.
+Classify defined, choice, unspecified, and resource outcomes according to
+the operation's contract. Keep the broader operation coverage in the numeric
+GoogleTest suite.
+
+### Suite C — Constant evaluation of prebuilt DAGs
+
+`node/dag/postorder` and `node/dag/constant_fold` use the same mixed DAG of
+15 roots, 96 distinct nodes, 157 child slots, and depth 65. The workload
+test verifies the fixture and each folded root, including the rebuilt
+symbolic parents and preserved unresolved operations. It also checks
+resource failure cleanup and that releasing folded results restores the
+input storage totals. [Node workload tests](../../tests/benchmark/node_workload_test.cc)
+
+Construct typed DAGs with Node factories before timing. Preflight verifies
+that the input still has its intended operator kinds, ordered children,
+indices, and shared identities. Time the evaluator or rewriter on those
+roots with a fresh call-local memo each iteration. Keep DAG construction
+and SMT-LIB parsing outside the timed region. Bound the lifetime of results
+and memo entries to the current iteration. Record root count, distinct nodes,
+child slots, and depth.
+
+- Build Integer `s = add(6, 7)` and roots `mul(s, s)` and `sub(s, 6)`.
+  There are five distinct input nodes, six child slots, and depth three
+  counting nodes. Check both occurrences of `s` in the first root and the
+  shared identity across roots. Expect Int results `169` and `7` in
+  root order. Repeat the call on the same input and verify its structure
+  and results are preserved.
+- Use a 64-addition chain starting at Int zero and adding the same Int one
+  at each step. Expect 66 nodes, 128 child slots, depth 65, and result 64.
+  Also check a literal-only root as a control.
+- Use BV8 `extract(7,4,0xa3)` for a BV4 result `0xa`, and BV8 `0xff`
+  converted to signed Int for `-1`. Evaluate a Rational-to-FP node with
+  payload `9/8` and a concrete RTP child for `5/4` in format `(2,3)`.
+  Use the same rational with RNE for `1`. Check both result values and
+  result sorts.
+- Check a symbolic leaf, integer division by zero, and FP min on opposite
+  signed zeros. Require preservation of unresolved terms or the documented
+  non-concrete outcome. Inject a recoverable resource failure and verify the
+  category, cleanup of temporary state, and the original roots' validity.
+
+### Memory verification
+
+Sample the same fixture and lifecycle boundaries across applicable layers.
+Capture a baseline after fixed setup, then measure live input or results,
+partial release where applicable, and final teardown. Run diagnostics
+separately from the timing samples.
+
+| Layer | Verification and reporting |
+| --- | --- |
+| `NodeStorageStats` | Use the two-root Integer DAG with all temporary owners and evaluation results released. Check `(live_nodes, live_edges)` of `(0,0)` for the fresh manager, `(5,6)` with both roots, `(4,4)` after releasing the multiply root, and `(0,0)` after releasing the last root. Verify the retained root still reaches the shared child. Check that live node bytes fall on each release and reach zero. A separate wide literal contributes its inline limbs to `node_bytes`. A builtin with a wide index exercises separately owned `numeric_backing_bytes`. Report metadata and current/peak table storage according to the Node contract, including any retained manager storage. |
+| Allocation counting hooks | Enable hooks in a diagnostic build at project-controlled allocation boundaries. Allocate 32 bytes then 96 bytes through a covered boundary and free them in the same order. Require two allocations, two frees, 128 bytes requested, live-byte samples of `0, 32, 128, 96, 0`, and a 128-byte peak. Count a recoverable failed request without adding live bytes. On real fixtures, verify zero additional node-block allocations on a seeded hit and balance for covered allocations after destroying all fixture owners, evaluator state, and the manager. Report hook coverage. GMP's internal allocation and allocator overhead are outside these counts. |
+| Subprocess RSS | Run one workload per fresh child and use the existing subprocess accounting path for peak RSS in KiB. Report child startup/runtime and fixture memory as part of that process total. Check the path with a bounded child that touches a known set of pages and require a valid positive RSS record attributable to the child. Use synthetic records for exact unit conversion and missing or malformed fields. Check timeout and signal classification separately and report unavailable measurements explicitly. |
+
+Requested storage, allocation traffic, and process residency have different
+scopes. Keep each layer's units and checkpoints in the output. Use exact
+counts for deterministic ownership and hook tests. RSS and elapsed-time
+magnitudes are measurements with no fixed GoogleTest pass threshold.
+The Node memory inspection reports workload storage separately from the
+manager's requested bytes. The workload's storage includes the enclosing
+Rational backing and both stored GMP magnitudes, via `RationalView::BackingBytes()`.
+Allocation traffic remains a separate diagnostic measurement.
+
+### Acceptance checks
+
+- Register direct fixture checks and subprocess checks in GoogleTest/CTest.
+  Run the applicable suites with GCC Debug ASan+UBSan and Clang Debug.
+- In a benchmark-enabled test configuration, list and dry-run the actual
+  executables. Require the expected case inventory, one completed iteration
+  per selected workload, and no unexpected skip or error. Exercise an
+  invalid or missing selection and an error record from a failed preflight.
+  Treat zero selected cases as an invalid measurement.
+- Collect timing in a tests-off Release build with sanitizers and allocation
+  hooks disabled. Retain raw JSON repetitions, units, iterations, workload
+  parameters, build and dependency versions, CPU and affinity, and failures.
+  Compare the legacy Integer cases under the same conditions and report
+  diagnostic and RSS results with their own run settings.
 
 ## Trace-derived workloads
 
@@ -189,12 +367,13 @@ scheduler tests. Keep timing and RSS magnitude out of pass criteria.
 | Boundary | Fixture and independent checks |
 | --- | --- |
 | Build and built-in dry run | With benchmarks disabled, build the workload library in the tests-enabled configuration and verify that the executable and the Google Benchmark dependency are absent. With benchmarks enabled, list and dry-run the executable without `--input`. Require exactly `frontend/smoke/builtin` in the result JSON, one iteration and no error or skip. The built-in text has 45 bytes, 11 tokens, three commands, one assertion, no definitions, an 18-byte largest command, and one Bool leaf. |
-| Loaded dry run and CLI | Dry-run a temporary SMT-LIB file at a path containing spaces. Require the six `frontend/parse/` cases `text`, `reader_64k`, `reader_4k`, `reader_irregular`, `phases`, and `teardown` when the filter is absent. Check one iteration and successful result records for each, and require all three phase counters to be present and finite in `phases`. Select a pair with the scenario CSV, then select one through a Google Benchmark filter. Reject missing option values, empty, duplicate, or unknown scenario names, and invalid `--inspect` combinations with nonzero exit and a usage diagnostic. |
-| Inspect JSON | Run `--inspect` on each fixture below. Require one escaped JSON object on stdout, `schema_version` 1, `ok`, the exact declared logic, an empty diagnostic message and null code/span. Verify exact syntax counts, committed query counts, and the four graph fields. Compare each of the seven storage fields with `GetStorageStats()` on the corresponding live workload manager. Require live node and edge counts to cover the reachable graph. Exercise a large exact literal to check that `numeric_backing_bytes` accounts for its backing storage. Verify the typed invariants through the workload API alongside JSON counts. |
+| Loaded dry run and CLI | Dry-run a temporary SMT-LIB file at a path containing spaces. Require the six `frontend/parse/` cases `text`, `reader_64k`, `reader_4k`, `reader_irregular`, `phases`, and `teardown` when the filter is absent. Check one iteration and successful result records for each. Require finite `read_command_ns` and `teardown_ns` counters in `phases`. Select a pair with the scenario CSV, then select one through a Google Benchmark filter. Reject missing option values, empty, duplicate, or unknown scenario names, and invalid `--inspect` combinations with nonzero exit and a usage diagnostic. |
+| Inspect JSON | Run `--inspect` on each fixture below. Require one escaped JSON object on stdout, `schema_version` 2, `ok`, the exact declared logic, an empty diagnostic message and null code/span. Verify the full input byte count, committed-prefix token and command counts, commit offset, query counts, and the four graph fields. Require `read_command_ns` and `teardown_ns`. Compare each of the seven storage fields with `GetStorageStats()` on the corresponding live workload manager. Require live node and edge counts to cover the reachable graph. Check that wide literal limbs contribute to `node_bytes` and that a wide builtin index contributes to `numeric_backing_bytes`. Verify the typed invariants through the workload API alongside JSON counts. |
+| Commutative canonicalization | Use a query containing both orders of integer addition and Boolean xor. Check that the default text and reader parses preserve distinct nodes, while enabling canonicalization shares each pair and reduces reachable and live counts by two nodes and four edges. Inspect with text and every reader in both modes. Exercise the executable flag for inspection and timed parsing, and verify the runner forwards it to both child types and records the enabled setting. Both modes emit inspection schema 2. Default runs omit the flag. |
 | Graph order and repeated slots | Inspect `(set-logic QF_SAT)`, `(declare-const a Bool)`, `(assert (not a))`, `(assert (and (not a) (not a)))`, and `(check-sat)`. The first root reaches the shared `not` before the longer path through the second root. Expect two root occurrences and `(nodes, edges, depth, max_fanout) = (3, 3, 3, 2)`. A control with only `set-logic` and `check-sat` has zero roots and all four graph fields zero. |
 | Reader split equivalence | Build three byte fixtures with controlled offsets. Put a UTF-8 lead byte at offset 4,095 in a comment or quoted string, put `\r` at offset 65,535 followed by `\n`, and put a quoted `set-info` value longer than 8 KiB across more than one refill with a doubled quote and `;` inside it. Use a separate offset variant whose UTF-8 or CRLF pair straddles the irregular boundary after bytes `1 + 7 + 31`. Independently check offsets before parsing. Run text and all three readers, with one valid assertion and `check-sat` per fixture. Require equal committed metadata, typed assertion and source spans, all syntax/query/graph counts other than calls, and `reader_calls = 0` for text. With EOF consumed, fixed modes give the ceiling of bytes divided by chunk size plus one. Enumerate the irregular schedule to derive its callback count. A companion malformed UTF-8 or unfinished quoted token has the same code and source span for all adapters. |
-| Structured failures | Use a missing file (`input_io`), an unclosed assertion (`syntax`, `kSyntax`), a well-formed `(push 1)` (`unsupported`, `kUnsupported`), EOF without a check (`invalid_input`), and a second `check-sat` (`invalid_input`, `kInvalidState`). Enable `:produce-models`, check, and request a model for a `model_dependent` result. Verify nonzero inspect exit, exact failure class, message and applicable span, syntax versus successful Apply counts, and absence of a solver reply. Include a diagnostic with embedded quotes and controls passed to `InspectToJson` to check exact round-trip of its string. A positive `exit` control stops at its closing delimiter even with malformed bytes after it. Dry-run a failing input and require the benchmark error record even when the benchmark framework returns zero. |
-| `:named` rollback | Apply `(set-logic QF_LIA)`, `(assert (! true :named good))`, `(assert (and (! true :named first) (! false :named second) 9))`, and `(check-sat)` on separate LF-terminated lines. Expect `invalid_input`, `kInvalidInput`, and `Incompatible operand or result sort` at `9` (offsets `[108, 109)`, line 3, columns `[60, 61)`). Inspect reports three complete commands, two successful applies, one assertion, one annotation and one named term in the committed prefix, and zero checks. Through `ParsedQuery::session`, verify the sole name and annotation are `good`. In a direct test, append a valid command reusing `first` and `second` before the check and continue the session after the failed Apply. Both names can then commit, proving that the original failure left them available. |
+| Structured failures | Use a missing file (`input_io`), an unclosed assertion (`syntax`, `kSyntax`), a well-formed `(push 1)` (`unsupported`, `kUnsupported`), EOF without a check (`invalid_input`), and a second `check-sat` (`invalid_input`, `kInvalidState`). Enable `:produce-models`, check, and request a model for a `model_dependent` result. Verify nonzero inspect exit, exact failure class, message and applicable span, committed command count and committed-end offset, and absence of a solver reply. Include a diagnostic with embedded quotes and controls passed to `InspectToJson` to check exact round-trip of its string. A positive `exit` control stops at its closing delimiter even with malformed bytes after it. Dry-run a failing input and require the benchmark error record even when the benchmark framework returns zero. |
+| `:named` rollback | Apply `(set-logic QF_LIA)`, `(assert (! true :named good))`, `(assert (and (! true :named first) (! false :named second) 9))`, and `(check-sat)` on separate LF-terminated lines. Expect `invalid_input`, `kInvalidInput`, and `Incompatible operand or result sort` at `9` (offsets `[108, 109)`, line 3, columns `[60, 61)`). Inspect reports two committed commands, the end offset of the second command, one assertion, one annotation and one named term in the committed prefix, and zero checks. Through `ParsedQuery::session`, verify the sole name and annotation are `good`. In a direct test, append a valid command reusing `first` and `second` before the check and continue the session after the failed `ReadCommand`. Both names can then commit, proving that the original failure left them available. |
 | RSS lifecycle | For a deterministic memory sample with 2,048 input bytes, feed baseline 100, peak 150, retained 130, and post-teardown 120 KiB. Require transient 20 KiB, `Peak/Input = 75`, and `Retained/Input = 65`. Check a missing or malformed proc value, zero-byte input, and a retained sample above the kernel's reported high-water mark. Unavailable dependent values serialize as null, and a negative difference clamps to zero. On Linux, run the real sampling path and require positive values for available fields, consistent derived ratios, and a released session and query after teardown. Allow allocator retention and variation between OS sources. |
 | Deterministic generation | Run `frontend_generate.py` twice with the same seed and `smoke` into different directories. Require byte-identical manifests, the same ordered IDs and paths, and files that match the recorded byte sizes and independently computed SHA-256. Require every matrix label and shape. Inspect each case for one check, the declared logic and its documented query structure. Check representative typed operations by family. Compare the skewed and balanced pair for equal leaf and operation counts and distinct depths, and the command-partition pair for different command counts and the expected extra conjunction node. Check that trivia padding preserves typed structure and moves the intended reader split. |
 | Corpus staging and provenance | Stage two selected regular files from a temporary source in deliberately nonalphabetic order, with comments and blank lines in the selection. Require the original selection bytes, the same ordered relative source paths and content under `inputs/`, the snapshot/source evidence and independently checked selection and input hashes. For indexed selection, include a repeated path, an out-of-range file, and a valid unindexed file. Require deterministic selection within the requested count and size bounds per logic. Verify source bytes, names, timestamps and modes are preserved under the protected-source policy. Exercise absolute paths, traversal, duplicates in a selection file, symlinks in an intermediate directory and at a leaf, a nonregular file, missing selections, and a destination resolving into a protected-root stand-in. Simulate a denied or ineffective metadata-safe open and require an unavailable diagnostic with no unsafe retry. Require no published manifest on any staging failure. |
@@ -206,8 +385,14 @@ scheduler tests. Keep timing and RSS magnitude out of pass criteria.
 
 Each fixture uses the literal lines shown, one LF after every line. In the
 table, the syntax tuple is `(bytes, tokens, commands, max_command_bytes)`.
-Every fixture has one applied check, every command applies successfully, and
-text reports zero reader callbacks. Query counts give `(assertions,
+In schema 2, `bytes` covers the full input, `commands` counts successful
+descriptors, and `committed_end_offset` ends at the last committed command's
+closing delimiter. Tokens and maximum command length cover the committed
+prefix. These fields replace schema 1's separate `applied_commands` and
+`syntax_end_offset`. Every fixture commits all commands and has one check.
+Its `committed_end_offset` is `bytes - 1` because the final LF follows the
+closing delimiter. The text adapter reports zero reader callbacks.
+Query counts give `(assertions,
 definitions, user_functions, datatype_groups, named_terms, annotations,
 roots)`. `user_sorts` and `metadata` are zero in all six. The graph tuple is
 `(nodes, edges, depth, max_fanout)`.

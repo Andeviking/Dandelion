@@ -278,6 +278,35 @@ class OperatorTest : public NodeTest,
   }
 };
 
+TEST_F(NodeTest, ConstantFpConstructionAndConversionsRemainOperations) {
+  const auto bv1 = Bv(1);
+  const auto bv8 = Bv(8);
+  const auto bv23 = Bv(23);
+  const auto bv32 = Bv(32);
+  const auto fp = Fp(8, 24);
+  const auto sign = Take(manager_.MakeBvWordValue(bv1.Borrow(), 0));
+  const auto exp = Take(manager_.MakeBvWordValue(bv8.Borrow(), 127));
+  const auto frac = Take(manager_.MakeBvWordValue(bv23.Borrow(), 0));
+  const auto packed = Take(manager_.MakeBvWordValue(bv32.Borrow(), 0x3f800000));
+  const auto one = FpBits(Format(8, 24), IntegerView(0x3f800000));
+  const auto literal = Take(manager_.MakeFpValue(fp.Borrow(), one.Borrow()));
+  const auto rm = Take(manager_.MakeRoundingMode(RoundingMode::kRne));
+  const auto rational = Take(Rational::Make(IntegerView(1), IntegerView(1)));
+  const std::array format{Integer(8), Integer(24)};
+  const auto construct =
+      Op(Kind::kFpConstruct, {sign.Borrow(), exp.Borrow(), frac.Borrow()});
+  const auto from_bits = Op(Kind::kFpFromBits, {packed.Borrow()}, format);
+  const auto from_rational =
+      Op(Kind::kFpFromRational, {rm.Borrow()}, format, {}, rational.Borrow());
+  for (const auto* node : {&construct, &from_bits, &from_rational}) {
+    EXPECT_EQ(node->GetSort(), fp);
+    EXPECT_NE(*node, literal);
+    EXPECT_FALSE(node->Borrow().GetValue());
+    EXPECT_EQ(node->Borrow().GetRationalParameter().has_value(),
+              node == &from_rational);
+  }
+}
+
 TEST_P(OperatorTest, ExactStructureIdentityAndForcedCollision) {
   Prepare(true);
   const auto op = Operator();

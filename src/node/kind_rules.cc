@@ -1,16 +1,10 @@
 module dandelion.node;
 import :internal;
+import dandelion.util.numeric;
 import std;
 
 namespace dandelion::detail {
 namespace {
-SortId BvSortId(ManagerState* state, std::uint64_t width) {
-  if (width > std::numeric_limits<std::uint32_t>::max())
-    Fail(ErrorCode::kResourceLimit, ResourceKind::kSize);
-  return InternSort(
-      state,
-      {SortKind::kBitVector, static_cast<std::uint32_t>(width), 0, 0, {}});
-}
 struct BuiltinShape {
   // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
   std::uint64_t arity;
@@ -146,7 +140,9 @@ BuiltinShape Shape(Kind kind) {
   Fail(ErrorCode::kInvalidKind);
 }
 
-std::uint32_t PositiveIndexWidth(const QueryKey& key, std::size_t index = 0,
+template <class Child>
+std::uint32_t PositiveIndexWidth(const QueryKey<Child>& key,
+                                 std::size_t index = 0,
                                  std::uint32_t minimum = 1) {
   if (key.tag == PayloadTag::kIndexWide)
     Fail(ErrorCode::kResourceLimit, ResourceKind::kSize);
@@ -156,13 +152,14 @@ std::uint32_t PositiveIndexWidth(const QueryKey& key, std::size_t index = 0,
 }
 }  // namespace
 
-SortId InferBuiltinSort(ManagerState* state, const QueryKey& key) {
+template <class Child>
+SortId InferBuiltinSort(ManagerState* state, const QueryKey<Child>& key) {
 #ifdef DANDELION_NODE_TESTING
   ++state->type_evaluations;
 #endif
   const auto children = key.children;
   const auto id = [&](std::size_t index) {
-    return CheckNode(state, children[index], index)->sort_id;
+    return CheckNode(state, Access::Data(children[index]), index)->sort_id;
   };
   const auto sort = [&](std::size_t index) -> const SortRecord& {
     return SortAt(state, id(index));
@@ -405,8 +402,11 @@ void CheckPlainBuiltinShape(ManagerState* state, Kind kind,
           ErrorCode::kInvalidParameter);
 }
 
-QueryKey BuiltinKey(ManagerState* state, BuiltinOpView op,
-                    std::span<const NodeView> children) {
+namespace {
+template <class Child, class IndexAt>
+QueryKey<Child> MakeBuiltinKey(ManagerState* state, BuiltinOpView op,
+                               std::span<Child> children,
+                               std::size_t supplied_indices, IndexAt index_at) {
   Require(op.kind >= Kind::kNot && op.kind <= Kind::kArrayConst,
           ErrorCode::kInvalidKind);
   const auto tag = CheckBuiltinShape(state, op.kind, children.size());
@@ -415,17 +415,17 @@ QueryKey BuiltinKey(ManagerState* state, BuiltinOpView op,
       : (tag == PayloadTag::kIndex2 || tag == PayloadTag::kRationalConversion)
           ? 2
           : 0;
-  Require(op.indices.size() == index_count &&
+  Require(supplied_indices == index_count &&
               op.qualifier.has_value() == (op.kind == Kind::kArrayConst) &&
               op.rational.has_value() == (op.kind == Kind::kFpFromRational),
           ErrorCode::kInvalidParameter);
-  QueryKey key{op.kind, 0, children, tag};
+  QueryKey<Child> key{op.kind, 0, children, tag};
   if (op.qualifier) {
     CheckView(state, *op.qualifier);
     key.input_sort = op.qualifier->GetId();
   }
   for (std::size_t i = 0; i < index_count; ++i) {
-    const auto value = op.indices[i].Borrow();
+    const auto value = index_at(i);
     if (const auto word = value.TryUint32()) {
       key.indices[i] = *word;
       continue;
@@ -441,6 +441,45 @@ QueryKey BuiltinKey(ManagerState* state, BuiltinOpView op,
     key.integer = value;
   }
   key.rational = op.rational;
+  if (key.rational) {
+    const auto numerator = key.rational->Numerator();
+    if (!numerator.TryInt64() || !key.rational->Denominator().TryUint64()) {
+      key.tag = numerator.Sign() < 0 ? PayloadTag::kRationalWideNegative
+                                     : PayloadTag::kRationalWidePositive;
+    }
+  }
   return key;
 }
+}  // namespace
+
+template <class Child>
+QueryKey<Child> BuiltinKey(ManagerState* state, BuiltinOpView op,
+                           std::span<Child> children) {
+  return MakeBuiltinKey(state, op, children, op.indices.size(),
+                        [&](std::size_t i) { return op.indices[i].Borrow(); });
+}
+template <class Child>
+QueryKey<Child> WordIndexedBuiltinKey(ManagerState* state, Kind kind,
+                                      std::span<const std::uint64_t> indices,
+                                      std::span<Child> children) {
+  return MakeBuiltinKey(
+      state, {kind, {}, {}, {}}, children, indices.size(),
+      [&](std::size_t i) { return IntegerView::FromUnsigned(indices[i]); });
+}
+
+template SortId InferBuiltinSort(ManagerState*, const QueryKey<>&);
+template SortId InferBuiltinSort(ManagerState*, const QueryKey<Node>&);
+template SortId InferBuiltinSort(ManagerState*, const QueryKey<const Node>&);
+template QueryKey<const Node> BuiltinKey(ManagerState*, BuiltinOpView,
+                                         std::span<const Node>);
+template QueryKey<> BuiltinKey(ManagerState*, BuiltinOpView,
+                               std::span<const NodeView>);
+template QueryKey<Node> BuiltinKey(ManagerState*, BuiltinOpView,
+                                   std::span<Node>);
+template QueryKey<> WordIndexedBuiltinKey(ManagerState*, Kind,
+                                          std::span<const std::uint64_t>,
+                                          std::span<const NodeView>);
+template QueryKey<Node> WordIndexedBuiltinKey(ManagerState*, Kind,
+                                              std::span<const std::uint64_t>,
+                                              std::span<Node>);
 }  // namespace dandelion::detail

@@ -1,6 +1,7 @@
 export module dandelion.node_workload;
 import std;
 import dandelion.node;
+import dandelion.util.numeric;
 
 namespace dandelion::node_bench {
 
@@ -60,8 +61,8 @@ class Workload {
   std::vector<std::size_t> metadata_ends_;
   std::vector<Instruction> instructions_;
   std::vector<std::size_t> operands_;
-  std::vector<Integer> payloads_;
-  std::vector<Rational> rationals_;
+  std::vector<numeric::Integer> payloads_;
+  std::vector<numeric::Rational> rationals_;
   std::vector<std::size_t> roots_;
   std::variant<std::vector<std::uint32_t>, std::vector<std::size_t>> lookups_;
 };
@@ -115,5 +116,11 @@ class WalkStats {
 };
 
 WalkStats Walk(std::span<const Node> roots, bool describe_shape = true);
+
+// Typed fixtures for the parser-independent folding benchmark.
+std::vector<Node> BuildFoldingDag(NodeManager& manager);
+// Only the fixture's operator set is evaluated. Other nodes are rebuilt
+// with their rewritten children, including operations with unresolved results.
+std::vector<Node> FoldDag(NodeManager& manager, std::span<const Node> roots);
 
 }  // namespace dandelion::node_bench

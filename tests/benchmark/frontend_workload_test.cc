@@ -13,6 +13,7 @@
 import std;
 import dandelion.frontend;
 import dandelion.frontend_workload;
+import dandelion.util.numeric;
 
 #ifdef __linux__
 extern char** environ;
@@ -20,6 +21,56 @@ extern char** environ;
 
 namespace dandelion::frontend_bench {
 namespace {
+
+TEST(FrontendWorkloadTest, CanonicalizationIsOptInForAllAdapters) {
+  constexpr std::string_view input = R"(
+(set-logic ALL)
+(declare-const a Int)
+(declare-const b Int)
+(declare-const p Bool)
+(declare-const q Bool)
+(assert (= (+ a b) (+ b a)))
+(assert (xor p q))
+(assert (xor q p))
+(check-sat)
+)";
+  const auto check = [](const ParsedQuery& parsed, bool canonicalize) {
+    ASSERT_TRUE(parsed.query) << parsed.diagnostic_message;
+    const auto assertions = parsed.query->GetAssertions();
+    ASSERT_EQ(assertions.size(), 3);
+    const auto equality = assertions[0].Borrow();
+    ASSERT_EQ(equality.GetKind(), Kind::kEqual);
+    ASSERT_EQ(equality.GetChildren().size(), 2);
+    EXPECT_EQ(equality.GetChildren()[0] == equality.GetChildren()[1],
+              canonicalize);
+    EXPECT_EQ(assertions[1] == assertions[2], canonicalize);
+  };
+  check(ParseFromText(input), false);
+  check(ParseFromText(input, false, true), true);
+  for (const auto mode : {ReaderMode::kMemory64K, ReaderMode::kMemory4K,
+                          ReaderMode::kMemoryIrregular}) {
+    SCOPED_TRACE(static_cast<int>(mode));
+    check(ParseFromReader(input, mode), false);
+    check(ParseFromReader(input, mode, false, true), true);
+  }
+  for (const auto mode :
+       {std::optional<ReaderMode>{}, std::optional{ReaderMode::kMemory64K},
+        std::optional{ReaderMode::kMemory4K},
+        std::optional{ReaderMode::kMemoryIrregular}}) {
+    const auto original = Inspect(input, mode);
+    const auto canonical = Inspect(input, mode, true);
+    ASSERT_EQ(original.status, "ok") << original.diagnostic_message;
+    ASSERT_EQ(canonical.status, "ok") << canonical.diagnostic_message;
+    EXPECT_EQ(original.nodes, 9);
+    EXPECT_EQ(original.edges, 10);
+    EXPECT_EQ(canonical.nodes, 7);
+    EXPECT_EQ(canonical.edges, 6);
+    EXPECT_EQ(original.live_nodes, 9);
+    EXPECT_EQ(original.live_edges, 10);
+    EXPECT_EQ(canonical.live_nodes, 7);
+    EXPECT_EQ(canonical.live_edges, 6);
+  }
+}
 
 TEST(FrontendWorkloadTest, InspectReportsExactDiamondDagCounts) {
   constexpr std::string_view input =
@@ -59,10 +110,9 @@ TEST(FrontendWorkloadTest, PreservesDefineFunCallDagWithoutExpansion) {
   ASSERT_TRUE(parsed.query);
   EXPECT_EQ(parsed.stats.definitions, 2);
   const auto& query = *parsed.query;
-  const auto definitions = query.GetDefinitions();
-  ASSERT_EQ(definitions.size(), 2);
-  EXPECT_EQ(definitions[0].body.Borrow().GetKind(), Kind::kNot);
-  const auto body = definitions[1].body.Borrow();
+  ASSERT_EQ(query.GetDefinitionCount(), 2);
+  EXPECT_EQ(query.GetDefinition(0).body.Borrow().GetKind(), Kind::kNot);
+  const auto body = query.GetDefinition(1).body.Borrow();
   ASSERT_EQ(body.GetKind(), Kind::kAnd);
   const auto calls = body.GetChildren();
   ASSERT_EQ(calls.size(), 2);
@@ -70,19 +120,20 @@ TEST(FrontendWorkloadTest, PreservesDefineFunCallDagWithoutExpansion) {
   ASSERT_EQ(calls[0].GetKind(), Kind::kApply);
   ASSERT_TRUE(calls[0].GetDeclaration());
   EXPECT_EQ(query.FindDefinition(calls[0].GetDeclaration()->GetDeclaration()),
-            &definitions[0]);
+            &query.GetDefinition(0));
   ASSERT_EQ(calls[0].GetChildren().size(), 1);
   const auto argument = calls[0].GetChildren()[0].GetDeclaration();
   ASSERT_TRUE(argument);
-  ASSERT_EQ(definitions[1].formals.size(), 1);
-  EXPECT_EQ(argument->GetDeclaration(), definitions[1].formals[0].Borrow());
+  ASSERT_EQ(query.GetDefinition(1).formals.size(), 1);
+  EXPECT_EQ(argument->GetDeclaration(),
+            query.GetDefinition(1).formals[0].Borrow());
 
   ASSERT_EQ(query.GetAssertions().size(), 1);
-  const auto assertion = query.GetAssertions().front().term.Borrow();
+  const auto assertion = query.GetAssertions().front().Borrow();
   ASSERT_EQ(assertion.GetKind(), Kind::kApply);
   ASSERT_TRUE(assertion.GetDeclaration());
   EXPECT_EQ(query.FindDefinition(assertion.GetDeclaration()->GetDeclaration()),
-            &definitions[1]);
+            &query.GetDefinition(1));
 
   const auto report = Inspect(input);
   ASSERT_EQ(report.status, "ok") << report.diagnostic_message;
@@ -103,18 +154,19 @@ TEST(FrontendWorkloadTest, HandlesParametricDatatypeMatchAndNamedTerms) {
 (assert picked)
 (check-sat)
 )";
-  const auto parsed = ParseFromText(input);
+  const auto parsed = ParseFromText(input, false, false, true);
   ASSERT_TRUE(parsed.query);
   const auto& query = *parsed.query;
   ASSERT_EQ(query.GetDatatypeGroups().size(), 1);
-  ASSERT_EQ(query.GetNamedTerms().size(), 1);
-  ASSERT_EQ(query.GetAnnotations().size(), 1);
+  const auto& records = *parsed.session->GetSourceRecords();
+  ASSERT_EQ(records.named_terms.size(), 1);
+  ASSERT_EQ(records.annotations.size(), 1);
   ASSERT_EQ(query.GetAssertions().size(), 2);
-  const auto& named = query.GetNamedTerms().front();
+  const auto& named = records.named_terms.front();
   EXPECT_EQ(named.name, "picked");
-  EXPECT_EQ(named.term, query.GetAnnotations().front().term);
-  EXPECT_EQ(named.term, query.GetAssertions()[0].term);
-  EXPECT_EQ(named.term, query.GetAssertions()[1].term);
+  EXPECT_EQ(named.term, records.annotations.front().term);
+  EXPECT_EQ(named.term, query.GetAssertions()[0]);
+  EXPECT_EQ(named.term, query.GetAssertions()[1]);
 
   const auto equality = named.term.Borrow();
   ASSERT_EQ(equality.GetKind(), Kind::kEqual);
@@ -160,7 +212,7 @@ TEST(FrontendWorkloadTest, NormalizesFpRationalConversionsAndArrayStores) {
   ASSERT_TRUE(parsed.query);
   const auto assertions = parsed.query->GetAssertions();
   ASSERT_EQ(assertions.size(), 1);
-  const auto equality = assertions.front().term.Borrow();
+  const auto equality = assertions.front().Borrow();
   ASSERT_EQ(equality.GetKind(), Kind::kFpEq);
   ASSERT_EQ(equality.GetChildren().size(), 2);
   const auto select = equality.GetChildren()[0];
@@ -183,7 +235,7 @@ TEST(FrontendWorkloadTest, NormalizesFpRationalConversionsAndArrayStores) {
   ASSERT_EQ(conversion.GetChildren().size(), 1);
   const auto rounding = conversion.GetChildren()[0].GetValue();
   ASSERT_TRUE(rounding);
-  EXPECT_EQ(rounding->GetRoundingMode(), RoundingMode::kRne);
+  EXPECT_EQ(rounding->GetRoundingMode(), numeric::RoundingMode::kRne);
 }
 
 TEST(FrontendWorkloadTest, ReaderChunkModesMatchTextParsingAcrossSplits) {
@@ -199,11 +251,12 @@ TEST(FrontendWorkloadTest, ReaderChunkModesMatchTextParsingAcrossSplits) {
   const auto name = input.substr(name_start);
   input += " Bool)\r\n; ignored )\r\n(assert " + name + ")\r\n(check-sat)\r\n";
 
-  const auto text = ParseFromText(input);
+  const auto text = ParseFromText(input, false, false, true);
   ASSERT_TRUE(text.query);
   ASSERT_EQ(text.query->GetFunctions().size(), 1);
   ASSERT_EQ(text.query->GetAssertions().size(), 1);
-  EXPECT_TRUE(text.query->GetFunctions().front().source_name == name);
+  const auto& records = *text.session->GetSourceRecords();
+  EXPECT_EQ(records.functions.front().source_name, name);
   EXPECT_EQ(text.stats.bytes, input.size());
   EXPECT_EQ(text.stats.commands, 4);
   EXPECT_EQ(text.stats.assertions, 1);
@@ -214,7 +267,7 @@ TEST(FrontendWorkloadTest, ReaderChunkModesMatchTextParsingAcrossSplits) {
   for (const auto mode : {ReaderMode::kMemory64K, ReaderMode::kMemory4K,
                           ReaderMode::kMemoryIrregular}) {
     SCOPED_TRACE(static_cast<int>(mode));
-    const auto reader = ParseFromReader(input, mode, true);
+    const auto reader = ParseFromReader(input, mode, true, false, true);
     ASSERT_TRUE(reader.query);
     EXPECT_EQ(reader.stats.bytes, text.stats.bytes);
     EXPECT_EQ(reader.stats.commands, text.stats.commands);
@@ -222,21 +275,80 @@ TEST(FrontendWorkloadTest, ReaderChunkModesMatchTextParsingAcrossSplits) {
     EXPECT_EQ(reader.stats.definitions, text.stats.definitions);
     EXPECT_EQ(reader.stats.max_command_bytes, text.stats.max_command_bytes);
     EXPECT_GT(reader.stats.reader_calls, 1);
-    EXPECT_GT(reader.stats.next_syntax_ns, 0);
-    EXPECT_GT(reader.stats.apply_ns, 0);
+    EXPECT_GT(reader.stats.read_command_ns, 0);
     EXPECT_EQ(reader.query->GetLogic(), text.query->GetLogic());
     ASSERT_EQ(reader.query->GetFunctions().size(), 1);
     ASSERT_EQ(reader.query->GetAssertions().size(), 1);
-    const auto& function = reader.query->GetFunctions().front();
+    const auto& source = *reader.session->GetSourceRecords();
+    const auto& function = source.functions.front();
     EXPECT_TRUE(function.source_name == name);
-    EXPECT_EQ(function.where, text.query->GetFunctions().front().where);
-    const auto& assertion = reader.query->GetAssertions().front();
-    EXPECT_EQ(assertion.where, text.query->GetAssertions().front().where);
+    EXPECT_EQ(function.where, records.functions.front().where);
+    const auto& assertion = source.assertions.front();
+    EXPECT_EQ(assertion.where, records.assertions.front().where);
     const auto term = assertion.term.Borrow();
     ASSERT_EQ(term.GetKind(), Kind::kApply);
     ASSERT_TRUE(term.GetDeclaration());
     EXPECT_EQ(term.GetDeclaration()->GetDeclaration(), function.decl.Borrow());
     EXPECT_TRUE(term.GetChildren().empty());
+  }
+}
+
+TEST(FrontendWorkloadTest, CountsDefinitionCommandsAndCapturedRoots) {
+  SCOPED_TRACE("FE-P1-BENCH and FE-P2-BENCH");
+  constexpr std::string_view input =
+      "(set-info :status unknown)(set-info :status sat)(set-logic QF_LIA)"
+      "(define-fun a () Int 1)(define-const b Int a)(define-fun id ((x Int)) "
+      "Int x)"
+      "(assert (= (id (! b :named n)) n))(check-sat)";
+  const auto timed = ParseFromText(input);
+  ASSERT_TRUE(timed.query);
+  ASSERT_TRUE(timed.session);
+  EXPECT_EQ(timed.session->GetSourceRecords(), nullptr);
+  EXPECT_EQ(timed.stats.commands, 8);
+  EXPECT_EQ(timed.stats.definitions, 3);
+  EXPECT_EQ(timed.query->GetDefinitionCount(), 1);
+  for (const auto mode : {ReaderMode::kMemory64K, ReaderMode::kMemory4K,
+                          ReaderMode::kMemoryIrregular}) {
+    auto reader = ParseFromReader(input, mode, true);
+    ASSERT_TRUE(reader.query);
+    EXPECT_EQ(reader.stats.commands, 8);
+    EXPECT_EQ(reader.stats.committed_end_offset, input.size());
+    EXPECT_EQ(reader.stats.assertions, 1);
+    EXPECT_EQ(reader.stats.definitions, 3);
+    EXPECT_EQ(reader.query->GetDefinitionCount(), 1);
+    const auto read_ns = reader.stats.read_command_ns;
+    reader.Teardown(true);
+    EXPECT_FALSE(reader.query);
+    EXPECT_FALSE(reader.session);
+    EXPECT_EQ(reader.stats.read_command_ns, read_ns);
+  }
+  for (const bool fail : {false, true}) {
+    const auto text =
+        fail ? std::string(input.substr(0, input.find("(check-sat)"))) +
+                   "(assert (= (! 2 :named discarded) unbound))"
+             : std::string(input);
+    const auto inspected = Inspect(text, ReaderMode::kMemoryIrregular);
+    EXPECT_EQ(inspected.status, fail ? "invalid_input" : "ok");
+    EXPECT_EQ(inspected.commands, fail ? 7 : 8);
+    EXPECT_EQ(inspected.committed_end_offset,
+              fail ? input.find("(check-sat)") : input.size());
+    EXPECT_EQ(inspected.assertions, 1);
+    EXPECT_EQ(inspected.checks, fail ? 0 : 1);
+    EXPECT_EQ(inspected.definitions, 3);
+    EXPECT_EQ(inspected.metadata, 2);
+    EXPECT_EQ(inspected.named_terms, 1);
+    EXPECT_EQ(inspected.annotations, 1);
+    EXPECT_EQ(inspected.user_functions, 0);
+    EXPECT_EQ(inspected.user_sorts, 0);
+    EXPECT_EQ(inspected.roots, 6);
+    EXPECT_EQ(inspected.nodes, 4);
+    EXPECT_EQ(inspected.edges, 3);
+    const auto json = InspectToJson(inspected);
+    EXPECT_TRUE(json.contains("\"schema_version\":2,"));
+    EXPECT_TRUE(json.contains("\"read_command_ns\":" +
+                              std::to_string(inspected.read_command_ns) + ","));
+    EXPECT_TRUE(json.contains(
+        "\"teardown_ns\":" + std::to_string(inspected.teardown_ns) + ","));
   }
 }
 

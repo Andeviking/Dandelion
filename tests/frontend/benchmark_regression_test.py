@@ -29,6 +29,15 @@ class ClassifyTest(unittest.TestCase):
             with self.subTest(observed=observed):
                 self.assertEqual(runner.classify(observed), expected)
 
+    def test_probe_summary_counts_committed_exit(self):
+        summary = ("QF_BV commands=4 assertions=1 functions=0 definitions=0 "
+                   "datatype_groups=0\n")
+        expected = runner.probe_summary("QF_BV", (4, 1, 0, 0, 0))
+        self.assertEqual(runner.classify_probe(record(stderr=summary), expected),
+                         "accepted")
+        late_error = record(1, stderr="1:48 Unexpected token in this position\n")
+        self.assertEqual(runner.classify_probe(late_error, expected), "diagnostic")
+
     def test_xor_requires_a_single_result(self):
         cases = (
             (record(stdout=" \tunsat\r\n"), "matches"),

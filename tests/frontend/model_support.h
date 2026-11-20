@@ -63,7 +63,7 @@ inline Outcome<ValueRef> Scalar(ModelOwner& model, Node node) {
 }
 inline Outcome<ValueRef> IntegerScalar(ModelOwner& model, std::int64_t number) {
   auto manager = Require(NodeManager::Attach(model.GetQuery().GetManager()));
-  return Scalar(model, Require(manager.MakeInt(IntegerView(number))));
+  return Scalar(model, Require(manager.MakeInt(numeric::IntegerView(number))));
 }
 inline Node ApplyDecl(NodeManager& nm, DeclView decl,
                       std::initializer_list<NodeView> children = {}) {

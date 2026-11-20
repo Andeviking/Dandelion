@@ -108,32 +108,31 @@ ParsedQuery Parse(frontend::Outcome<frontend::Session> session,
   }
   auto& active = parsed.session.emplace(std::move(*session));
   for (;;) {
-    const auto next = Measure(measure_phases, parsed.stats.next_syntax_ns,
-                              [&] { return active.NextSyntax(); });
+    auto next = Measure(measure_phases, parsed.stats.read_command_ns,
+                        [&] { return active.ReadCommand(); });
     if (!next) {
       RecordDiagnostic(parsed, next.error());
       break;
     }
     if (!*next) break;
 
-    const auto& [kind, where] = **next;
+    auto& command = *next;
+    const auto& [kind, where] = command->header;
     ++parsed.stats.commands;
-    parsed.syntax_end_offset = where.end.offset;
+    parsed.stats.committed_end_offset = where.end.offset;
     parsed.stats.max_command_bytes = std::max(
         parsed.stats.max_command_bytes, where.end.offset - where.begin.offset);
-
-    auto command = Measure(measure_phases, parsed.stats.apply_ns,
-                           [&] { return active.Apply(); });
-    if (!command) {
-      RecordDiagnostic(parsed, command.error());
-      break;
-    }
-    ++parsed.applied_commands;
+    if (kind == frontend::CommandKind::kDefineFun ||
+        kind == frontend::CommandKind::kDefineConst)
+      ++parsed.stats.definitions;
     if (kind == frontend::CommandKind::kCheckSat)
       parsed.query = std::move(command->query);
+    if (kind == frontend::CommandKind::kExit) break;
+    const auto* response =
+        std::get_if<frontend::CommandResponse>(&command->response);
     if (kind == frontend::CommandKind::kGetModel ||
         kind == frontend::CommandKind::kGetValue ||
-        command->needs_unknown_reason) {
+        (response && *response == frontend::CommandResponse::kUnknownReason)) {
       RecordDiagnostic(parsed, {DiagnosticCode::kModelDependent, where,
                                 "Command requires a model or check result"});
       break;
@@ -141,7 +140,6 @@ ParsedQuery Parse(frontend::Outcome<frontend::Session> session,
   }
   const auto& prefix = active.GetPrefix();
   parsed.stats.assertions = prefix.GetAssertions().size();
-  parsed.stats.definitions = prefix.GetDefinitions().size();
   if (parsed.status == "ok" && !parsed.query) {
     parsed.status = "invalid_input";
     parsed.diagnostic_message = "Missing check-sat command";
@@ -230,16 +228,21 @@ void CollectStorageStats(const frontend::QueryContext& query,
 }
 
 void CollectGraphStats(const frontend::QueryContext& query,
+                       const frontend::SourceRecords& records,
                        InspectReport& report) {
   std::vector<Node> roots;
   roots.reserve(report.assertions + report.definitions + report.named_terms +
                 report.annotations);
-  for (const auto& assertion : query.GetAssertions())
-    roots.push_back(assertion.term);
-  for (const auto& definition : query.GetDefinitions())
-    roots.push_back(definition.body);
-  for (const auto& named : query.GetNamedTerms()) roots.push_back(named.term);
-  for (const auto& annotation : query.GetAnnotations())
+  roots.insert(roots.end(), query.GetAssertions().begin(),
+               query.GetAssertions().end());
+  for (const auto& definition : records.definitions) {
+    if (const auto ordinal = definition.definition_ordinal)
+      roots.push_back(query.GetDefinition(*ordinal).body);
+    else
+      roots.push_back(definition.body);
+  }
+  for (const auto& named : records.named_terms) roots.push_back(named.term);
+  for (const auto& annotation : records.annotations)
     roots.push_back(annotation.term);
 
   auto walker = DagWalker::Create(roots);
@@ -417,19 +420,29 @@ std::expected<std::string, std::error_code> LoadFile(
   }
 }
 
-ParsedQuery ParseFromText(std::string_view input, bool measure_phases) {
-  return Parse(frontend::Session::FromText(input), input.size(),
-               measure_phases);
+ParsedQuery ParseFromText(std::string_view input, bool measure_phases,
+                          bool canonicalize_commutative,
+                          bool capture_source_records) {
+  return Parse(frontend::Session::FromText(
+                   input,
+                   frontend::ParseOptions{
+                       .canonicalize_commutative = canonicalize_commutative,
+                       .capture_source_records = capture_source_records}),
+               input.size(), measure_phases);
 }
 
 ParsedQuery ParseFromReader(std::string_view input, ReaderMode mode,
-                            bool measure_phases) {
+                            bool measure_phases, bool canonicalize_commutative,
+                            bool capture_source_records) {
   try {
     const auto reader = std::make_shared<MemoryReader>(input, mode);
     auto session = frontend::Session::FromReader(
         [reader](std::span<char> destination) -> frontend::ReadResult {
           return reader->Read(destination);
-        });
+        },
+        frontend::ParseOptions{
+            .canonicalize_commutative = canonicalize_commutative,
+            .capture_source_records = capture_source_records});
     auto parsed = Parse(std::move(session), input.size(), measure_phases);
     parsed.stats.reader_calls = reader->GetCalls();
     return parsed;
@@ -468,11 +481,13 @@ MemorySnapshot ReadProcessMemory() {
   return memory;
 }
 
-InspectReport Inspect(std::string_view input, std::optional<ReaderMode> mode) {
+InspectReport Inspect(std::string_view input, std::optional<ReaderMode> mode,
+                      bool canonicalize_commutative) {
   InspectReport report;
   report.baseline_rss_kib = ReadProcessMemory().retained_rss_kib;
   auto parsed =
-      mode ? ParseFromReader(input, *mode, true) : ParseFromText(input, true);
+      mode ? ParseFromReader(input, *mode, true, canonicalize_commutative, true)
+           : ParseFromText(input, true, canonicalize_commutative, true);
   const auto retained = ReadProcessMemory();
   report.peak_rss_kib = retained.peak_rss_kib;
   report.retained_rss_kib = retained.retained_rss_kib;
@@ -482,10 +497,9 @@ InspectReport Inspect(std::string_view input, std::optional<ReaderMode> mode) {
   report.diagnostic_message = std::move(parsed.diagnostic_message);
   report.diagnostic_code = parsed.diagnostic_code;
   report.diagnostic_span = parsed.diagnostic_span;
-  report.applied_commands = parsed.applied_commands;
   report.checks = parsed.query ? 1 : 0;
-  report.tokens = CountTokens(
-      input.substr(0, static_cast<std::size_t>(parsed.syntax_end_offset)));
+  report.tokens = CountTokens(input.substr(
+      0, static_cast<std::size_t>(parsed.stats.committed_end_offset)));
   if (parsed.session) {
     const auto& query =
         parsed.query ? *parsed.query : parsed.session->GetPrefix();
@@ -495,10 +509,11 @@ InspectReport Inspect(std::string_view input, std::optional<ReaderMode> mode) {
       report.user_sorts = query.GetUserSorts().size();
       report.user_functions = query.GetFunctions().size();
       report.datatype_groups = query.GetDatatypeGroups().size();
-      report.named_terms = query.GetNamedTerms().size();
-      report.annotations = query.GetAnnotations().size();
-      report.metadata = parsed.session->GetMetadata().size();
-      CollectGraphStats(query, report);
+      const auto& records = *parsed.session->GetSourceRecords();
+      report.named_terms = records.named_terms.size();
+      report.annotations = records.annotations.size();
+      report.metadata = records.metadata.size();
+      CollectGraphStats(query, records, report);
     } catch (const std::exception& error) {
       if (report.status == "ok") {
         report.status = "measurement_error";
@@ -525,7 +540,7 @@ std::string InspectToJson(const InspectReport& report) {
   std::ostringstream json;
   json.imbue(std::locale::classic());
   json << std::setprecision(std::numeric_limits<double>::max_digits10)
-       << "{\"schema_version\":1";
+       << "{\"schema_version\":2";
   const auto field = [&](std::string_view key, const auto& value) {
     json << ",\"" << key << "\":";
     WriteJsonValue(json, value);
@@ -538,13 +553,12 @@ std::string InspectToJson(const InspectReport& report) {
   field("bytes", report.bytes);
   field("tokens", report.tokens);
   field("commands", report.commands);
-  field("applied_commands", report.applied_commands);
+  field("committed_end_offset", report.committed_end_offset);
   field("assertions", report.assertions);
   field("definitions", report.definitions);
   field("max_command_bytes", report.max_command_bytes);
   field("reader_calls", report.reader_calls);
-  field("next_syntax_ns", report.next_syntax_ns);
-  field("apply_ns", report.apply_ns);
+  field("read_command_ns", report.read_command_ns);
   field("teardown_ns", report.teardown_ns);
   field("checks", report.checks);
   field("user_sorts", report.user_sorts);

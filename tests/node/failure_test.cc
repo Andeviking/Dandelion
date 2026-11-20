@@ -322,6 +322,9 @@ TEST_F(Failure, EveryFactoryCheckpointFromAnIdenticalFreshState) {
       const std::array fields = {DatatypeFieldSpec{"head", p},
                                  DatatypeFieldSpec{"tail", recursive}};
       Take(builder.AddConstructor(0, "cons", fields));
+      const auto bv_value = ExactBv(8, one.Borrow());
+      const auto fp_value = FpBits(Format(8, 24), one.Borrow());
+      const auto fp_nan = SpecialFp(Format(8, 24), FpSpecial::kNaN);
       const auto large = Number("18446744073709551617");
       const auto rational = Take(Rational::Make(one.Borrow(), two.Borrow()));
       std::optional<DatatypeGroup> committed;
@@ -351,13 +354,13 @@ TEST_F(Failure, EveryFactoryCheckpointFromAnIdenticalFreshState) {
           result = Discard(local.MakeInt(large.Borrow()));
           break;
         case 2:
-          result = Discard(local.MakeBvValue(v.Borrow(), one.Borrow()));
+          result = Discard(local.MakeBvValue(v.Borrow(), bv_value.Borrow()));
           break;
         case 3:
-          result = Discard(local.MakeFpBits(fp.Borrow(), one.Borrow()));
+          result = Discard(local.MakeFpValue(fp.Borrow(), fp_value.Borrow()));
           break;
         case 4:
-          result = Discard(local.MakeFpSpecial(fp.Borrow(), FpSpecial::kNaN));
+          result = Discard(local.MakeFpValue(fp.Borrow(), fp_nan.Borrow()));
           break;
         case 5:
           result = Discard(local.MakeRoundingMode(RoundingMode::kRtz));
@@ -614,66 +617,10 @@ TEST_F(Failure, WideContractsAndDiagnosticIndices) {
   EXPECT_EQ(NodeError{}.parameter_index, UINT64_MAX);
 }
 
-TEST_F(Failure, NumericPayloadCopiesPublishOnlyOnSuccess) {
-  const auto wide = Number("18446744073709551617");
-  const auto denominator = Number("18446744073709551616");
-  const auto fraction =
-      Take(Rational::Make(wide.Borrow(), denominator.Borrow()));
-  const auto bv = Bv(65);
-  const auto fp = Fp(2, 64);
-  const auto bv_operand = Const(bv.Borrow());
-  const auto rm = Take(manager_.MakeRoundingMode(RoundingMode::kRne));
-  const std::array index{wide};
-  const std::array format{Integer(2), Integer(64)};
-  const auto check = [&](std::size_t expected_failures, const auto& make) {
-    const auto before = NodeTestPeer::GetStats(manager_);
-    const auto storage = Take(manager_.GetStorageStats());
-    const auto state_refs = NodeTestPeer::StateRefCount(manager_);
-    const auto bv_refs = NodeTestPeer::RefCount(bv_operand);
-    const auto rm_refs = NodeTestPeer::RefCount(rm);
-    for (std::size_t checkpoint = 0; checkpoint <= expected_failures;
-         ++checkpoint) {
-      SCOPED_TRACE(checkpoint);
-      NumericTestPeer::FailAllocationAfter(checkpoint);
-      const auto result = make();
-      NumericTestPeer::ClearFailures();
-      if (checkpoint == expected_failures) {
-        ASSERT_TRUE(result);
-        EXPECT_EQ(result->GetId(), before.next_node_id);
-        EXPECT_EQ(Take(make()), *result);
-      } else {
-        Resource(result, ResourceKind::kCppAllocation);
-        const auto after = NodeTestPeer::GetStats(manager_);
-        EXPECT_EQ(after.next_node_id, before.next_node_id);
-        EXPECT_EQ(after.live_nodes, before.live_nodes);
-        EXPECT_EQ(Take(manager_.GetStorageStats()).numeric_backing_bytes,
-                  storage.numeric_backing_bytes);
-        EXPECT_EQ(NodeTestPeer::StateRefCount(manager_), state_refs);
-        EXPECT_EQ(NodeTestPeer::RefCount(bv_operand), bv_refs);
-        EXPECT_EQ(NodeTestPeer::RefCount(rm), rm_refs);
-      }
-    }
-  };
-  check(1, [&] { return manager_.MakeInt(wide.Borrow()); });
-  check(1, [&] { return manager_.MakeBvValue(bv.Borrow(), wide.Borrow()); });
-  check(1, [&] { return manager_.MakeFpBits(fp.Borrow(), wide.Borrow()); });
-  check(1, [&] {
-    return manager_.MakeBuiltin({Kind::kBvRotateLeft, index, {}, {}},
-                                std::array{bv_operand.Borrow()});
-  });
-  check(2, [&] {
-    return manager_.MakeBuiltin(
-        {Kind::kFpFromRational, format, {}, fraction.Borrow()},
-        std::array{rm.Borrow()});
-  });
-}
-
 TEST_F(Failure, LateExternalChildRetainRollsBackEveryEdge) {
   const auto first = Take(manager_.MakeBool(false));
   const auto last = Take(manager_.MakeBool(true));
-  std::vector<NodeView> children(65536, first.Borrow());
-  children[32768] = last.Borrow();
-  children.back() = last.Borrow();
+  const auto children = ExternalRetainChildren(first.Borrow(), last.Borrow());
   const BuiltinOpView op{Kind::kAnd, {}, {}, {}};
   const auto before = NodeTestPeer::GetStats(manager_);
   const auto refs = NodeTestPeer::StateRefCount(manager_);
@@ -757,177 +704,6 @@ TEST_F(Failure, DatatypeCommitExhaustsEachDestinationIndependently) {
     }
     check_instance();
   }
-}
-
-TEST(NumericCapacity, GmpImportsPowersShiftsAndProductsCheckLimbCapacity) {
-  const auto wide = Number("18446744073709551617");
-  const auto other = Number("18446744073709551619");
-  const auto dividend = Take(Rational::Make(wide.Borrow(), IntegerView(1)));
-  const auto divisor = Take(Rational::Make(IntegerView(1), other.Borrow()));
-  const auto cancelling = Take(Rational::Make(wide.Borrow(), other.Borrow()));
-  const auto one = Take(Rational::Make(IntegerView(1), IntegerView(1)));
-  {
-    struct ResetCapacity {
-      ~ResetCapacity() {
-        NumericTestPeer::SetLimbCapacity(std::numeric_limits<int>::max());
-      }
-    };
-    const ResetCapacity reset;
-    NumericTestPeer::SetLimbCapacity(2);
-    EXPECT_EQ(Take(Integer::ParseDecimal("00042")).ToDecimal(), "42");
-    Resource(Integer::ParseDecimal("18446744073709551617"),
-             ResourceKind::kSize);
-    Resource(Integer::ParseRadix("10000000000000001", 16), ResourceKind::kSize);
-    EXPECT_EQ(Take(Integer::ParseRadix("00a", 16)).ToDecimal(), "10");
-    Resource(RoundRationalToFp(8, 65, RoundingMode::kRne, one.Borrow()),
-             ResourceKind::kSize);
-    const auto eighth = Take(Rational::ParseDecimalFraction("0.125"));
-    EXPECT_EQ(eighth.Borrow().Numerator().ToDecimal(), "1");
-    EXPECT_EQ(eighth.Borrow().Denominator().ToDecimal(), "8");
-    const auto cancelled =
-        Take(Rational::Divide(cancelling.Borrow(), cancelling.Borrow()));
-    EXPECT_EQ(cancelled.Borrow().Numerator().ToDecimal(), "1");
-    EXPECT_EQ(cancelled.Borrow().Denominator().ToDecimal(), "1");
-    NumericTestPeer::SetLimbCapacity(3);
-    EXPECT_EQ(Take(Integer::ParseDecimal("18446744073709551617")).ToDecimal(),
-              "18446744073709551617");
-    Resource(Rational::Divide(dividend.Borrow(), divisor.Borrow()),
-             ResourceKind::kSize);
-    Resource(Rational::Divide(divisor.Borrow(), dividend.Borrow()),
-             ResourceKind::kSize);
-    NumericTestPeer::SetLimbCapacity(4);
-    const std::string fraction = "0." + std::string(79, '0') + "1";
-    Resource(Rational::ParseDecimalFraction(fraction), ResourceKind::kSize);
-  }
-  EXPECT_EQ(dividend.Borrow().Numerator().ToDecimal(), "18446744073709551617");
-  EXPECT_EQ(View(Take(Rational::Divide(dividend.Borrow(), divisor.Borrow())))
-                .Numerator()
-                .BitLength(),
-            129);
-}
-
-class NumericCapacityBoundary : public ::testing::Test {
- protected:
-  void TearDown() override {
-    NumericTestPeer::SetLimbCapacity(std::numeric_limits<int>::max());
-  }
-};
-
-TEST_F(NumericCapacityBoundary, UnsignedRadixWordsRequireLimbCapacity) {
-  const std::string binary = "1" + std::string(63, '0');
-  NumericTestPeer::SetLimbCapacity(0);
-  EXPECT_EQ(Take(Integer::ParseRadix("7fffffffffffffff", 16)).ToDecimal(),
-            "9223372036854775807");
-  Resource(Integer::ParseRadix("8000000000000000", 16), ResourceKind::kSize);
-  Resource(Integer::ParseRadix(binary, 2), ResourceKind::kSize);
-
-  NumericTestPeer::SetLimbCapacity(1);
-  EXPECT_EQ(Take(Integer::ParseRadix("8000000000000000", 16)).ToDecimal(),
-            "9223372036854775808");
-  EXPECT_EQ(Take(Integer::ParseRadix(binary, 2)).ToDecimal(),
-            "9223372036854775808");
-  EXPECT_EQ(Take(Integer::ParseRadix("ffffffffffffffff", 16)).ToDecimal(),
-            "18446744073709551615");
-}
-
-TEST_F(NumericCapacityBoundary, WideRadixImportsMatchGmpLimbSizing) {
-  const std::string binary = "1" + std::string(127, '0');
-  const std::string hex = "8" + std::string(31, '0');
-  NumericTestPeer::SetLimbCapacity(2);
-  Resource(Integer::ParseRadix(binary, 2), ResourceKind::kSize);
-  Resource(Integer::ParseRadix(hex, 16), ResourceKind::kSize);
-
-  NumericTestPeer::SetLimbCapacity(3);
-  EXPECT_EQ(Take(Integer::ParseRadix(binary, 2)).ToDecimal(),
-            "170141183460469231731687303715884105728");
-  EXPECT_EQ(Take(Integer::ParseRadix(hex, 16)).ToDecimal(),
-            "170141183460469231731687303715884105728");
-}
-
-TEST_F(NumericCapacityBoundary, DecimalImportsCountOnlySignificantDigits) {
-  NumericTestPeer::SetLimbCapacity(2);
-  EXPECT_EQ(Take(Integer::ParseDecimal("0009223372036854775808")).ToDecimal(),
-            "9223372036854775808");
-  Resource(Integer::ParseDecimal("18446744073709551617"), ResourceKind::kSize);
-  const auto fraction =
-      Take(Rational::ParseDecimalFraction("000922337203685477580.8000"));
-  EXPECT_EQ(fraction.Borrow().Numerator().ToDecimal(), "4611686018427387904");
-  EXPECT_EQ(fraction.Borrow().Denominator().ToDecimal(), "5");
-  Resource(Rational::ParseDecimalFraction("1844674407370955161.7"),
-           ResourceKind::kSize);
-
-  NumericTestPeer::SetLimbCapacity(3);
-  const auto wider =
-      Take(Rational::ParseDecimalFraction("1844674407370955161.7"));
-  EXPECT_EQ(wider.Borrow().Numerator().ToDecimal(), "18446744073709551617");
-  EXPECT_EQ(wider.Borrow().Denominator().ToDecimal(), "10");
-}
-
-TEST_F(NumericCapacityBoundary, NearestRoundingChecksSubtractionSpareLimb) {
-  const auto numerator = Number("18446744073709551615");
-  const auto denominator = Number("18446744073709551617");
-  const auto value =
-      Take(Rational::Make(numerator.Borrow(), denominator.Borrow()));
-  NumericTestPeer::SetLimbCapacity(2);
-  Resource(RoundRationalToFp(8, 2, RoundingMode::kRne, value.Borrow()),
-           ResourceKind::kSize);
-  const auto truncated =
-      Take(RoundRationalToFp(8, 2, RoundingMode::kRtz, value.Borrow()));
-  EXPECT_FALSE(truncated.negative);
-  EXPECT_FALSE(truncated.infinite);
-  EXPECT_EQ(truncated.exponent.ToDecimal(), "126");
-  EXPECT_EQ(truncated.fraction.ToDecimal(), "1");
-
-  NumericTestPeer::SetLimbCapacity(3);
-  const auto rounded =
-      Take(RoundRationalToFp(8, 2, RoundingMode::kRne, value.Borrow()));
-  EXPECT_FALSE(rounded.negative);
-  EXPECT_FALSE(rounded.infinite);
-  EXPECT_EQ(rounded.exponent.ToDecimal(), "127");
-  EXPECT_EQ(rounded.fraction.ToDecimal(), "0");
-  EXPECT_EQ(value.Borrow().Numerator().ToDecimal(), "18446744073709551615");
-  EXPECT_EQ(value.Borrow().Denominator().ToDecimal(), "18446744073709551617");
-}
-
-TEST_F(NumericCapacityBoundary, RoundingChecksIncrementAndExponentSpareLimbs) {
-  const auto seven_thirds =
-      Take(Rational::Make(IntegerView(7), IntegerView(3)));
-  const auto one = Take(Rational::Make(IntegerView(1), IntegerView(1)));
-  NumericTestPeer::SetLimbCapacity(2);
-  Resource(RoundRationalToFp(8, 65, RoundingMode::kRne, seven_thirds.Borrow()),
-           ResourceKind::kSize);
-  Resource(RoundRationalToFp(66, 2, RoundingMode::kRtz, one.Borrow()),
-           ResourceKind::kSize);
-  const auto truncated =
-      Take(RoundRationalToFp(8, 65, RoundingMode::kRtz, seven_thirds.Borrow()));
-  EXPECT_EQ(truncated.exponent.ToDecimal(), "128");
-  EXPECT_EQ(truncated.fraction.ToDecimal(), "3074457345618258602");
-
-  NumericTestPeer::SetLimbCapacity(3);
-  const auto rounded =
-      Take(RoundRationalToFp(8, 65, RoundingMode::kRne, seven_thirds.Borrow()));
-  EXPECT_EQ(rounded.exponent.ToDecimal(), "128");
-  EXPECT_EQ(rounded.fraction.ToDecimal(), "3074457345618258603");
-  const auto wide_exponent =
-      Take(RoundRationalToFp(66, 2, RoundingMode::kRtz, one.Borrow()));
-  EXPECT_EQ(wide_exponent.exponent.ToDecimal(), "36893488147419103231");
-  EXPECT_EQ(wide_exponent.fraction.ToDecimal(), "0");
-}
-
-TEST_F(NumericCapacityBoundary, FiniteOverflowChecksFractionLimbCapacity) {
-  const auto four = Take(Rational::Make(IntegerView(4), IntegerView(1)));
-  NumericTestPeer::SetLimbCapacity(2);
-  Resource(RoundRationalToFp(2, 130, RoundingMode::kRtz, four.Borrow()),
-           ResourceKind::kSize);
-
-  NumericTestPeer::SetLimbCapacity(3);
-  const auto largest_finite =
-      Take(RoundRationalToFp(2, 130, RoundingMode::kRtz, four.Borrow()));
-  EXPECT_FALSE(largest_finite.negative);
-  EXPECT_FALSE(largest_finite.infinite);
-  EXPECT_EQ(largest_finite.exponent.ToDecimal(), "2");
-  EXPECT_EQ(largest_finite.fraction.ToDecimal(),
-            "680564733841876926926749214863536422911");
 }
 
 }  // namespace dandelion::testing

@@ -1,35 +1,32 @@
 # Foundation Numeric Values
 
-Status: **design and research proposal for review, 2026-11-16**. The four
-value types and their full operations described here are not implemented by
-this work. The existing `Integer`, `Rational`, and node literal behavior are
-implemented and remain governed by the current node documents. No solver,
-rewriter, FP evaluator, or frontend is implied to exist.
+**Status.** `dandelion_util` implements the standalone numeric module.
+Node factories and payloads, the frontend, and benchmark workloads use
+its numeric types.
+[Node design](../node/design.md#5-exact-values),
+[frontend implementation](../frontend/implementation.md)
 
 | Document | Responsibility |
 | --- | --- |
-| [design.md](design.md) | Boundaries, shared contracts, operation ownership, resources, and node integration. |
-| [integer.md](integer.md) | Exact integers, Euclidean arithmetic and exponentiation. |
-| [bitvector.md](bitvector.md) | Width-bearing values and the complete fixed-size BV operations. |
-| [rational.md](rational.md) | Canonical exact fractions and their callers. |
-| [floating-point.md](floating-point.md) | SMT-LIB FP values, concrete evaluation and underspecification. |
-| [implementation.md](implementation.md) | Source/module organization, migration, dependency order and acceptance. |
-| [research.md](research.md) | Versioned evidence, alternatives and independence of references. |
-| [../testing/util.md](../testing/util.md) | Test-first coverage, concrete oracles and integration gates. |
+| [design.md](design.md) | Layer boundary, value ownership, checked errors, and FP outcomes |
+| [integer.md](integer.md) | Exact signed integers, Euclidean arithmetic, and arbitrary exponentiation |
+| [rational.md](rational.md) | Exact reduced fractions, arithmetic, and integral rounding |
+| [bitvector.md](bitvector.md) | Width-bearing values, modular arithmetic, and the full BV operator set |
+| [floating-point.md](floating-point.md) | Abstract FP values, exact concrete evaluation, and conversions |
+| [implementation.md](implementation.md) | Module layout, dependency graph, migration, and acceptance |
+| [research.md](research.md) | Versioned evidence, design rationale, and reference limitations |
+| [Numeric testing](../testing/util.md) | Test-first coverage, independent oracles, and failure injection |
 
-These documents propose a baseline for the complete project scope, not just a
-sequence of early features. They use the selected theory revisions and input
-forms in [node operators](../node/operators.md), and complement the
-[architecture](../architecture.md), [node design](../node/design.md),
-[development principles](../development-principles.md), and
-[planning standard](../planning.md). Existing contracts take effect until a
-future, explicitly tested and documented change replaces them. The source
-organization here is a proposal, not an assertion about the current tree.
+`dandelion_util` exposes `dandelion.util.numeric`. Node construction, the
+frontend, and future evaluation and theory code consume the same concrete
+semantics. The layer keeps common values inline, owns wide storage
+exclusively, and uses GMP privately for exact arithmetic. The four value
+types cover concrete operations for the selected Int, BV, and FP profile.
+Rational values support exact conversions and integer algorithms.
 
-The principal review choices are: keeping legacy node-compatible numeric
-entry points while introducing a neutral computation error; an Integer-backed
-initial BV representation; an exact concrete FP evaluator without MPFR; and
-leaving the symbolic FP encoding implementation to a separate theory design.
-No discretionary work or memory quota is proposed. The existing 32-bit BV
-width and FP format representation is retained as the project baseline.
-None of these choices is a measured performance conclusion.
+Concrete results carry SMT-LIB value identity. Checked computation can
+report an input error, an actual representation limit, or a C++ allocation
+failure. A successful FP evaluation can also describe a set of permitted
+results. The solver and model layers own the interpretation of those sets
+across a query. [Solver architecture](../architecture.md),
+[node operator inventory](../node/operators.md)

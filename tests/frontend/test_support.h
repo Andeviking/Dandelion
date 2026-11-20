@@ -5,6 +5,7 @@
 
 import std;
 import dandelion.frontend;
+import dandelion.util.numeric;
 
 namespace dandelion::frontend::testing {
 
@@ -29,13 +30,18 @@ T Require(dandelion::Result<T> result) {
   if constexpr (!std::is_void_v<T>) return std::move(*result);
 }
 
+template <class T>
+T Require(numeric::NumericResult<T> result) {
+  if (!result) {
+    ADD_FAILURE() << "Unexpected numeric error "
+                  << static_cast<int>(result.error());
+    throw std::runtime_error("Unexpected numeric error");
+  }
+  if constexpr (!std::is_void_v<T>) return std::move(*result);
+}
+
 inline Outcome<std::optional<TypedCommand>> Next(Session& session) {
-  auto header = session.NextSyntax();
-  if (!header) return std::unexpected(header.error());
-  if (!*header) return std::nullopt;
-  auto applied = session.Apply();
-  if (!applied) return std::unexpected(applied.error());
-  return std::move(*applied);
+  return session.ReadCommand();
 }
 
 inline TypedCommand RequireNext(
@@ -54,15 +60,19 @@ inline TypedCommand RequireNext(
 }
 
 inline Outcome<std::shared_ptr<const QueryContext>> Parse(
-    std::string_view text) {
-  auto made = Session::FromText(text);
+    std::string_view text, SourceRecords* records = nullptr) {
+  auto made = Session::FromText(
+      text, ParseOptions{.capture_source_records = records != nullptr});
   if (!made) return std::unexpected(made.error());
   auto session = std::move(*made);
   std::shared_ptr<const QueryContext> query;
   for (;;) {
     auto command = Next(session);
     if (!command) return std::unexpected(command.error());
-    if (!*command) return query;
+    if (!*command) {
+      if (records) *records = *session.GetSourceRecords();
+      return query;
+    }
     if ((*command)->query) query = (*command)->query;
   }
 }
@@ -106,6 +116,12 @@ inline void ExpectChildren(NodeView node,
 
 inline std::string IntegerValue(NodeView node) {
   return node.GetValue().value().GetInteger().value().ToDecimal();
+}
+
+inline std::string BvValue(NodeView node) {
+  const auto bits = node.GetValue().value().GetBitVector().value();
+  return Require(numeric::BitVector::ToUnsignedInteger(bits.Copy()))
+      .ToDecimal();
 }
 
 inline DeclView Applied(NodeView node) {

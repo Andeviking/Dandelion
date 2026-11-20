@@ -1,5 +1,7 @@
 #include "model_support.h"
 
+#include "../util/numeric_test_peer.h"
+
 namespace {
 thread_local std::optional<std::size_t> model_create_fail_after;
 }
@@ -143,7 +145,7 @@ TEST(FrontendModel, ProxyAndValueHandlesRejectAnotherModelOnSameManager) {
   auto second =
       Require(ModelOwner::Create(query, provider("second"), CheckAnswer::kSat));
   auto manager = Require(NodeManager::Attach(query->GetManager()));
-  const auto term = ApplyDecl(manager, query->GetFunctions()[0].decl.Borrow());
+  const auto term = ApplyDecl(manager, query->GetFunctions()[0].Borrow());
   const auto foreign = Require(first->Evaluate(term.Borrow()));
   const auto proxy = Require(first->MakeProxy(foreign));
   EXPECT_EQ(Require(first->LookupProxy(proxy.GetTerm().Borrow())).GetKey(),
@@ -183,17 +185,19 @@ TEST(FrontendModel, ScalarCanonicalOutputAndFiniteness) {
   CapturedSink sink;
   const auto result = WithModel(
       input,
-      std::make_unique<ControlledModel>([](ModelOwner& model,
-                                           NodeView term) -> Outcome<ValueRef> {
-        auto manager =
-            Require(NodeManager::Attach(model.GetQuery().GetManager()));
-        if (term.GetKind() == Kind::kFpConstruct) {
-          const auto sort = term.GetSort();
-          return Scalar(
-              model, Require(manager.MakeFpBits(sort, IntegerView(0b000110))));
-        }
-        return Scalar(model, Require(manager.RetainNode(term)));
-      }),
+      std::make_unique<ControlledModel>(
+          [](ModelOwner& model, NodeView term) -> Outcome<ValueRef> {
+            auto manager =
+                Require(NodeManager::Attach(model.GetQuery().GetManager()));
+            if (term.GetKind() == Kind::kFpConstruct) {
+              const auto sort = term.GetSort();
+              const auto value = Require(numeric::FloatingPointValue::FromBits(
+                  sort.GetFpFormat().value(), numeric::IntegerView(0b000110)));
+              return Scalar(model,
+                            Require(manager.MakeFpValue(sort, value.Borrow())));
+            }
+            return Scalar(model, Require(manager.RetainNode(term)));
+          }),
       sink);
   EXPECT_EQ(result.status, 0);
   EXPECT_EQ(
@@ -265,7 +269,7 @@ TEST(FrontendModel, RetainedQueryAndDefinitionsSurviveInputAndDriver) {
 }
 
 TEST(FrontendModel,
-     ExportBeforeValueSharesTotalInterpretationAndOriginalRanks) {
+     ExportBeforeValueSharesTotalInterpretationAndSemanticRanks) {
   const std::string input =
       std::string(kModelOption) +
       "(set-logic ALL)(declare-sort U 0)(define-sort Alias () U)"
@@ -286,7 +290,7 @@ TEST(FrontendModel,
       [](ModelOwner& model) -> Outcome<ModelExport> {
         const auto functions = model.GetQuery().GetFunctions();
         auto nm = Require(NodeManager::Attach(model.GetQuery().GetManager()));
-        const auto sort = *functions[0].decl.Borrow().GetRange();
+        const auto sort = *functions[0].Borrow().GetRange();
         const auto zero = Require(model.MakeValue(sort, "zero"));
         const auto one = Require(model.MakeValue(sort, "one"));
         auto z = Require(model.MakeProxy(zero));
@@ -298,16 +302,15 @@ TEST(FrontendModel,
         auto body = Builtin(
             nm, Kind::kIte,
             {cond.Borrow(), o.GetTerm().Borrow(), z.GetTerm().Borrow()});
-        return ModelExport{
-            {{functions[0].decl, {std::move(var)}, std::move(body)},
-             {functions[1].decl, {}, Require(nm.MakeBool(false))}},
-            {std::move(z), std::move(o)}};
+        return ModelExport{{{functions[0], {std::move(var)}, std::move(body)},
+                            {functions[1], {}, Require(nm.MakeBool(false))}},
+                           {std::move(z), std::move(o)}};
       });
   CapturedSink sink;
   const auto result = WithModel(input, std::move(provider), sink);
   ASSERT_EQ(result.status, 0) << sink.output;
   EXPECT_TRUE(sink.output.starts_with("sat\n((define-fun f (("));
-  EXPECT_TRUE(sink.output.contains(" Alias)) Alias (ite (= "));
+  EXPECT_TRUE(sink.output.contains(" U)) U (ite (= "));
   EXPECT_TRUE(
       sink.output.contains("(as @value0 U)) (as @value1 U) (as @value0 U))"));
   EXPECT_TRUE(sink.output.contains("(define-fun unused () Bool false)"));
@@ -330,9 +333,9 @@ TEST(FrontendModel,
       Parse("(set-logic ALL)(declare-sort U 0)(define-sort Alias () U)"
             "(declare-const zero U)(declare-const one U)" +
             records + "(check-sat)"));
-  ASSERT_EQ(recovered->GetDefinitions().size(), 2);
+  ASSERT_EQ(recovered->GetDefinitionCount(), 1);
   ASSERT_EQ(recovered->GetFunctions().size(), 2);
-  const auto& f = recovered->GetDefinitions()[0];
+  const auto& f = recovered->GetDefinition(0);
   ASSERT_EQ(f.formals.size(), 1);
   ASSERT_EQ(f.body.Borrow().GetKind(), Kind::kIte);
   ASSERT_EQ(f.body.Borrow().GetChildren().size(), 3);
@@ -341,11 +344,11 @@ TEST(FrontendModel,
   ASSERT_EQ(condition.GetChildren().size(), 2);
   EXPECT_EQ(Applied(condition.GetChildren()[0]), f.formals[0].Borrow());
   EXPECT_EQ(Applied(condition.GetChildren()[1]),
-            recovered->GetFunctions()[0].decl.Borrow());
+            recovered->GetFunctions()[0].Borrow());
   EXPECT_EQ(Applied(Argument(f.body, 1)),
-            recovered->GetFunctions()[1].decl.Borrow());
+            recovered->GetFunctions()[1].Borrow());
   EXPECT_EQ(Applied(Argument(f.body, 2)),
-            recovered->GetFunctions()[0].decl.Borrow());
+            recovered->GetFunctions()[0].Borrow());
 }
 
 TEST(FrontendModel, SharedExportUsesCaptureSafeDependencyOrderedLetBindings) {
@@ -375,17 +378,19 @@ TEST(FrontendModel, SharedExportUsesCaptureSafeDependencyOrderedLetBindings) {
             for (int i = 0; i < 12; ++i)
               shared = Builtin(nm, Kind::kIntAdd,
                                {shared.Borrow(), shared.Borrow()});
-            const auto g = ApplyDecl(nm, functions[1].decl.Borrow());
+            const auto g = ApplyDecl(nm, functions[1].Borrow());
             auto body =
                 Builtin(nm, Kind::kIntAdd, {g.Borrow(), shared.Borrow()});
             auto id_body = ApplyDecl(nm, id_formal.Borrow());
             return ModelExport{
-                {{functions[0].decl, {}, Require(nm.MakeInt(IntegerView(7)))},
-                 {functions[1].decl, {}, Require(nm.MakeInt(IntegerView(7)))},
-                 {functions[2].decl, {std::move(f_formal)}, std::move(body)},
-                 {functions[3].decl,
-                  {std::move(id_formal)},
-                  std::move(id_body)}},
+                {{functions[0],
+                  {},
+                  Require(nm.MakeInt(numeric::IntegerView(7)))},
+                 {functions[1],
+                  {},
+                  Require(nm.MakeInt(numeric::IntegerView(7)))},
+                 {functions[2], {std::move(f_formal)}, std::move(body)},
+                 {functions[3], {std::move(id_formal)}, std::move(id_body)}},
                 {}};
           }),
       sink);
@@ -399,16 +404,16 @@ TEST(FrontendModel, SharedExportUsesCaptureSafeDependencyOrderedLetBindings) {
   const auto body = sink.output.substr(5, model_end - 6);
   const auto script = "(set-logic ALL)(define-sort Alias () Int)" + body +
                       "(assert (= (f 2) 8199))(check-sat)";
-  const auto parsed = RequireQuery(Parse(script));
-  ASSERT_EQ(parsed->GetDefinitions().size(), 4);
-  EXPECT_EQ(EvalSmallInt(*parsed, Argument(parsed->GetAssertions()[0].term, 0)),
+  SourceRecords source;
+  const auto parsed = RequireQuery(Parse(script, &source));
+  ASSERT_EQ(parsed->GetDefinitionCount(), 2);
+  EXPECT_EQ(EvalSmallInt(*parsed, Argument(parsed->GetAssertions()[0], 0)),
             8199);
-  const auto& f = parsed->GetDefinitions()[2];
+  const auto& f = parsed->GetDefinition(0);
   ASSERT_EQ(f.formals.size(), 1);
   EXPECT_NE(f.formals[0].Borrow().GetNameHint(), "model_local0");
-  EXPECT_EQ(Applied(Argument(f.body, 0)),
-            parsed->GetDefinitions()[1].decl.Borrow());
-  const auto& id = parsed->GetDefinitions()[3];
+  EXPECT_EQ(Argument(f.body, 0), source.definitions[1].body.Borrow());
+  const auto& id = parsed->GetDefinition(1);
   ASSERT_EQ(id.formals.size(), 1);
   ASSERT_EQ(id.body.Borrow().GetKind(), Kind::kApply);
   EXPECT_EQ(Applied(id.body.Borrow()), id.formals[0].Borrow());
@@ -438,11 +443,11 @@ TEST(FrontendModel, UfidlNegativeValuesReadBackAndExportAsBinarySubtraction) {
             auto nm =
                 Require(NodeManager::Attach(model.GetQuery().GetManager()));
             return ModelExport{
-                {{fs[0].decl, {}, Require(nm.MakeInt(IntegerView(-1)))},
-                 {fs[1].decl,
+                {{fs[0], {}, Require(nm.MakeInt(numeric::IntegerView(-1)))},
+                 {fs[1],
                   {},
-                  Require(nm.MakeInt(
-                      IntegerView(std::numeric_limits<std::int64_t>::min())))}},
+                  Require(nm.MakeInt(numeric::IntegerView(
+                      std::numeric_limits<std::int64_t>::min())))}},
                 {}};
           }),
       sink);
@@ -474,19 +479,17 @@ TEST(FrontendModel, RejectsIncompleteOrOutOfOrderExportsAndForeignValues) {
               const auto fs = model.GetQuery().GetFunctions();
               auto nm =
                   Require(NodeManager::Attach(model.GetQuery().GetManager()));
-              const auto two = Require(nm.MakeInt(IntegerView(2)));
-              if (mode == 0) return ModelExport{{{fs[0].decl, {}, two}}, {}};
+              const auto two = Require(nm.MakeInt(numeric::IntegerView(2)));
+              if (mode == 0) return ModelExport{{{fs[0], {}, two}}, {}};
               if (mode == 1)
-                return ModelExport{
-                    {{fs[0].decl, {}, ApplyDecl(nm, fs[1].decl.Borrow())},
-                     {fs[1].decl, {}, two}},
-                    {}};
+                return ModelExport{{{fs[0], {}, ApplyDecl(nm, fs[1].Borrow())},
+                                    {fs[1], {}, two}},
+                                   {}};
               if (mode == 2)
-                return ModelExport{
-                    {{fs[0].decl, {}, two}, {fs[0].decl, {}, two}}, {}};
-              return ModelExport{{{fs[0].decl, {}, Require(nm.MakeBool(false))},
-                                  {fs[1].decl, {}, two}},
-                                 {}};
+                return ModelExport{{{fs[0], {}, two}, {fs[0], {}, two}}, {}};
+              return ModelExport{
+                  {{fs[0], {}, Require(nm.MakeBool(false))}, {fs[1], {}, two}},
+                  {}};
             }),
         sink);
     EXPECT_EQ(result.status, 1);
@@ -500,7 +503,7 @@ TEST(FrontendModel, RejectsIncompleteOrOutOfOrderExportsAndForeignValues) {
       foreign_query, std::make_unique<ControlledModel>(ArrayEvaluation),
       CheckAnswer::kSat));
   auto nm = Require(NodeManager::Attach(foreign_query->GetManager()));
-  const auto u = ApplyDecl(nm, foreign_query->GetFunctions()[0].decl.Borrow());
+  const auto u = ApplyDecl(nm, foreign_query->GetFunctions()[0].Borrow());
   const auto value = Require(foreign->Evaluate(u.Borrow()));
   CapturedSink sink;
   const auto result = WithModel(
@@ -523,7 +526,8 @@ TEST(FrontendModel, RejectsIncompleteOrOutOfOrderExportsAndForeignValues) {
   EXPECT_EQ(empty.output, "sat\n()\n");
 }
 
-NodeView SelectRounding(NodeView term, DeclView formal, RoundingMode mode) {
+NodeView SelectRounding(NodeView term, DeclView formal,
+                        numeric::RoundingMode mode) {
   while (term.GetKind() == Kind::kIte) {
     const auto args = term.GetChildren();
     if (args.size() != 3 || args[0].GetKind() != Kind::kEqual ||
@@ -557,14 +561,14 @@ TEST(FrontendModel, RationalConversionExportSurvivesLaterSlashDeclaration) {
                 Require(NodeManager::Attach(model.GetQuery().GetManager()));
             const auto functions = model.GetQuery().GetFunctions();
             auto int_sort = Require(nm.IntSort());
-            const auto& round = model.GetQuery().GetDefinitions()[0];
-            const auto bv = *functions[0].decl.Borrow().GetRange();
+            const auto& round = model.GetQuery().GetDefinition(0);
+            const auto bv = *functions[0].Borrow().GetRange();
             return ModelExport{
-                {{functions[0].decl,
+                {{functions[0],
                   {Require(nm.MakeFormal("a", int_sort.Borrow())),
                    Require(nm.MakeFormal("b", int_sort.Borrow()))},
-                  Require(nm.MakeBvValue(bv, IntegerView(0)))},
-                 {functions[1].decl, round.formals, round.body}},
+                  Require(nm.MakeBvWordValue(bv, 0))},
+                 {functions[1], round.formals, round.body}},
                 {}};
           }),
       sink);
@@ -574,20 +578,22 @@ TEST(FrontendModel, RationalConversionExportSurvivesLaterSlashDeclaration) {
   const auto body = sink.output.substr(5, sink.output.size() - 7);
   const auto recovered =
       RequireQuery(Parse("(set-logic ALL)" + body + "(check-sat)"));
-  ASSERT_EQ(recovered->GetDefinitions().size(), 2);
-  const auto& function = recovered->GetDefinitions()[1];
+  ASSERT_EQ(recovered->GetDefinitionCount(), 2);
+  const auto& function = recovered->GetDefinition(1);
   ASSERT_EQ(function.formals.size(), 1);
   for (const auto mode :
-       {RoundingMode::kRne, RoundingMode::kRna, RoundingMode::kRtp,
-        RoundingMode::kRtn, RoundingMode::kRtz}) {
+       {numeric::RoundingMode::kRne, numeric::RoundingMode::kRna,
+        numeric::RoundingMode::kRtp, numeric::RoundingMode::kRtn,
+        numeric::RoundingMode::kRtz}) {
     const auto value = SelectRounding(function.body.Borrow(),
                                       function.formals[0].Borrow(), mode);
     ASSERT_FALSE(value.IsNull());
     ASSERT_EQ(value.GetKind(), Kind::kFpConstruct);
     const auto args = value.GetChildren();
-    EXPECT_EQ(IntegerValue(args[0]), "0");
-    EXPECT_EQ(IntegerValue(args[1]), "1");
-    EXPECT_EQ(IntegerValue(args[2]), mode == RoundingMode::kRtp ? "2" : "1");
+    EXPECT_EQ(BvValue(args[0]), "0");
+    EXPECT_EQ(BvValue(args[1]), "1");
+    EXPECT_EQ(BvValue(args[2]),
+              mode == numeric::RoundingMode::kRtp ? "2" : "1");
   }
 }
 
@@ -658,19 +664,19 @@ TEST(FrontendModel, FpRoundingFailureRespectsModelResponseBoundary) {
             ControlledModel::Evaluation{}, ControlledModel::Description{},
             [after_first](ModelOwner& model) -> Outcome<ModelExport> {
               const auto functions = model.GetQuery().GetFunctions();
-              const auto& round = model.GetQuery().GetDefinitions()[0];
+              const auto& round = model.GetQuery().GetDefinition(0);
               auto manager =
                   Require(NodeManager::Attach(model.GetQuery().GetManager()));
               auto export_model = ModelExport{
-                  {{functions[0].decl, {}, Require(manager.MakeBool(false))},
-                   {functions[1].decl, round.formals, round.body}},
+                  {{functions[0], {}, Require(manager.MakeBool(false))},
+                   {functions[1], round.formals, round.body}},
                   {}};
               if (!after_first) std::ranges::reverse(export_model.functions);
-              NumericTestPeer::FailAllocationAfter(0);
+              numeric::NumericTestPeer::FailAllocationAfter(0);
               return export_model;
             }),
         sink);
-    NumericTestPeer::ClearFailures();
+    numeric::NumericTestPeer::ClearFailures();
     EXPECT_EQ(run.status, 1);
     ASSERT_TRUE(run.diagnostic);
     EXPECT_EQ(run.diagnostic->code, DiagnosticCode::kResource);
@@ -724,7 +730,7 @@ TEST(FrontendModel, ValidNodeRanksCannotSmuggleSortsOutsideTheSignature) {
       std::make_unique<ControlledModel>(
           ControlledModel::Evaluation{}, ControlledModel::Description{},
           [](ModelOwner& model) -> Outcome<ModelExport> {
-            const auto function = model.GetQuery().GetFunctions()[0].decl;
+            const auto function = model.GetQuery().GetFunctions()[0];
             auto nm =
                 Require(NodeManager::Attach(model.GetQuery().GetManager()));
             const auto alias = Require(nm.DeclareUninterpretedSort("U", 0));
@@ -749,16 +755,15 @@ TEST(FrontendModel, ValidNodeRanksCannotSmuggleSortsOutsideTheSignature) {
   const auto query = RequireQuery(
       Parse("(set-option :produce-models true)(set-logic QF_FP)(check-sat)"));
   auto nm = Require(NodeManager::Attach(query->GetManager()));
-  const auto sort = Require(nm.MakeBvSort(IntegerView(1)));
-  const auto value = Require(nm.MakeBvValue(sort.Borrow(), IntegerView(0)));
+  const auto sort = Require(nm.MakeBvSort(numeric::IntegerView(1)));
+  const auto value = Require(nm.MakeBvWordValue(sort.Borrow(), 0));
   const auto unsupported = Builtin(nm, Kind::kBvNot, {value.Borrow()});
   int calls = 0;
   auto model = Require(ModelOwner::Create(
       query,
       std::make_unique<ControlledModel>([&](ModelOwner& owner, NodeView term) {
         ++calls;
-        return Scalar(owner,
-                      Require(nm.MakeBvValue(term.GetSort(), IntegerView(1))));
+        return Scalar(owner, Require(nm.MakeBvWordValue(term.GetSort(), 1)));
       }),
       CheckAnswer::kSat));
   ExpectError(model->Evaluate(unsupported.Borrow()),
@@ -870,7 +875,7 @@ void CheckPublishedNames(const std::shared_ptr<ModelOwner>& owner) {
             "prior");
   ExpectError(Next(session), DiagnosticCode::kInvalidInput);
   ExpectError(Next(session), DiagnosticCode::kInvalidInput);
-  EXPECT_FALSE(Require(session.NextSyntax()));
+  EXPECT_FALSE(Require(session.ReadCommand()));
 }
 
 TEST(FrontendModel, ValueResponsePublishesStagedNamesOnlyAfterFlush) {
@@ -986,7 +991,7 @@ TEST(FrontendModel, ModelResponseCommitsAllProxyNamesTogether) {
             [&](ModelOwner& model) -> Outcome<ModelExport> {
               ++exports;
               const auto functions = model.GetQuery().GetFunctions();
-              const auto sort = *functions[0].decl.Borrow().GetRange();
+              const auto sort = *functions[0].Borrow().GetRange();
               auto prior = Require(
                   model.MakeProxy(Require(model.MakeValue(sort, "prior"))));
               auto fresh = Require(
@@ -994,13 +999,12 @@ TEST(FrontendModel, ModelResponseCommitsAllProxyNamesTogether) {
               auto duplicate = Require(model.MakeProxy(fresh.GetValue()));
               auto different = Require(
                   model.MakeProxy(Require(model.MakeValue(sort, "different"))));
-              return ModelExport{{{functions[1].decl, {}, fresh.GetTerm()},
-                                  {functions[2].decl,
-                                   {},
-                                   valid ? duplicate.GetTerm() : Node{}},
-                                  {functions[0].decl, {}, prior.GetTerm()},
-                                  {functions[3].decl, {}, different.GetTerm()}},
-                                 {fresh, duplicate, prior, different}};
+              return ModelExport{
+                  {{functions[1], {}, fresh.GetTerm()},
+                   {functions[2], {}, valid ? duplicate.GetTerm() : Node{}},
+                   {functions[0], {}, prior.GetTerm()},
+                   {functions[3], {}, different.GetTerm()}},
+                  {fresh, duplicate, prior, different}};
             }),
         sink);
     ASSERT_EQ(checked.status, 0);
@@ -1072,13 +1076,12 @@ TEST(FrontendModel, ExposureReservationFailurePrecedesTheClosingWrite) {
                 [](ModelOwner& model) -> Outcome<ModelExport> {
                   ModelExport result;
                   for (const auto& function : model.GetQuery().GetFunctions()) {
-                    const auto declaration = function.decl.Borrow();
+                    const auto declaration = function.Borrow();
                     auto value = Require(model.MakeValue(
                         *declaration.GetRange(),
                         std::string(declaration.GetNameHint())));
                     auto proxy = Require(model.MakeProxy(value));
-                    result.functions.push_back(
-                        {function.decl, {}, proxy.GetTerm()});
+                    result.functions.push_back({function, {}, proxy.GetTerm()});
                     result.proxies.push_back(std::move(proxy));
                   }
                   return result;
@@ -1176,11 +1179,8 @@ TEST(FrontendModel, InspectionApplyIsBoundToTheOriginalOwner) {
                   })
             : Session::ForModelText(first, script);
     auto session = Require(std::move(result));
-    auto header = Require(session.NextSyntax());
-    ASSERT_TRUE(header);
-    EXPECT_EQ(header->kind, CommandKind::kGetValue);
-    ExpectError(session.Apply(second.get()), DiagnosticCode::kModelFailure);
-    ExpectError(session.Apply(), DiagnosticCode::kInvalidState);
+    ExpectError(session.ReadCommand(second.get()),
+                DiagnosticCode::kModelFailure);
     EXPECT_EQ(second_calls, 1);
     const auto use = [&](const TypedCommand& command) {
       ASSERT_EQ(command.values.size(), 1);
@@ -1190,11 +1190,11 @@ TEST(FrontendModel, InspectionApplyIsBoundToTheOriginalOwner) {
           "first");
     };
     use(RequireNext(session, CommandKind::kGetValue));
-    header = Require(session.NextSyntax());
-    ASSERT_TRUE(header);
-    EXPECT_EQ(header->kind, CommandKind::kGetValue);
-    use(Require(session.Apply(first.get())));
-    EXPECT_FALSE(Require(session.NextSyntax()));
+    const auto command = Require(session.ReadCommand(first.get()));
+    ASSERT_TRUE(command);
+    EXPECT_EQ(command->header.kind, CommandKind::kGetValue);
+    use(*command);
+    EXPECT_FALSE(Require(session.ReadCommand()));
     EXPECT_EQ(second_calls, 1);
   }
   EXPECT_EQ(first_calls, 5);
@@ -1206,9 +1206,9 @@ TEST(FrontendModel, InspectionApplyIsBoundToTheOriginalOwner) {
   RequireNext(unrelated, CommandKind::kDeclareSort);
   const auto other = RequireCheck(unrelated);
   EXPECT_NE(other.get(), query.get());
-  ASSERT_TRUE(Require(unrelated.NextSyntax()));
-  ExpectError(unrelated.Apply(first.get()), DiagnosticCode::kModelFailure);
-  EXPECT_FALSE(Require(unrelated.NextSyntax()));
+  ExpectError(unrelated.ReadCommand(first.get()),
+              DiagnosticCode::kModelFailure);
+  EXPECT_FALSE(Require(unrelated.ReadCommand()));
   auto malformed =
       Require(Session::ForModelText(first, "(get-value (|@value01|))"));
   ExpectError(Next(malformed), DiagnosticCode::kInvalidInput);
@@ -1238,8 +1238,8 @@ TEST(FrontendModel, IdenticalKeyBytesInDistinctSortsDoNotMerge) {
   const auto u = Require(owner->LookupProxy(typed.values[0].term.Borrow()));
   const auto a = Require(owner->LookupProxy(typed.values[1].term.Borrow()));
   EXPECT_EQ(u.GetKey(), a.GetKey());
-  EXPECT_EQ(u.GetSort(), query->GetFunctions()[0].decl.Borrow().GetRange());
-  EXPECT_EQ(a.GetSort(), query->GetFunctions()[1].decl.Borrow().GetRange());
+  EXPECT_EQ(u.GetSort(), query->GetFunctions()[0].Borrow().GetRange());
+  EXPECT_EQ(a.GetSort(), query->GetFunctions()[1].Borrow().GetRange());
   EXPECT_NE(u.GetSort(), a.GetSort());
 }
 
@@ -1258,37 +1258,38 @@ TEST(FrontendModel, SharedSortAliasesBoundGeneratedModelText) {
       "(declare-const skew (R Int Bool))"
       "(declare-const small (Array Bool (_ BitVec 1)))"
       "(define-const constructor (Box (A12 Bool)) (as nil (Box (A12 Bool))))";
+  SourceRecords source;
   std::shared_ptr<const QueryContext> query;
   {
     const auto input = std::string(kModelOption) + "(set-logic ALL)" + aliases +
                        std::string(signature) + "(check-sat)";
     SCOPED_TRACE(::testing::Message() << "FE-MODEL-SORT-TEXT-02 " << input);
-    query = RequireQuery(Parse(input));
+    query = RequireQuery(Parse(input, &source));
   }
   ASSERT_EQ(query->GetFunctions().size(), 4);
   auto owner = Require(ModelOwner::Create(
       query,
       std::make_unique<ControlledModel>(
           NamedAbstractValue, ControlledModel::Description{},
-          [](ModelOwner& model) -> Outcome<ModelExport> {
+          [ctor = source.definitions[0].body](
+              ModelOwner& model) -> Outcome<ModelExport> {
             const auto functions = model.GetQuery().GetFunctions();
             auto nm =
                 Require(NodeManager::Attach(model.GetQuery().GetManager()));
-            const auto deep = *functions[0].decl.Borrow().GetRange();
+            const auto deep = *functions[0].Borrow().GetRange();
             const auto inner = Require(model.MakeProxy(
                 Require(model.MakeValue(*deep.GetArrayElement(), "inner"))));
             const auto array =
                 Require(nm.MakeBuiltin({Kind::kArrayConst, {}, deep, {}},
                                        std::array{inner.GetTerm().Borrow()}));
-            const auto skew = Require(model.MakeProxy(Require(model.MakeValue(
-                *functions[2].decl.Borrow().GetRange(), "skew"))));
-            const auto small = Require(model.MakeProxy(Require(model.MakeValue(
-                *functions[3].decl.Borrow().GetRange(), "small"))));
-            const auto ctor = model.GetQuery().GetDefinitions()[0].body;
-            return ModelExport{{{functions[0].decl, {}, array},
-                                {functions[1].decl, {}, ctor},
-                                {functions[2].decl, {}, skew.GetTerm()},
-                                {functions[3].decl, {}, small.GetTerm()}},
+            const auto skew = Require(model.MakeProxy(Require(
+                model.MakeValue(*functions[2].Borrow().GetRange(), "skew"))));
+            const auto small = Require(model.MakeProxy(Require(
+                model.MakeValue(*functions[3].Borrow().GetRange(), "small"))));
+            return ModelExport{{{functions[0], {}, array},
+                                {functions[1], {}, ctor},
+                                {functions[2], {}, skew.GetTerm()},
+                                {functions[3], {}, small.GetTerm()}},
                                {inner, skew, small}};
           }),
       CheckAnswer::kSat));
@@ -1298,15 +1299,16 @@ TEST(FrontendModel, SharedSortAliasesBoundGeneratedModelText) {
   ASSERT_EQ(Inspect(owner, input, sink).status, 0);
   EXPECT_EQ(sink.flushes, 2);
   ASSERT_LT(sink.output.size(), 500u);
-  EXPECT_EQ(sink.output,
-            "((deep (as @value0 (A12 Bool))) (skew (as @value1 (R Int Bool)))"
-            " (small (as @value2 (Array Bool (_ BitVec 1)))))\n"
-            "((define-fun deep () (A12 Bool)"
-            " ((as const (A12 Bool)) (as @value3 (A11 Bool))))"
-            " (define-fun ctor () (Box (A12 Bool)) (as nil (Box (A12 Bool))))"
-            " (define-fun skew () (R Int Bool) (as @value1 (R Int Bool)))"
-            " (define-fun small () (Array Bool (_ BitVec 1))"
-            " (as @value2 (Array Bool (_ BitVec 1)))))\n");
+  EXPECT_EQ(
+      sink.output,
+      "((deep (as @value0 (A12 Bool))) (skew (as @value1 (Array Bool Int)))"
+      " (small (as @value2 (Array Bool (_ BitVec 1)))))\n"
+      "((define-fun deep () (A12 Bool)"
+      " ((as const (A12 Bool)) (as @value3 (A11 Bool))))"
+      " (define-fun ctor () (Box (A12 Bool)) (as nil (Box (A12 Bool))))"
+      " (define-fun skew () (Array Bool Int) (as @value1 (Array Bool Int)))"
+      " (define-fun small () (Array Bool (_ BitVec 1))"
+      " (as @value2 (Array Bool (_ BitVec 1)))))\n");
   const auto inspect_input =
       "(get-value ((as @value0 (A12 Bool)) (as @value1 (R Int Bool))"
       " ((as const (A12 Bool)) (as @value3 (A11 Bool)))"
@@ -1314,10 +1316,10 @@ TEST(FrontendModel, SharedSortAliasesBoundGeneratedModelText) {
   auto session = Require(Session::ForModelText(owner, inspect_input));
   const auto typed = RequireNext(session, CommandKind::kGetValue);
   ASSERT_EQ(typed.values.size(), 5);
-  constexpr std::array<std::size_t, 5> source{0, 2, 0, 1, 3};
-  for (std::size_t i = 0; i < source.size(); ++i)
+  constexpr std::array<std::size_t, 5> function_indices{0, 2, 0, 1, 3};
+  for (std::size_t i = 0; i < function_indices.size(); ++i)
     EXPECT_EQ(typed.values[i].term.Borrow().GetSort(),
-              query->GetFunctions()[source[i]].decl.Borrow().GetRange());
+              query->GetFunctions()[function_indices[i]].Borrow().GetRange());
   const auto asymmetric = typed.values[1].term.Borrow().GetSort();
   EXPECT_EQ(asymmetric.GetArrayIndex()->GetKind(), SortKind::kBool);
   EXPECT_EQ(asymmetric.GetArrayElement()->GetKind(), SortKind::kInt);
@@ -1326,8 +1328,8 @@ TEST(FrontendModel, SharedSortAliasesBoundGeneratedModelText) {
   ASSERT_EQ(constant.GetChildren().size(), 1);
   EXPECT_EQ(constant.GetChildren()[0].GetSort(),
             constant.GetSort().GetArrayElement());
-  EXPECT_EQ(typed.values[3].term, query->GetDefinitions()[0].body);
-  EXPECT_FALSE(Require(session.NextSyntax()));
+  EXPECT_EQ(typed.values[3].term, source.definitions[0].body);
+  EXPECT_FALSE(Require(session.ReadCommand()));
 }
 
 TEST(FrontendModel, DeepAliasChainBoundsRecipeMatchesAcrossSubsorts) {
@@ -1416,19 +1418,20 @@ TEST(FrontendModel, ScalarDescriptionFaultsRejectTheFirstPair) {
                   Require(NodeManager::Attach(owner.GetQuery().GetManager()));
               switch (fault) {
                 case Fault::kNone:
-                  return ValueDescription{Require(nm.MakeInt(IntegerView(7)))};
+                  return ValueDescription{
+                      Require(nm.MakeInt(numeric::IntegerView(7)))};
                 case Fault::kMissing:
                   return ValueDescription{};
                 case Fault::kNull:
                   return ValueDescription{Node{}};
                 case Fault::kNonliteral:
                   return ValueDescription{ApplyDecl(
-                      nm, owner.GetQuery().GetFunctions()[0].decl.Borrow())};
+                      nm, owner.GetQuery().GetFunctions()[0].Borrow())};
                 case Fault::kWrongSort:
                   return ValueDescription{Require(nm.MakeBool(true))};
                 case Fault::kForeign:
                   return ValueDescription{
-                      Require(foreign.MakeInt(IntegerView(7)))};
+                      Require(foreign.MakeInt(numeric::IntegerView(7)))};
               }
               throw std::logic_error("Unrecognized scalar test case");
             }),
@@ -1461,9 +1464,10 @@ TEST(FrontendModel, DatatypeDescriptionChecksConstructorFieldsAndActiveKeys) {
       "(define-const test Bool ((_ is leaf) (leaf 7)))"
       "(define-const alien_value Other alien)(check-sat)";
   constexpr std::string_view request = "(get-value (sample))(echo \"unread\")";
-  const auto query = RequireQuery(Parse(input));
+  SourceRecords source;
+  const auto query = RequireQuery(Parse(input, &source));
   auto nm = Require(NodeManager::Attach(query->GetManager()));
-  const auto& sample = query->GetDefinitions()[0].body;
+  const auto& sample = source.definitions[0].body;
   const auto instance = [&](NodeView term) {
     return Require(nm.RetainDeclInstance(*term.GetDeclaration()));
   };
@@ -1504,7 +1508,8 @@ TEST(FrontendModel, DatatypeDescriptionChecksConstructorFieldsAndActiveKeys) {
                 const ValueRef& value) -> Outcome<ValueDescription> {
               ++descriptions;
               if (value.GetSort() == int_sort.Borrow())
-                return ValueDescription{Require(nm.MakeInt(IntegerView(7)))};
+                return ValueDescription{
+                    Require(nm.MakeInt(numeric::IntegerView(7)))};
               if (value.GetKey() == "leaf") {
                 ValueRef field =
                     Require(model.MakeValue(int_sort.Borrow(), "seven"));
@@ -1522,13 +1527,13 @@ TEST(FrontendModel, DatatypeDescriptionChecksConstructorFieldsAndActiveKeys) {
                   ctor = {};
                   break;
                 case Fault::kSelector:
-                  ctor = instance(query->GetDefinitions()[1].body.Borrow());
+                  ctor = instance(source.definitions[1].body.Borrow());
                   break;
                 case Fault::kTester:
-                  ctor = instance(query->GetDefinitions()[2].body.Borrow());
+                  ctor = instance(source.definitions[2].body.Borrow());
                   break;
                 case Fault::kWrongConstructor:
-                  ctor = instance(query->GetDefinitions()[3].body.Borrow());
+                  ctor = instance(source.definitions[3].body.Borrow());
                   break;
                 case Fault::kFieldCount:
                   return ValueDescription{DatatypeValue{ctor, {left}}};
@@ -1618,16 +1623,16 @@ TEST(FrontendModel, ExportChecksExactSignatureAndBodyBindings) {
                   Require(NodeManager::Attach(owner.GetQuery().GetManager()));
               const auto int_sort = Require(nm.IntSort());
               const auto bool_sort = Require(nm.BoolSort());
-              const auto seven = Require(nm.MakeInt(IntegerView(7)));
+              const auto seven = Require(nm.MakeInt(numeric::IntegerView(7)));
               const auto x = Require(nm.MakeFormal("x", int_sort.Borrow()));
               const auto y = Require(nm.MakeFormal("y", int_sort.Borrow()));
-              const auto seed = ApplyDecl(nm, functions[0].decl.Borrow());
+              const auto seed = ApplyDecl(nm, functions[0].Borrow());
               const auto left = ApplyDecl(nm, x.Borrow());
               const auto right = ApplyDecl(nm, y.Borrow());
               const auto difference =
                   Builtin(nm, Kind::kIntSub, {left.Borrow(), right.Borrow()});
-              ModelExport out{{{functions[0].decl, {}, seven},
-                               {functions[1].decl,
+              ModelExport out{{{functions[0], {}, seven},
+                               {functions[1],
                                 {x, y},
                                 Builtin(nm, Kind::kIntAdd,
                                         {seed.Borrow(), difference.Borrow()})}},
@@ -1677,7 +1682,7 @@ TEST(FrontendModel, ExportChecksExactSignatureAndBodyBindings) {
                       Require(nm.MakeFormal("y", bool_sort.Borrow()));
                   break;
                 case Fault::kFormalKind:
-                  later.formals[1] = functions[0].decl;
+                  later.formals[1] = functions[0];
                   break;
                 case Fault::kUnboundFormal: {
                   const auto unbound =
@@ -1718,18 +1723,18 @@ TEST(FrontendModel, ExportChecksExactSignatureAndBodyBindings) {
       const auto recovered = RequireQuery(
           Parse("(set-logic QF_UFIDL)" + sink.output.substr(5, model_end - 6) +
                 "(assert (= (f 9 2) 14))(check-sat)"));
-      ASSERT_EQ(recovered->GetDefinitions().size(), 2);
+      ASSERT_EQ(recovered->GetDefinitionCount(), 1);
       ASSERT_EQ(recovered->GetAssertions().size(), 1);
-      const auto& f = recovered->GetDefinitions()[1];
-      EXPECT_EQ(f.source_name, "f");
+      const auto& f = recovered->GetDefinition(0);
+      EXPECT_EQ(f.decl.Borrow().GetNameHint(), "f");
       ASSERT_EQ(f.formals.size(), 2);
       EXPECT_NE(f.formals[0], f.formals[1]);
       EXPECT_EQ(f.formals[0].Borrow().GetRange()->GetKind(), SortKind::kInt);
       EXPECT_EQ(f.formals[1].Borrow().GetRange()->GetKind(), SortKind::kInt);
       EXPECT_EQ(f.body.Borrow().GetSort().GetKind(), SortKind::kInt);
-      EXPECT_EQ(EvalSmallInt(*recovered,
-                             Argument(recovered->GetAssertions()[0].term, 0)),
-                14);
+      EXPECT_EQ(
+          EvalSmallInt(*recovered, Argument(recovered->GetAssertions()[0], 0)),
+          14);
     } else {
       EXPECT_EQ(result.status, 1);
       ASSERT_TRUE(result.diagnostic);
@@ -1752,7 +1757,7 @@ TEST(FrontendModel, ExportValidatesProxyMappingsBeforeNamingValues) {
   const auto query = RequireQuery(Parse(input));
   const auto functions = query->GetFunctions();
   ASSERT_EQ(functions.size(), 2);
-  const auto sort = *functions[0].decl.Borrow().GetRange();
+  const auto sort = *functions[0].Borrow().GetRange();
   auto external = Require(ModelOwner::Create(
       query, std::make_unique<ControlledModel>(), CheckAnswer::kSat));
   const auto foreign_value = Require(external->MakeValue(sort, "same"));
@@ -1780,8 +1785,8 @@ TEST(FrontendModel, ExportValidatesProxyMappingsBeforeNamingValues) {
               const auto b = Require(model.MakeProxy(value));
               EXPECT_NE(Applied(a.GetTerm().Borrow()),
                         Applied(b.GetTerm().Borrow()));
-              ModelExport out{{{functions[0].decl, {}, a.GetTerm()},
-                               {functions[1].decl, {}, b.GetTerm()}},
+              ModelExport out{{{functions[0], {}, a.GetTerm()},
+                               {functions[1], {}, b.GetTerm()}},
                               {a, b}};
               switch (fault) {
                 case Fault::kNone:
@@ -1883,7 +1888,7 @@ TEST(FrontendModel, EvaluateRejectsOutOfSignatureTermsBeforeProviderCallback) {
   const auto query = RequireQuery(Parse(input));
   auto nm = Require(NodeManager::Attach(query->GetManager()));
   const auto int_sort = Require(nm.IntSort());
-  const auto one = Require(nm.MakeInt(IntegerView(1)));
+  const auto one = Require(nm.MakeInt(numeric::IntegerView(1)));
   const auto inactive =
       Builtin(nm, Kind::kIntMod, {one.Borrow(), one.Borrow()});
   const auto new_sort = Require(nm.DeclareUninterpretedSort("U", 0));
@@ -1895,7 +1900,7 @@ TEST(FrontendModel, EvaluateRejectsOutOfSignatureTermsBeforeProviderCallback) {
       Require(nm.DeclareFunction("seed", {}, int_sort.Borrow()));
   const auto unbound = ApplyDecl(nm, outside.Borrow());
   auto other = Require(NodeManager::Create());
-  const auto foreign = Require(other.MakeInt(IntegerView(1)));
+  const auto foreign = Require(other.MakeInt(numeric::IntegerView(1)));
   int calls = 0;
   auto owner = Require(ModelOwner::Create(
       query,
@@ -1934,13 +1939,15 @@ TEST(FrontendModel, WideScalarFieldsAndNegativeWordNeighborRenderExactly) {
                                  std::numeric_limits<std::int64_t>::min() + 1);
           case SortKind::kBitVector: {
             const auto bits =
-                Require(Integer::ParseDecimal("18446744073709551617"));
+                Require(numeric::BitVector::FromBinaryDigits(field));
             return Scalar(owner, Require(nm.MakeBvValue(sort, bits.Borrow())));
           }
           case SortKind::kFloatingPoint: {
-            const auto bits =
-                Require(Integer::ParseRadix("1" + field + field, 2));
-            return Scalar(owner, Require(nm.MakeFpBits(sort, bits.Borrow())));
+            const auto bits = Require(
+                numeric::BitVector::FromBinaryDigits("1" + field + field));
+            const auto value = Require(numeric::FloatingPointValue::FromBits(
+                sort.GetFpFormat().value(), bits));
+            return Scalar(owner, Require(nm.MakeFpValue(sort, value.Borrow())));
           }
           default:
             return std::unexpected(ModelError());
@@ -1968,12 +1975,12 @@ TEST(FrontendModel, ExportKeepsDatatypeOperatorsAndUnshadowedRationalRank) {
       std::make_unique<ControlledModel>(
           ControlledModel::Evaluation{}, ControlledModel::Description{},
           [](ModelOwner& owner) -> Outcome<ModelExport> {
-            const auto defs = owner.GetQuery().GetDefinitions();
+            const auto& first = owner.GetQuery().GetDefinition(0);
+            const auto& second = owner.GetQuery().GetDefinition(1);
             const auto functions = owner.GetQuery().GetFunctions();
-            return ModelExport{
-                {{functions[0].decl, defs[0].formals, defs[0].body},
-                 {functions[1].decl, defs[1].formals, defs[1].body}},
-                {}};
+            return ModelExport{{{functions[0], first.formals, first.body},
+                                {functions[1], second.formals, second.body}},
+                               {}};
           }),
       sink);
   ASSERT_EQ(result.status, 0) << sink.output;
@@ -1982,8 +1989,8 @@ TEST(FrontendModel, ExportKeepsDatatypeOperatorsAndUnshadowedRationalRank) {
   const auto query = RequireQuery(
       Parse("(set-logic ALL)(declare-datatype D ((empty) (box (field Int))))" +
             sink.output.substr(5, sink.output.size() - 7) + "(check-sat)"));
-  ASSERT_EQ(query->GetDefinitions().size(), 2);
-  const auto& choose = query->GetDefinitions()[0];
+  ASSERT_EQ(query->GetDefinitionCount(), 2);
+  const auto& choose = query->GetDefinition(0);
   ASSERT_EQ(choose.formals.size(), 1);
   ASSERT_EQ(choose.body.Borrow().GetKind(), Kind::kIte);
   ASSERT_EQ(choose.body.Borrow().GetChildren().size(), 3);
@@ -1995,7 +2002,7 @@ TEST(FrontendModel, ExportKeepsDatatypeOperatorsAndUnshadowedRationalRank) {
             Applied(selector).GetConstructor());
   EXPECT_EQ(Applied(tester.GetChildren()[0]), choose.formals[0].Borrow());
   EXPECT_EQ(tester.GetChildren()[0], selector.GetChildren()[0]);
-  const auto& round = query->GetDefinitions()[1];
+  const auto& round = query->GetDefinition(1);
   ASSERT_EQ(round.formals.size(), 1);
   ASSERT_EQ(round.body.Borrow().GetKind(), Kind::kFpFromRational);
   ASSERT_EQ(round.body.Borrow().GetChildren().size(), 1);

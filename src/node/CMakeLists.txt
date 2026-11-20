@@ -1,7 +1,7 @@
-set(node_interfaces numeric.cppm node.cppm)
+set(node_interfaces node.cppm)
 set(node_private_interfaces node_internal.cppm)
 set(node_sources
-  numeric.cc node.cc sort_store.cc decl_store.cc datatype_builder.cc
+  node.cc sort_store.cc decl_store.cc datatype_builder.cc
   kind_rules.cc unique_table.cc traversal.cc
 )
 if(DANDELION_BUILD_TESTS)
@@ -14,9 +14,9 @@ target_sources(dandelion_node
           FILES ${node_private_interfaces}
   PRIVATE ${node_sources}
 )
-target_link_libraries(dandelion_node PRIVATE GMP::GMP)
+target_link_libraries(dandelion_node PUBLIC dandelion_util)
 if(DANDELION_BUILD_TESTS)
-  target_compile_definitions(dandelion_node PUBLIC DANDELION_NODE_TESTING=1)
+  target_compile_definitions(dandelion_node PRIVATE DANDELION_NODE_TESTING=1)
 endif()
 if(DANDELION_ENABLE_SANITIZERS)
   target_link_options(dandelion_node INTERFACE

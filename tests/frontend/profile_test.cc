@@ -67,7 +67,7 @@ TEST_P(LogicProfile, SignatureAndDeclarationPermissions) {
   SCOPED_TRACE(::testing::Message() << "FE-PROFILE-02 " << prelude << combined);
   const auto query = RequireQuery(parse(combined));
   EXPECT_EQ(query->GetLogic(), name);
-  ASSERT_EQ(query->GetDefinitions().size(), 1);
+  ASSERT_EQ(query->GetDefinitionCount(), 1);
   const auto roots = query->GetAssertions();
   const std::array expected{
       std::pair{'\0', Kind::kEqual}, std::pair{'B', Kind::kEqual},
@@ -80,15 +80,14 @@ TEST_P(LogicProfile, SignatureAndDeclarationPermissions) {
                     : gate != '\0' && !components.contains(gate))
       continue;
     ASSERT_LT(index, roots.size());
-    const auto root = roots[index++].term.Borrow();
+    const auto root = roots[index++].Borrow();
     ASSERT_EQ(root.GetKind(), kind);
     EXPECT_EQ(root.GetSort().GetKind(), SortKind::kBool);
     const auto children = root.GetChildren();
     ASSERT_FALSE(children.empty());
     switch (gate) {
       case '\0':
-        EXPECT_EQ(Applied(children[0]),
-                  query->GetDefinitions()[0].decl.Borrow());
+        EXPECT_EQ(Applied(children[0]), query->GetDefinition(0).decl.Borrow());
         break;
       case 'B':
         EXPECT_EQ(children[0].GetKind(), Kind::kBvNot);
@@ -114,7 +113,7 @@ TEST_P(LogicProfile, SignatureAndDeclarationPermissions) {
         ASSERT_EQ(children.size(), 2);
         EXPECT_EQ(Applied(root).GetKind(), DeclKind::kFunction);
         ASSERT_FALSE(query->GetFunctions().empty());
-        EXPECT_EQ(Applied(root), query->GetFunctions().back().decl.Borrow());
+        EXPECT_EQ(Applied(root), query->GetFunctions().back().Borrow());
         EXPECT_TRUE(query->HasFunction(Applied(root)));
         break;
       default:
@@ -183,14 +182,13 @@ TEST(FrontendProfiles, InactiveSpellingCanHaveUserIdentity) {
             "Bool)) Bool)"
             "(assert (select x))(check-sat)"));
   ASSERT_EQ(query->GetFunctions().size(), 2);
-  const auto assertion = query->GetAssertions()[0].term.Borrow();
-  EXPECT_EQ(Applied(assertion), query->GetFunctions()[1].decl.Borrow());
+  const auto assertion = query->GetAssertions()[0].Borrow();
+  EXPECT_EQ(Applied(assertion), query->GetFunctions()[1].Borrow());
   const auto arg_sort = assertion.GetChildren()[0].GetSort();
   EXPECT_EQ(arg_sort.GetKind(), SortKind::kUninterpreted);
-  EXPECT_EQ(arg_sort.GetSortConstructor(),
-            query->GetUserSorts()[1].constructor.Borrow());
+  EXPECT_EQ(arg_sort.GetSortConstructor(), query->GetUserSorts()[1].Borrow());
   EXPECT_EQ(arg_sort.GetArguments()[0].GetSortConstructor(),
-            query->GetUserSorts()[0].constructor.Borrow());
+            query->GetUserSorts()[0].Borrow());
   EXPECT_EQ(arg_sort.GetArguments()[1].GetKind(), SortKind::kBool);
 
   const auto div = Require(Values("(div 4 0)",
@@ -280,14 +278,14 @@ TEST(FrontendProfiles, DivRankInStandaloneAssertionAndValueRequest) {
     ASSERT_EQ(term.GetChildren().size(), 2);
     const auto lhs = term.GetChildren()[0];
     const auto rhs = term.GetChildren()[1];
-    EXPECT_EQ(Applied(lhs), query.GetFunctions()[0].decl.Borrow());
+    EXPECT_EQ(Applied(lhs), query.GetFunctions()[0].Borrow());
     EXPECT_EQ(term.GetSort().GetKind(), SortKind::kInt);
     EXPECT_EQ(lhs.GetSort(), term.GetSort());
     EXPECT_EQ(rhs.GetSort(), term.GetSort());
     EXPECT_EQ(IntegerValue(rhs), "2");
   };
   ASSERT_EQ(assertion_query->GetAssertions().size(), 1);
-  const auto& root = assertion_query->GetAssertions()[0].term;
+  const auto& root = assertion_query->GetAssertions()[0];
   ASSERT_EQ(root.Borrow().GetKind(), Kind::kEqual);
   ASSERT_EQ(root.Borrow().GetChildren().size(), 2);
   check(Argument(root, 0), *assertion_query);
@@ -304,10 +302,10 @@ TEST(FrontendProfiles, DivRankInStandaloneAssertionAndValueRequest) {
   ASSERT_EQ(value_query->GetFunctions().size(), 2);
   const auto call = uf.values.at(0).term.Borrow();
   ASSERT_EQ(call.GetKind(), Kind::kApply);
-  EXPECT_EQ(Applied(call), value_query->GetFunctions()[1].decl.Borrow());
+  EXPECT_EQ(Applied(call), value_query->GetFunctions()[1].Borrow());
   ASSERT_EQ(call.GetChildren().size(), 2);
   EXPECT_EQ(Applied(call.GetChildren()[0]),
-            value_query->GetFunctions()[0].decl.Borrow());
+            value_query->GetFunctions()[0].Borrow());
   EXPECT_EQ(IntegerValue(call.GetChildren()[1]), "2");
 }
 
@@ -339,7 +337,7 @@ TEST(FrontendProfiles, RealIntNamesFollowProfileAndOrdinaryUserRanks) {
   for (std::size_t index = 0; index < calls.size(); ++index) {
     const auto term = typed.values[index].term.Borrow();
     ASSERT_EQ(term.GetKind(), Kind::kApply);
-    EXPECT_EQ(Applied(term), query->GetFunctions()[index].decl.Borrow());
+    EXPECT_EQ(Applied(term), query->GetFunctions()[index].Borrow());
     ExpectChildren(term, {typed.values[index + 2].term.Borrow()});
     EXPECT_EQ(term.GetSort().GetKind(),
               index == 0 ? SortKind::kInt : SortKind::kBool);

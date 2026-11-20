@@ -5,8 +5,42 @@
 
 import std;
 import dandelion.node;
+import dandelion.util.numeric;
+
+#include "node_test_peer.h"
 
 namespace dandelion::testing {
+
+using numeric::BitVector;
+using numeric::BitVectorView;
+using numeric::FloatingPointValue;
+using numeric::FloatingPointView;
+using numeric::FpCategory;
+using numeric::FpFormat;
+using numeric::FpSpecial;
+using numeric::Integer;
+using numeric::IntegerView;
+using numeric::NumericError;
+using numeric::NumericResult;
+using numeric::Rational;
+using numeric::RationalView;
+using numeric::RoundingMode;
+
+template <class T>
+T Take(NumericResult<T> result) {
+  if (!result) {
+    ADD_FAILURE() << "Unexpected numeric error "
+                  << static_cast<int>(result.error());
+    throw std::runtime_error("Unexpected numeric factory failure");
+  }
+  return std::move(*result);
+}
+
+template <class T>
+void Error(const NumericResult<T>& result, NumericError error) {
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error(), error);
+}
 
 template <class T>
 T Take(Result<T> result) {
@@ -51,6 +85,31 @@ void ExpectOrderedViews(const Actual& actual, const Expected& expected) {
 
 inline Integer Number(std::string_view text) {
   return Take(Integer::ParseDecimal(text));
+}
+
+inline BitVector ExactBv(std::uint32_t width, IntegerView value) {
+  return Take(BitVector::FromIntegerExact(IntegerView(width), value));
+}
+
+inline FpFormat Format(std::uint32_t exponent, std::uint32_t significand) {
+  return Take(FpFormat::Make(IntegerView(exponent), IntegerView(significand)));
+}
+
+inline FloatingPointValue FpBits(FpFormat format, IntegerView bits) {
+  return Take(FloatingPointValue::FromBits(format, bits));
+}
+
+inline FloatingPointValue SpecialFp(FpFormat format, FpSpecial special) {
+  return Take(
+      FloatingPointValue::Special(format, static_cast<FpCategory>(special)));
+}
+
+inline std::vector<NodeView> ExternalRetainChildren(NodeView first,
+                                                    NodeView last) {
+  std::vector<NodeView> children(65536, first);
+  children[32768] = last;
+  children.back() = last;
+  return children;
 }
 
 class NodeTest : public ::testing::Test {

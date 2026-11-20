@@ -1,68 +1,83 @@
 # Integer
 
-Status: **proposed extension of an existing implemented value**. The current
-parse, ownership and view contracts are specified by [node design](../node/design.md#5-exact-values);
-the general arithmetic below is design. The frontend bridge adds checked
-`ParseRadix` for unsigned base-2 and base-16 digits and checked `Negate`.
-Both return owning, exact integers.
+**Status.** The standalone value and arithmetic are implemented in Phase 3.
 
-## Value, interface and algorithms
+## Representation and ownership
 
-`Integer` denotes exactly one member of Z. The selected baseline retains the
-current canonical small `int64_t` or owned GMP `mpz_t` representation: any
-value in the signed 64-bit range is small, including `INT64_MIN`; all others
-are big. Normalize back to small after every operation. This is an internal
-strategy, not a stable ABI. Comparisons, equality, sign, magnitude bit length
-(`0` has length zero), little-endian 64-bit magnitude chunks, hash, decimal
-output, narrowing and borrowing preserve the existing view semantics. Decimal
-parsing accepts optional `-` and digits only; no `+`, whitespace, or empty
-digits. Decimal output is canonical. Other bases for BV input belong to a
-checked digit decoder, not to an undocumented expansion of this grammar.
+`Integer` denotes an exact element of Z. On the supported 64-bit target it
+uses two words (16 bytes), an `int64_t` and an exclusive `BigInteger*`.
+A null pointer selects the inline word and covers the full signed range,
+including `INT64_MIN`. A non-null pointer owns an opaque holder for one
+`mpz_t` outside the signed range. The selected layout needs neither pointer
+tagging nor a reserved signed-word value.
 
-| Operation | Inputs and output | Conditions and meaning |
-| --- | --- | --- |
-| Negate, absolute, add, subtract, multiply | Integers -> exact Integer | Never wrap. Checked signed fast paths fall back to GMP on overflow. Negating/absolute `INT64_MIN` produces `2^63`. |
-| Compare and sign, parity, bit length and magnitude chunks | Integer -> order, predicate or unsigned chunks | Inspect magnitude safely without signed negation of `INT64_MIN`; out-of-range chunk is zero. |
-| GCD and LCM | Integers -> nonnegative Integer | `gcd(0,0)=0`, `lcm(0,x)=0`; exact; useful for Rational normalization and integer algorithms. |
-| Euclidean `DivMod` | `(a,b)` -> `(q,r)`, `b != 0` | `a=b*q+r`, `0 <= r < abs(b)`; div and mod use the same pair. A checked external call rejects zero; internal nonzero precondition is established by caller. |
-| Exact quotient, divisibility | Integers -> Integer or Bool | Exact quotient requires a nonzero divisor and zero remainder. SMT `(_ divisible n)` has positive `n`; test remainder zero. |
-| Power | `(base, exponent: Integer)` -> Integer or resource outcome | Implements the selected `**` semantics below, not a narrowed machine exponent. |
-| Checked import/narrowing | Signed/unsigned machine values or exact digits -> Integer; Integer -> optional machine value | No silent conversion of a negative value to unsigned, or truncation of a large value. Provide unsigned-64 construction without assuming it fits signed 64. |
+Compute into a private temporary. If the result fits a signed word, return
+it inline and clear any temporary limbs. Otherwise allocate the holder and
+transfer the owning GMP buffer using `mpz_swap` with an initialized
+`mpz_t`. Clear the remaining temporary on every path. Apply the same
+canonicalization to each output of a multi-result operation. Copy duplicates
+wide storage, move transfers it, and zero is the allocation-free reset.
+[Shared ownership and failures](design.md)
 
-For nonzero `b`, compute a truncating quotient/remainder then, when `r < 0`,
-set `r += abs(b)` and `q -= sign(b)`, using exact intermediates; an equivalent
-GMP floor/ceiling implementation is acceptable if it meets this contract.
-For example `(-7,3) -> (-3,2)`, `(7,-3) -> (-2,1)`,
-`(-7,-3) -> (3,2)`. Avoid C++ `INT64_MIN / -1` and any signed overflow before
-dispatching. The SMT terms `(div a 0)` and `(mod a 0)` are well-sorted,
-underspecified total functions; they are not calls to `DivMod`, and distinct
-occurrences with equal semantic arguments must have consistent interpretations.
+For a word operand, put its unsigned magnitude in a native GMP limb on the
+stack. Packed operands already have aligned 64-bit limbs. Both forms use
+a read-only GMP descriptor from `mpz_roinit_n` for the duration of the
+call. Owned wide operands borrow their existing GMP input. The bridge also
+handles rational components. Compute the signed minimum's magnitude in
+unsigned arithmetic.
+[GMP special integer functions](https://gmplib.org/manual/Integer-Special-Functions)
 
-For `n >= 0`, `Power(m,n)` is exact exponentiation by squaring and `0^0=1`.
-For `n < 0`: base 0 gives 0, bases 1 and -1 give 1 and the parity-selected
-sign respectively, all `abs(m)>1` give 0. For nonnegative arbitrarily large
-`n`, short-circuit 0, 1 and -1 before estimating size; for other bases use
-exact arithmetic and check actual representation and size calculations when
-needed. Do not impose a work or intermediate-size quota. Never narrow the
-exponent without proof it fits and
-never claim a resource error proves a formula. The catalog excludes `**`
-from `QF_NIA`, but Dandelion's proposed compatibility profile accepts it
-when the full Ints signature is active, including under `QF_NIA`; see
-[Ints 2026-01-16](https://smt-lib.org/theories-Ints.shtml) and
-[frontend logic profiles](../frontend/logic-profile.md).
+## Construction, inspection, and arithmetic
 
-Copy, move, borrowing, allocation and GMP OOM follow [design.md](design.md).
-The current numeric API already tests canonical small storage, `INT64_MIN`,
-exact large values, ownership, failed assignment and moved-from zero; retain
-those contracts during migration.
+| Operation | Contract |
+| --- | --- |
+| Signed and unsigned word construction | Any `int64_t` is inline, including zero. Checked unsigned construction promotes above `INT64_MAX`. |
+| `ParseDecimal`, `ParseRadix` | Decimal accepts an optional minus and at least one ASCII digit. The unsigned radix form accepts nonempty base-2 or base-16 digit sequences, with either hex case. Leading zeros are valid. Signs in the unsigned form, prefixes, whitespace, and invalid digits give `kInvalidText`. An unsupported radix gives `kInvalidArgument`. |
+| Sign, equality, comparison, parity, bit length, magnitude chunks, hash, narrowing | Exact and nonallocating. Sign and comparison give negative, zero, or positive. Zero has bit length zero. Chunks are 64-bit magnitude words in least-significant-first order, and out-of-range chunks are zero. `TryInt64`, `TryUint64`, and `TryUint32` return empty outside their ranges. `IsSmall` describes signed-word fit and `BackingBytes` reports significant owned backing where applicable. |
+| Borrow, copy, and decimal output | Views can contain a signed or unsigned word or borrow read-only wide storage. Decimal output is canonical, with no leading zeros and zero rendered as `0`. |
+| `+`, binary `-`, `*`, unary `-`, `Abs` | Exact results. Check machine overflow before dispatching to wider arithmetic. Negation or absolute value of `INT64_MIN` gives `2^63`. |
+| `Gcd`, `Lcm` | Nonnegative. `Gcd(0,0)=0` and `Lcm(0,x)=0`. |
+| `DivMod(a,b)` | For nonzero `b`, return the unique `(q,r)` with `a=b*q+r` and `0 <= r < abs(b)`. |
+| `ExactDiv(a,b)`, `IsDivisible(a,b)` | For nonzero `b`, divide exactly or test for zero remainder. `ExactDiv` returns `kInvalidArgument` for nonzero remainder. Signed divisors are accepted by the numeric API. The SMT indexed predicate has a positive divisor. |
+| `Power(base, exponent)` | Exact SMT-LIB Ints power with an arbitrary Integer exponent, as specified below. |
 
-## Cost and unresolved measurements
+`DivMod`, `ExactDiv`, and `IsDivisible` report `kDivisionByZero` at
+zero divisor. A GMP implementation can use floor division for a positive
+divisor and ceiling division for a negative one. With a truncating pair,
+adjust a negative remainder by adding `abs(b)` and subtracting `sign(b)`
+from the quotient. In particular `(-7,3)` gives `(-3,2)`, `(7,-3)`
+gives `(-2,1)`, and `(-7,-3)` gives `(3,2)`. Handle
+`INT64_MIN / -1` before invoking machine division or remainder.
+Use a checked divisibility test before calling the GMP exact-quotient
+primitive.
 
-Machine fast paths avoid GMP arithmetic when all checked intermediates fit;
-big operations use GMP's input-size-dependent algorithms and allocations.
-Small/big transitions, copying, normalized result size, parsing and hashing
-costs, and frequency of such paths in integer solving are unmeasured. A
-two-word tagged representation, reference sharing or inline limbs might save
-space or allocations but add ownership or portability costs; none is chosen
-without real measurements. GMP's `mp_bitcnt_t`, `size_t` and allocation limits
-must be checked before narrowing a requested shift or allocation.
+For `n >= 0`, `Power(m,n)` is exact and `0^0=1`. For `n < 0`,
+return zero for `m=0` or `abs(m)>1`, one for `m=1`, and the
+parity-selected sign for `m=-1`. Handle the exponent-zero and base
+`0, 1, -1` cases before interpreting exponent magnitude as a size.
+Otherwise for positive `n`, compare a proven minimum result bit length
+`n * (bit_length(abs(m)) - 1) + 1` to actual capacity using exact
+arithmetic or division against the capacity bound. Use exponentiation by
+squaring over exponent bits, skipping the final unused square. Guard each
+required product and normalize the final value. The exponent is narrowed
+only after a proof of fit. [SMT-LIB Ints, 2026-01-16](https://smt-lib.org/theories-Ints.shtml)
+
+## Fast paths and capacity
+
+Use `__builtin_add_overflow`, `__builtin_sub_overflow`, and
+`__builtin_mul_overflow` or exact `__int128` intermediates on the supported
+GCC and Clang targets. Keep signed-minimum cases in unsigned magnitudes or
+wide intermediates. GCD operates on unsigned magnitudes and LCM divides out
+the GCD before multiplying. Use exact comparison of signs and magnitudes
+across representations. No operand is interpreted through the host
+`unsigned long` width.
+
+Validate the entire text grammar before converting. Ignore leading zeros
+when checking the magnitude. Accumulate digits in checked machine chunks
+and extend into GMP only when the value requires it. Check GMP's actual
+result and working counts before calls that can grow storage. Near those
+limits, use the operation's proven required count or capacity-safe limb
+steps rather than rejecting on an imprecise bound. For operations with a
+non-word result, wrapper allocation remains recoverable even after GMP
+produces a temporary. The temporary's limbs are cleared if the holder
+cannot be allocated.

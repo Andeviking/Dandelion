@@ -1,5 +1,7 @@
 #include "test_support.h"
 
+#include "../node/node_test_peer.h"
+
 namespace dandelion::frontend::testing {
 namespace {
 
@@ -8,7 +10,7 @@ TEST(FrontendBindings, SimultaneousLetAndLexicalRestoration) {
       Parse("(set-logic ALL)(declare-const x Int)"
             "(assert (let ((x 1)) (and (let ((x 2) (y x)) (= x y)) (= x 1))))"
             "(assert (= x 3))(check-sat)"));
-  const auto conjunction = query->GetAssertions()[0].term.Borrow();
+  const auto conjunction = query->GetAssertions()[0].Borrow();
   ASSERT_EQ(conjunction.GetKind(), Kind::kAnd);
   const auto inner = conjunction.GetChildren()[0].GetChildren();
   EXPECT_EQ(IntegerValue(inner[0]), "2");
@@ -16,8 +18,8 @@ TEST(FrontendBindings, SimultaneousLetAndLexicalRestoration) {
   const auto outside = conjunction.GetChildren()[1].GetChildren();
   EXPECT_EQ(outside[0], inner[1]);
   EXPECT_EQ(outside[0], outside[1]);
-  EXPECT_EQ(Applied(Argument(query->GetAssertions()[1].term, 0)),
-            query->GetFunctions()[0].decl.Borrow());
+  EXPECT_EQ(Applied(Argument(query->GetAssertions()[1], 0)),
+            query->GetFunctions()[0].Borrow());
   for (auto input : {"(let ((x 1) (y x)) y)", "(let ((x 1) (|x| 2)) x)",
                      "(let ((true false)) true)", "(let ((x 1)) (as x Int))",
                      "(let ((f false)) (f 1))", "|@hidden|", ".hidden",
@@ -44,35 +46,32 @@ TEST(FrontendBindings,
         "(assert (let ((g 5)) (= (h g) n)))(check-sat)";
     query = RequireQuery(Parse(input));
   }
-  ASSERT_EQ(query->GetDefinitions().size(), 3);
+  ASSERT_EQ(query->GetDefinitionCount(), 2);
   ASSERT_EQ(query->GetFunctions().size(), 1);
-  const auto& f = query->GetDefinitions()[0];
-  const auto& h = query->GetDefinitions()[1];
-  const auto& n = query->GetDefinitions()[2];
+  const auto& f = query->GetDefinition(0);
+  const auto& h = query->GetDefinition(1);
   ASSERT_EQ(f.formals.size(), 2);
   ASSERT_EQ(h.formals.size(), 1);
   EXPECT_NE(f.formals[0], h.formals[0]);
   EXPECT_EQ(f.formals[0].Borrow().GetKind(), DeclKind::kFormal);
   EXPECT_EQ(f.decl.Borrow().GetKind(), DeclKind::kInternalFunction);
   EXPECT_EQ(f.body.Borrow().GetKind(), Kind::kIntAdd);
-  EXPECT_EQ(Applied(Argument(f.body, 0)),
-            query->GetFunctions()[0].decl.Borrow());
+  EXPECT_EQ(Applied(Argument(f.body, 0)), query->GetFunctions()[0].Borrow());
   EXPECT_EQ(Applied(Argument(f.body, 1)), f.formals[0].Borrow());
   EXPECT_EQ(Argument(f.body, 1), Argument(f.body, 2));
   EXPECT_EQ(Applied(h.body.Borrow()), f.decl.Borrow());
   EXPECT_EQ(Applied(Argument(h.body, 0)), h.formals[0].Borrow());
   EXPECT_EQ(Argument(h.body, 1).GetValue()->GetBool(), true);
-  EXPECT_EQ(Applied(n.body.Borrow()), h.decl.Borrow());
-  const auto root = query->GetAssertions()[0].term.Borrow();
+  const auto root = query->GetAssertions()[0].Borrow();
   ASSERT_EQ(root.GetChildren().size(), 2);
   const auto actual = root.GetChildren()[0];
   EXPECT_EQ(query->FindDefinition(Applied(actual)), &h);
   EXPECT_EQ(IntegerValue(actual.GetChildren()[0]), "5");
-  EXPECT_EQ(Applied(root.GetChildren()[1]), n.decl.Borrow());
-  EXPECT_TRUE(root.GetChildren()[1].GetChildren().empty());
-  auto other =
-      RequireQuery(Parse("(set-logic ALL)(define-const f Int 0)(check-sat)"));
-  EXPECT_EQ(query->FindDefinition(other->GetDefinitions()[0].decl.Borrow()),
+  EXPECT_EQ(Applied(root.GetChildren()[1]), h.decl.Borrow());
+  EXPECT_EQ(IntegerValue(root.GetChildren()[1].GetChildren()[0]), "3");
+  auto other = RequireQuery(
+      Parse("(set-logic ALL)(define-fun f ((x Int)) Int x)(check-sat)"));
+  EXPECT_EQ(query->FindDefinition(other->GetDefinition(0).decl.Borrow()),
             nullptr);
 
   for (auto input :
@@ -117,13 +116,13 @@ TEST(FrontendBindings, WrittenDefinitionGraphDoesNotExpandCalls) {
       while (auto command = Require(Next(session)))
         if (command->query) query = command->query;
       ASSERT_TRUE(query);
-      EXPECT_EQ(query->GetDefinitions().size(),
+      EXPECT_EQ(query->GetDefinitionCount(),
                 static_cast<std::size_t>(depth + 1));
       const auto stats = session.GetStats();
       EXPECT_EQ(stats.definition_bodies, static_cast<std::size_t>(depth + 1));
       EXPECT_EQ(stats.defined_calls,
                 static_cast<std::size_t>(2 * depth + used));
-      const auto& last = query->GetDefinitions().back();
+      const auto& last = query->GetDefinition(query->GetDefinitionCount() - 1);
       EXPECT_EQ(Applied(last.body.Borrow()).GetNameHint(),
                 "f" + std::to_string(depth - 1));
       EXPECT_EQ(Applied(Argument(last.body, 0)), Applied(last.body.Borrow()));
@@ -136,17 +135,17 @@ TEST(FrontendBindings, WrittenDefinitionGraphDoesNotExpandCalls) {
                          "(define-fun keep ((t Int) (discard Int)) Int (f t))"
                          "(assert (= (f (+ x 1)) 4))(assert (= (f x) 2))"
                          "(assert (= (keep x (* x x)) 2))(check-sat)"));
-  const auto left = Argument(q->GetAssertions()[0].term, 0);
-  const auto right = Argument(q->GetAssertions()[1].term, 0);
+  const auto left = Argument(q->GetAssertions()[0], 0);
+  const auto right = Argument(q->GetAssertions()[1], 0);
   EXPECT_EQ(Applied(left), Applied(right));
   EXPECT_EQ(left.GetChildren()[0].GetKind(), Kind::kIntAdd);
-  EXPECT_EQ(Applied(right.GetChildren()[0]),
-            q->GetFunctions()[0].decl.Borrow());
-  EXPECT_EQ(Argument(q->GetAssertions()[2].term, 0).GetChildren()[1].GetKind(),
+  EXPECT_EQ(Applied(right.GetChildren()[0]), q->GetFunctions()[0].Borrow());
+  EXPECT_EQ(Argument(q->GetAssertions()[2], 0).GetChildren()[1].GetKind(),
             Kind::kIntMul);
 }
 
 TEST(FrontendNames, PostorderPublicationClosureAndMetadata) {
+  SourceRecords records;
   const auto query = RequireQuery(Parse(
       "(set-logic ALL)(declare-const a Int)"
       "(assert (= (! 1 :source (x \"\" :keyword) :informative :named one) one))"
@@ -155,15 +154,16 @@ TEST(FrontendNames, PostorderPublicationClosureAndMetadata) {
       "(assert (= (let ((one 3)) one) 3))"
       "(define-const f Int (! 5 :named five))(assert (= (let ((u f)) u) five))"
       "(assert (= (! (let ((a 2)) (+ a a)) :named four) four))"
-      "(check-sat)"));
-  ASSERT_EQ(query->GetNamedTerms().size(), 4);
-  EXPECT_EQ(query->GetNamedTerms()[0].name, "one");
-  EXPECT_EQ(IntegerValue(query->GetNamedTerms()[1].term.Borrow()), "0");
-  EXPECT_EQ(query->GetNamedTerms()[2].name, "five");
-  EXPECT_EQ(query->GetNamedTerms()[3].term.Borrow().GetKind(), Kind::kIntAdd);
-  EXPECT_EQ(Argument(query->GetAssertions()[0].term, 0),
-            Argument(query->GetAssertions()[0].term, 1));
-  const auto& metadata = query->GetAnnotations()[0].attributes;
+      "(check-sat)",
+      &records));
+  ASSERT_EQ(records.named_terms.size(), 4);
+  EXPECT_EQ(records.named_terms[0].name, "one");
+  EXPECT_EQ(IntegerValue(records.named_terms[1].term.Borrow()), "0");
+  EXPECT_EQ(records.named_terms[2].name, "five");
+  EXPECT_EQ(records.named_terms[3].term.Borrow().GetKind(), Kind::kIntAdd);
+  EXPECT_EQ(Argument(query->GetAssertions()[0], 0),
+            Argument(query->GetAssertions()[0], 1));
+  const auto& metadata = records.annotations[0].attributes;
   ASSERT_EQ(metadata.size(), 3);
   EXPECT_EQ(metadata[0].value, "(x \"\" :keyword)");
   EXPECT_FALSE(metadata[1].value);
@@ -195,7 +195,7 @@ TEST(FrontendNames, PostorderPublicationClosureAndMetadata) {
       Parse("(set-logic ALL)(declare-datatype D ((c (val Int))(d)))"
             "(assert (= (! (match (c 1) (((c v) v) (_ 0))) :named n) n))"
             "(check-sat)"));
-  EXPECT_EQ(closed->GetNamedTerms()[0].term.Borrow().GetKind(), Kind::kIte);
+  EXPECT_EQ(Argument(closed->GetAssertions()[0], 0).GetKind(), Kind::kIte);
 }
 
 TEST(FrontendNames, ClosureReusesCheckedOccurrencesAndAliasesRollBack) {
@@ -206,44 +206,50 @@ TEST(FrontendNames, ClosureReusesCheckedOccurrencesAndAliasesRollBack) {
   for (int i = 0; i < kDepth; ++i)
     input += " :named n" + std::to_string(i) + ")";
   input += " n0))(check-sat)";
-  auto session = Require(Session::FromText(input));
+  auto session = Require(
+      Session::FromText(input, ParseOptions{.capture_source_records = true}));
   Require(Next(session));
   Require(Next(session));
   EXPECT_EQ(session.GetStats().closure_visits,
             static_cast<std::size_t>(kDepth));
-  EXPECT_EQ(RequireCheck(session)->GetNamedTerms().size(),
+  RequireCheck(session);
+  EXPECT_EQ(session.GetSourceRecords()->named_terms.size(),
             static_cast<std::size_t>(kDepth));
 
   auto retry = Require(Session::FromText(
       "(set-logic ALL)(assert (! true :named good))"
       "(assert (and (! true :named first) (! false :named second) 9))"
       "(assert (and good (! true :named first) (! false :named second)))"
-      "(check-sat)"));
+      "(check-sat)",
+      ParseOptions{.capture_source_records = true}));
   Require(Next(retry));
   Require(Next(retry));
   ExpectError(Next(retry), DiagnosticCode::kInvalidInput);
-  ASSERT_EQ(retry.GetPrefix().GetNamedTerms().size(), 1);
-  ASSERT_EQ(retry.GetPrefix().GetAnnotations().size(), 1);
+  ASSERT_EQ(retry.GetSourceRecords()->named_terms.size(), 1);
+  ASSERT_EQ(retry.GetSourceRecords()->annotations.size(), 1);
   ASSERT_EQ(retry.GetPrefix().GetAssertions().size(), 1);
   Require(Next(retry));
-  EXPECT_EQ(Require(Next(retry))->query->GetNamedTerms().size(), 3);
+  RequireCheck(retry);
+  EXPECT_EQ(retry.GetSourceRecords()->named_terms.size(), 3);
 
   std::size_t failures = 0;
   for (std::size_t checkpoint = 0; checkpoint < 64; ++checkpoint) {
     auto allocation = Require(Session::FromText(
         "(set-logic ALL)(assert (and (! true :named a) (! false :named b)))"
-        "(assert (and (! true :named a) (! false :named b)))(check-sat)"));
+        "(assert (and (! true :named a) (! false :named b)))(check-sat)",
+        ParseOptions{.capture_source_records = true}));
     Require(Next(allocation));
     allocation.FailAllocationAfter(checkpoint);
     const auto attempt = Next(allocation);
     if (attempt) break;
     ++failures;
     ExpectError(attempt, DiagnosticCode::kResource);
-    EXPECT_TRUE(allocation.GetPrefix().GetNamedTerms().empty());
-    EXPECT_TRUE(allocation.GetPrefix().GetAnnotations().empty());
+    EXPECT_TRUE(allocation.GetSourceRecords()->named_terms.empty());
+    EXPECT_TRUE(allocation.GetSourceRecords()->annotations.empty());
     EXPECT_TRUE(allocation.GetPrefix().GetAssertions().empty());
     Require(Next(allocation));
-    EXPECT_EQ(Require(Next(allocation))->query->GetNamedTerms().size(), 2);
+    RequireCheck(allocation);
+    EXPECT_EQ(allocation.GetSourceRecords()->named_terms.size(), 2);
   }
   EXPECT_GE(failures, 3);
 }
@@ -257,17 +263,17 @@ TEST(FrontendScale, DeepTermsWideDistinctAndLargeExactNumeral) {
   for (std::size_t i = 0; i < 4096; ++i) script += " " + std::to_string(i);
   script += "))(assert (= 1" + std::string(4096, '0') + " 0))(check-sat)";
   auto query = RequireQuery(Parse(script));
-  auto node = query->GetAssertions()[0].term.Borrow();
+  auto node = query->GetAssertions()[0].Borrow();
   for (std::size_t i = 0; i < kDepth; ++i) {
     ASSERT_EQ(node.GetKind(), Kind::kNot);
     node = node.GetChildren()[0];
   }
   EXPECT_EQ(node.GetValue()->GetBool(), false);
-  const auto wide = query->GetAssertions()[1].term.Borrow();
+  const auto wide = query->GetAssertions()[1].Borrow();
   EXPECT_EQ(wide.GetKind(), Kind::kDistinct);
   ASSERT_EQ(wide.GetChildren().size(), 4096);
   EXPECT_EQ(IntegerValue(wide.GetChildren()[4095]), "4095");
-  EXPECT_EQ(IntegerValue(Argument(query->GetAssertions()[2].term, 0)),
+  EXPECT_EQ(IntegerValue(Argument(query->GetAssertions()[2], 0)),
             "1" + std::string(4096, '0'));
   query.reset();
   auto malformed = script;
@@ -281,7 +287,8 @@ TEST(FrontendNames, RetainFailuresPreservePublishedPrefixAndAllowRetry) {
     auto session = Require(Session::FromText(
         "(set-logic ALL)(assert (! true :named good))"
         "(assert (and (! good :named a) (! good :named b)))"
-        "(assert (and (! good :named a) (! good :named b)))(check-sat)"));
+        "(assert (and (! good :named a) (! good :named b)))(check-sat)",
+        ParseOptions{.capture_source_records = true}));
     Require(Next(session));
     Require(Next(session));
     auto manager =
@@ -295,14 +302,14 @@ TEST(FrontendNames, RetainFailuresPreservePublishedPrefixAndAllowRetry) {
     ASSERT_TRUE(attempt.error().node_error);
     EXPECT_EQ(attempt.error().node_error->resource,
               ResourceKind::kReferenceCount);
-    EXPECT_EQ(session.GetPrefix().GetNamedTerms().size(), 1);
-    EXPECT_EQ(session.GetPrefix().GetAnnotations().size(), 1);
+    EXPECT_EQ(session.GetSourceRecords()->named_terms.size(), 1);
+    EXPECT_EQ(session.GetSourceRecords()->annotations.size(), 1);
     EXPECT_EQ(session.GetPrefix().GetAssertions().size(), 1);
     Require(Next(session));
-    const auto context = RequireCheck(session);
-    EXPECT_EQ(context->GetNamedTerms().size(), 3);
-    EXPECT_EQ(context->GetNamedTerms()[2].term,
-              context->GetNamedTerms()[0].term);
+    RequireCheck(session);
+    EXPECT_EQ(session.GetSourceRecords()->named_terms.size(), 3);
+    EXPECT_EQ(session.GetSourceRecords()->named_terms[2].term,
+              session.GetSourceRecords()->named_terms[0].term);
   }
   EXPECT_GE(failures, 4);
 }
@@ -311,15 +318,16 @@ TEST(FrontendNames, LetRhsNamesAndClosureFollowSourceOrder) {
   constexpr std::string_view input =
       "(assert (let ((x (! 1 :named n)) (y n)) (= x y)))";
   SCOPED_TRACE(::testing::Message() << "FE-LET-NAME-02 " << input);
+  SourceRecords records;
   const auto query = RequireQuery(
-      Parse("(set-logic ALL)" + std::string(input) + "(check-sat)"));
-  ASSERT_EQ(query->GetNamedTerms().size(), 1);
-  ASSERT_EQ(query->GetAnnotations().size(), 1);
+      Parse("(set-logic ALL)" + std::string(input) + "(check-sat)", &records));
+  ASSERT_EQ(records.named_terms.size(), 1);
+  ASSERT_EQ(records.annotations.size(), 1);
   ASSERT_EQ(query->GetAssertions().size(), 1);
-  const auto& name = query->GetNamedTerms()[0];
+  const auto& name = records.named_terms[0];
   EXPECT_EQ(name.name, "n");
   EXPECT_EQ(IntegerValue(name.term.Borrow()), "1");
-  ExpectChildren(query->GetAssertions()[0].term.Borrow(),
+  ExpectChildren(query->GetAssertions()[0].Borrow(),
                  {name.term.Borrow(), name.term.Borrow()});
   ExpectError(Parse("(set-logic ALL)"
                     "(assert (let ((y n) (x (! 1 :named n))) (= x y)))"),
@@ -335,27 +343,27 @@ TEST(FrontendNames, LetRhsNamesAndClosureFollowSourceOrder) {
     script += closed_first ? open : closed;
     script += "(assert (= open 1))(assert (= closed 1))(check-sat)";
     SCOPED_TRACE(script);
-    auto session = Require(Session::FromText(script));
+    auto session = Require(Session::FromText(
+        script, ParseOptions{.capture_source_records = true}));
     RequireNext(session, CommandKind::kSetLogic);
     RequireNext(session, CommandKind::kAssert);
     ASSERT_EQ(session.GetPrefix().GetAssertions().size(), 1);
-    const auto shared =
-        Argument(session.GetPrefix().GetAssertions()[0].term, 0);
+    const auto shared = Argument(session.GetPrefix().GetAssertions()[0], 0);
     if (closed_first) RequireNext(session, CommandKind::kAssert);
     ExpectError(Next(session), DiagnosticCode::kInvalidInput);
-    EXPECT_EQ(session.GetPrefix().GetNamedTerms().size(),
+    EXPECT_EQ(session.GetSourceRecords()->named_terms.size(),
               closed_first ? 1u : 0u);
-    EXPECT_EQ(session.GetPrefix().GetAnnotations().size(),
+    EXPECT_EQ(session.GetSourceRecords()->annotations.size(),
               closed_first ? 1u : 0u);
     if (!closed_first) RequireNext(session, CommandKind::kAssert);
     ExpectError(Next(session), DiagnosticCode::kInvalidInput);
     RequireNext(session, CommandKind::kAssert);
     const auto sealed = RequireCheck(session);
-    ASSERT_EQ(sealed->GetNamedTerms().size(), 1);
-    EXPECT_EQ(sealed->GetNamedTerms()[0].name, "closed");
-    EXPECT_EQ(sealed->GetNamedTerms()[0].term.Borrow(), shared);
-    ASSERT_EQ(sealed->GetAnnotations().size(), 1);
-    EXPECT_EQ(sealed->GetAnnotations()[0].term.Borrow(), shared);
+    ASSERT_EQ(session.GetSourceRecords()->named_terms.size(), 1);
+    EXPECT_EQ(session.GetSourceRecords()->named_terms[0].name, "closed");
+    EXPECT_EQ(session.GetSourceRecords()->named_terms[0].term.Borrow(), shared);
+    ASSERT_EQ(session.GetSourceRecords()->annotations.size(), 1);
+    EXPECT_EQ(session.GetSourceRecords()->annotations[0].term.Borrow(), shared);
     EXPECT_EQ(sealed->GetAssertions().size(), 3);
   }
 }
@@ -374,8 +382,8 @@ TEST(FrontendBindings, DefinitionCallsKeepActualsInEitherAssertionOrder) {
     const auto query = RequireQuery(Parse(script));
     ASSERT_EQ(query->GetAssertions().size(), 2);
     ASSERT_EQ(query->GetFunctions().size(), 1);
-    ASSERT_EQ(query->GetDefinitions().size(), 1);
-    const auto& definition = query->GetDefinitions()[0];
+    ASSERT_EQ(query->GetDefinitionCount(), 1);
+    const auto& definition = query->GetDefinition(0);
     const auto body = definition.body.Borrow();
     ASSERT_EQ(body.GetKind(), Kind::kIntMul);
     ASSERT_EQ(body.GetChildren().size(), 2);
@@ -383,15 +391,15 @@ TEST(FrontendBindings, DefinitionCallsKeepActualsInEitherAssertionOrder) {
     const auto coefficient = IntegerValue(body.GetChildren()[0]);
     EXPECT_EQ(coefficient, "2");
     EXPECT_EQ(Applied(body.GetChildren()[1]), definition.formals[0].Borrow());
-    const auto x = query->GetFunctions()[0].decl.Borrow();
+    const auto x = query->GetFunctions()[0].Borrow();
     for (std::size_t index = 0; index < 2; ++index) {
       const bool incremented = (index == 1) != reversed;
-      const auto root = query->GetAssertions()[index].term.Borrow();
+      const auto root = query->GetAssertions()[index].Borrow();
       ASSERT_EQ(root.GetKind(), Kind::kEqual);
       ASSERT_EQ(root.GetChildren().size(), 2);
       const auto call = root.GetChildren()[0];
       ASSERT_EQ(call.GetKind(), Kind::kApply);
-      EXPECT_EQ(call.GetDeclaration(), definition.instance.Borrow());
+      EXPECT_EQ(Applied(call), definition.decl.Borrow());
       EXPECT_EQ(query->FindDefinition(Applied(call)), &definition);
       ASSERT_EQ(call.GetChildren().size(), 1);
       const auto actual = call.GetChildren()[0];
@@ -424,29 +432,30 @@ TEST(FrontendNames, LaterInvalidAnnotationRollsBackEarlierStagedName) {
       " (let ((x true)) (! (! true :named inside) :tag outer))))"
       "(assert (and staged inside))(check-sat)";
   SCOPED_TRACE(::testing::Message() << "FE-ROLLBACK-NAME-02 " << script);
-  auto session = Require(Session::FromText(script));
+  auto session = Require(
+      Session::FromText(script, ParseOptions{.capture_source_records = true}));
   RequireNext(session, CommandKind::kSetLogic);
   RequireNext(session, CommandKind::kAssert);
-  const auto prior = session.GetPrefix().GetAssertions()[0].term;
+  const auto prior = session.GetPrefix().GetAssertions()[0];
   for (int i = 0; i < 3; ++i) {
     ExpectError(Next(session), DiagnosticCode::kInvalidInput);
     const auto& prefix = session.GetPrefix();
     ASSERT_EQ(prefix.GetAssertions().size(), 1);
-    EXPECT_EQ(prefix.GetAssertions()[0].term, prior);
-    ASSERT_EQ(prefix.GetNamedTerms().size(), 1);
-    EXPECT_EQ(prefix.GetNamedTerms()[0].name, "prior");
-    ASSERT_EQ(prefix.GetAnnotations().size(), 1);
-    EXPECT_EQ(prefix.GetAnnotations()[0].term, prior);
+    EXPECT_EQ(prefix.GetAssertions()[0], prior);
+    ASSERT_EQ(session.GetSourceRecords()->named_terms.size(), 1);
+    EXPECT_EQ(session.GetSourceRecords()->named_terms[0].name, "prior");
+    ASSERT_EQ(session.GetSourceRecords()->annotations.size(), 1);
+    EXPECT_EQ(session.GetSourceRecords()->annotations[0].term, prior);
   }
   RequireNext(session, CommandKind::kAssert);
   RequireNext(session, CommandKind::kAssert);
   const auto query = RequireCheck(session);
-  const auto names = query->GetNamedTerms();
+  const auto names = session.GetSourceRecords()->named_terms;
   ASSERT_EQ(names.size(), 3);
   EXPECT_EQ(names[0].name, "prior");
   EXPECT_EQ(names[1].name, "staged");
   EXPECT_EQ(names[2].name, "inside");
-  const auto annotations = query->GetAnnotations();
+  const auto annotations = session.GetSourceRecords()->annotations;
   ASSERT_EQ(annotations.size(), 4);
   ASSERT_EQ(annotations[1].attributes.size(), 1);
   ASSERT_EQ(annotations[2].attributes.size(), 1);
@@ -455,8 +464,8 @@ TEST(FrontendNames, LaterInvalidAnnotationRollsBackEarlierStagedName) {
   EXPECT_EQ(annotations[2].attributes[0].value, "inside");
   EXPECT_EQ(annotations[3].attributes[0].value, "outer");
   ASSERT_EQ(query->GetAssertions().size(), 3);
-  EXPECT_EQ(query->GetAssertions()[0].term, prior);
-  ExpectChildren(query->GetAssertions()[2].term.Borrow(),
+  EXPECT_EQ(query->GetAssertions()[0], prior);
+  ExpectChildren(query->GetAssertions()[2].Borrow(),
                  {names[1].term.Borrow(), names[2].term.Borrow()});
 }
 

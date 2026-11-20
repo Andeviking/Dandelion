@@ -1,7 +1,9 @@
 # Frontend Logic and Input Profiles
 
-**Status: implemented frontend profile.** The [acceptance record](implementation.md)
-reports the tested corpus slice. This document defines the input profile
+**Status.** The signature registry, metadata rules and definition bindings
+are implemented. The [acceptance record](implementation.md) reports
+verification and the earlier tested corpus slice.
+This document defines the input profile
 for the project scope. It records intentional compatibility extensions rather
 than claiming complete conformance to each registered logic or support for
 every benchmark bearing its name.
@@ -22,6 +24,8 @@ ways:
 - Admit Bool constants under `QF_BV` and other constant-only profiles. Free
   sort and nonconstant function declarations follow the permission in the
   registry below, rather than being admitted under every label.
+- Reduce decimal indexed BV literals `(_ bvN w)` modulo `2^w` at the
+  frontend boundary. The typed value passed to Node fits its declared width.
 - Admit every selected, well-sorted integer operation from an active Ints
   signature in assertions and value requests. Do not reject an expression
   merely because it does not have the catalog's IDL, linear or nonlinear
@@ -68,6 +72,37 @@ binding, the documented closed grammar decodes the operand as an exact
 Rational, including when a supported arithmetic rank is active. Quoted and
 unquoted forms share the same dequoted identifier. This rule neither enables
 general Real terms nor promotes an inactive operator to a builtin.
+
+The [Phase 2 reader](design.md#reduction-of-special-forms) carries
+this identity check through every nested candidate head as it reads the
+operand. Only the complete two-operand indexed form with an eligible
+closed expression selects exact rational evaluation. Other shapes use
+ordinary term admission, including bound `-` and `/`. A selected
+rational divisor that evaluates to zero is explicitly unsupported, with
+the half-open span of the entire divisor expression.
+
+## Metadata
+
+Every `set-info` validates standard attribute syntax with one keyword and
+at most one attribute value. The recognized keys have these value rules.
+
+| Key | Admitted value |
+| --- | --- |
+| `:smt-lib-version` | The exact decimal tokens `2.6` and `2.7`. Another well-formed decimal is unsupported. A missing value or a different token class is invalid. |
+| `:source` | A string or quoted symbol. |
+| `:category` | Any string, including `"check"`, by default. With `ParseOptions::strict_metadata` enabled, only `"crafted"`, `"random"` and `"industrial"` are admitted. |
+| `:license` | A string. |
+| `:status` | The unquoted symbol `sat`, `unsat` or `unknown`. |
+
+Missing or wrong value forms for the recognized keys are invalid. Other
+keys accept opaque well-formed attribute data. The category compatibility
+extension applies independently of source capture. Strict metadata leaves
+logic and signature admission as specified in this document. Status is
+advisory and never determines an engine result or its validity. Only
+`capture_source_records` requests owned metadata text and history.
+The Phase 2 reader validates opaque S-expressions in place and discards
+their text when capture is disabled. Lexical and grammar checks apply in
+both capture modes, including after a recognized value fails admission.
 
 ## Components and registered labels
 
@@ -158,9 +193,11 @@ use of labels, not the actual contents or coverage of the local snapshot.
 
 The frontend checks syntax, source scope, symbol and sort identity, operation
 rank, and the active signature. It validates every written definition body,
-argument, let RHS and match branch, even when unused. It retains typed
-nonrecursive definitions and calls without expanding their bodies to enforce a
-fragment grammar. It does not perform a strict IDL/LIA/NIA shape check.
+argument, let RHS and match branch, even when unused. Nullary
+`define-fun` and `define-const` bind closed typed bodies directly.
+Parameterized definitions retain typed templates and saturated calls.
+The frontend checks these terms against the active signature without
+expanding applications or performing IDL/LIA/NIA shape checks.
 
 The declared logic is a hint and an input-signature selection, not a proof
 that the query belongs to a solver's IDL, LIA or NIA algorithm. A consumer
@@ -194,6 +231,14 @@ has the same identity as `-` and is accepted in this value form. `(- 0)`, a
 qualified unary head such as `((as - Int) 1)`, and `(- x)` are not covered by
 the exception. A `get-model` definition instead uses the binary expression
 `(- 0 n)` for a negative integer; see [model export](semantic-interfaces.md#model-local-values-and-inspection).
+
+The Phase 2 command boundary preserves this value-only admission and
+does not enable `:named` in `get-value`. For execution, result-dependent
+requests use the actual retained answer and owner after grammar
+validation. The solver-free typed reader can classify ordinary requests
+without a result, and resolution of a model-local name requires its
+published same-owner binding.
+[Phase 2 protocol](semantic-interfaces.md#phase-2-command-processing-and-publication)
 
 ## Evidence and test obligations
 

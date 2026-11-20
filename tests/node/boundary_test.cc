@@ -249,7 +249,8 @@ TEST_F(Boundary, DivisionPowerAndUnderspecifiedOperationsAreRetained) {
   }
   for (const auto width : {1, 2, 8, 32, 64, 65}) {
     const auto sort = Bv(width);
-    const Integer value(0);
+    const auto value =
+        ExactBv(static_cast<std::uint32_t>(width), IntegerView(0));
     const auto bv = Take(manager_.MakeBvValue(sort.Borrow(), value.Borrow()));
     for (const auto kind : {Kind::kBvUdiv, Kind::kBvUrem, Kind::kBvSdiv,
                             Kind::kBvSrem, Kind::kBvSmod}) {

@@ -3,8 +3,21 @@
 import std;
 import dandelion.node;
 import dandelion.node_workload;
+import dandelion.util.numeric;
 
 namespace {
+
+using dandelion::Kind;
+using dandelion::Node;
+using dandelion::NodeManager;
+using dandelion::NodeStorageStats;
+using dandelion::NodeView;
+using dandelion::numeric::BitVectorView;
+using dandelion::numeric::FloatingPointView;
+using dandelion::numeric::Integer;
+using dandelion::numeric::IntegerView;
+using dandelion::numeric::Rational;
+using dandelion::numeric::RoundingMode;
 
 void NodeIntegerHit(benchmark::State& state) {
   auto manager_result = dandelion::NodeManager::Create();
@@ -13,9 +26,9 @@ void NodeIntegerHit(benchmark::State& state) {
     return;
   }
   auto manager = std::move(*manager_result);
-  auto retained = manager.MakeInt(dandelion::IntegerView(42));
+  auto retained = manager.MakeInt(IntegerView(42));
   {
-    auto repeated = manager.MakeInt(dandelion::IntegerView(42));
+    auto repeated = manager.MakeInt(IntegerView(42));
     if (!retained || !repeated || retained->GetId() != repeated->GetId()) {
       state.SkipWithError(
           "Integer node interning did not produce the same identity");
@@ -24,7 +37,7 @@ void NodeIntegerHit(benchmark::State& state) {
   }
   for (auto iteration : state) {
     (void)iteration;
-    auto result = manager.MakeInt(dandelion::IntegerView(42));
+    auto result = manager.MakeInt(IntegerView(42));
     if (!result) {
       state.SkipWithError("Cannot construct integer node");
       break;
@@ -42,7 +55,7 @@ void NodeIntegerCreateRelease(benchmark::State& state) {
   auto manager = std::move(*manager_result);
   dandelion::NodeId first_id = 0;
   {
-    auto first = manager.MakeInt(dandelion::IntegerView(42));
+    auto first = manager.MakeInt(IntegerView(42));
     if (!first) {
       state.SkipWithError("Cannot construct integer node");
       return;
@@ -50,7 +63,7 @@ void NodeIntegerCreateRelease(benchmark::State& state) {
     first_id = first->GetId();
   }
   {
-    auto second = manager.MakeInt(dandelion::IntegerView(42));
+    auto second = manager.MakeInt(IntegerView(42));
     if (!second || second->GetId() == first_id) {
       state.SkipWithError("Released integer node was not reclaimed");
       return;
@@ -58,7 +71,7 @@ void NodeIntegerCreateRelease(benchmark::State& state) {
   }
   for (auto iteration : state) {
     (void)iteration;
-    auto result = manager.MakeInt(dandelion::IntegerView(42));
+    auto result = manager.MakeInt(IntegerView(42));
     if (!result) {
       state.SkipWithError("Cannot construct integer node");
       break;
@@ -70,9 +83,239 @@ void NodeIntegerCreateRelease(benchmark::State& state) {
 BENCHMARK(NodeIntegerHit)->Name("node/integer/hit");
 BENCHMARK(NodeIntegerCreateRelease)->Name("node/integer/create_release");
 
+void Check(bool condition, const char* message) {
+  if (!condition) throw std::runtime_error(message);
+}
+
+void ReportStorage(benchmark::State& state, const NodeStorageStats& stats,
+                   std::string_view prefix = "") {
+  const std::string name(prefix);
+  state.counters[name + "node_bytes"] = static_cast<double>(stats.node_bytes);
+  state.counters[name + "numeric_backing_bytes"] =
+      static_cast<double>(stats.numeric_backing_bytes);
+  state.counters[name + "live_nodes"] = static_cast<double>(stats.live_nodes);
+  state.counters[name + "live_edges"] = static_cast<double>(stats.live_edges);
+}
+
+void CheckStorage(const NodeStorageStats& actual,
+                  const NodeStorageStats& expected) {
+  Check(actual.live_nodes == expected.live_nodes &&
+            actual.live_edges == expected.live_edges &&
+            actual.node_bytes == expected.node_bytes &&
+            actual.numeric_backing_bytes == expected.numeric_backing_bytes,
+        "Unexpected live storage after dropping benchmark results");
+}
+
+// Prepare the payload and sort in setup. A hit retains the seed while a
+// create_release iteration times both the miss and final owner destruction.
+template <class Setup>
+void RunPayloadBenchmark(benchmark::State& state, bool hit, Setup setup) {
+  try {
+    auto manager = NodeManager::Create().value();
+    setup(manager, [&](auto make, auto matches, const char* label) {
+      const auto baseline = manager.GetStorageStats().value();
+      auto seed = make().value();
+      Check(matches(seed.Borrow()), "Unexpected numeric fixture payload");
+      const auto id = seed.GetId();
+      const auto live = manager.GetStorageStats().value();
+      Check(live.live_nodes == baseline.live_nodes + 1,
+            "Expected one live numeric fixture node");
+      if (!hit) seed = {};
+      {
+        const auto repeated = make().value();
+        Check((repeated.GetId() == id) == hit,
+              "Unexpected numeric fixture identity");
+      }
+      CheckStorage(manager.GetStorageStats().value(), hit ? live : baseline);
+
+      for (auto iteration : state) {
+        (void)iteration;
+        auto result = make();
+        if (!result) {
+          state.SkipWithError("Cannot construct numeric node");
+          break;
+        }
+        benchmark::DoNotOptimize(result);
+      }
+
+      seed = {};
+      const auto released = manager.GetStorageStats().value();
+      CheckStorage(released, baseline);
+      state.SetLabel(label);
+      ReportStorage(state, live);
+      ReportStorage(state, released, "released_");
+    });
+  } catch (const std::exception& error) {
+    state.SkipWithError(error.what());
+  }
+}
+
+void NodeWideInteger(benchmark::State& state, bool hit) {
+  RunPayloadBenchmark(state, hit, [](NodeManager& manager, auto measure) {
+    // An owning Integer exposes magnitude limbs above INT64_MAX.
+    const auto value = Integer::FromUnsigned(std::uint64_t{1} << 63).value();
+    measure([&] { return manager.MakeInt(value.Borrow()); },
+            [&](NodeView node) {
+              return node.GetValue().value().GetInteger() == value.Borrow();
+            },
+            "Int 2^63");
+  });
+}
+
+void NodeBv(benchmark::State& state, bool hit, BitVectorView bits,
+            const char* label) {
+  RunPayloadBenchmark(state, hit, [&](NodeManager& manager, auto measure) {
+    const auto sort = manager.MakeBvSort(bits.Width()).value();
+    measure([&] { return manager.MakeBvValue(sort.Borrow(), bits); },
+            [&](NodeView node) {
+              return node.GetSort() == sort.Borrow() &&
+                     node.GetValue().value().GetBitVector() == bits;
+            },
+            label);
+  });
+}
+
+void NodeFp(benchmark::State& state, std::uint32_t exponent,
+            std::uint32_t significand, bool special, const char* label) {
+  RunPayloadBenchmark(state, false, [&](NodeManager& manager, auto measure) {
+    const auto sort =
+        manager.MakeFpSort(IntegerView(exponent), IntegerView(significand))
+            .value();
+    const auto format = *sort.Borrow().GetFpFormat();
+    const std::array<std::uint64_t, 2> limbs{1, 0x3fff000000000000};
+    const auto payload =
+        special ? FloatingPointView::FromCanonicalSpecial(
+                      format, dandelion::numeric::FpSpecial::kNegativeZero)
+                : FloatingPointView::FromCanonicalBits(
+                      format, format.Width() == 64
+                                  ? BitVectorView::FromCanonicalWord(
+                                        format.Width(), 0x3ff0000000000001)
+                                  : BitVectorView::FromCanonicalLimbs(
+                                        format.Width(), limbs));
+    measure([&] { return manager.MakeFpValue(sort.Borrow(), payload); },
+            [&](NodeView node) {
+              return node.GetSort() == sort.Borrow() &&
+                     node.GetValue().value().GetFloatingPoint() == payload;
+            },
+            label);
+  });
+}
+
+void NodeRationalConversion(benchmark::State& state, bool wide) {
+  RunPayloadBenchmark(state, false, [&](NodeManager& manager, auto measure) {
+    const std::array<std::uint64_t, 3> numerator{1, 0, 1};
+    const std::array<std::uint64_t, 2> denominator{0, 2};
+    const auto value =
+        (wide ? Rational::Make(
+                    IntegerView::FromCanonicalMagnitude(numerator, false),
+                    IntegerView::FromCanonicalMagnitude(denominator, false))
+              : Rational::Make(IntegerView(9), IntegerView(8)))
+            .value();
+    const auto rne = manager.MakeRoundingMode(RoundingMode::kRne).value();
+    const std::array indices{Integer(8), Integer(24)};
+    const std::array children{rne.Borrow()};
+    const auto sort =
+        manager.MakeFpSort(indices[0].Borrow(), indices[1].Borrow()).value();
+    measure(
+        [&] {
+          return manager.MakeBuiltin(
+              {Kind::kFpFromRational, indices, {}, value.Borrow()}, children);
+        },
+        [&](NodeView node) {
+          return node.GetKind() == Kind::kFpFromRational &&
+                 node.GetSort() == sort.Borrow() &&
+                 node.GetRationalParameter() == value.Borrow() &&
+                 node.GetChildren()[0] == rne.Borrow();
+        },
+        wide ? "FP(8,24) RNE (2^128+1)/2^65" : "FP(8,24) RNE 9/8");
+  });
+}
+
+BENCHMARK_CAPTURE(NodeWideInteger, hit, true)->Name("node/integer/wide_hit");
+BENCHMARK_CAPTURE(NodeWideInteger, create_release, false)
+    ->Name("node/integer/wide_create_release");
+constexpr std::array<std::uint64_t, 2> kBv65Limbs{
+    std::numeric_limits<std::uint64_t>::max(), 1};
+BENCHMARK_CAPTURE(NodeBv, word_hit, true,
+                  BitVectorView::FromCanonicalWord(64, 42), "BV64 42")
+    ->Name("node/bv/word_hit");
+BENCHMARK_CAPTURE(NodeBv, word_highbit, false,
+                  BitVectorView::FromCanonicalWord(64, std::uint64_t{1} << 63),
+                  "BV64 2^63")
+    ->Name("node/bv/word_highbit_create_release");
+BENCHMARK_CAPTURE(NodeBv, wide_hit, true,
+                  BitVectorView::FromCanonicalLimbs(65, kBv65Limbs),
+                  "BV65 2^65-1")
+    ->Name("node/bv/wide_hit");
+BENCHMARK_CAPTURE(NodeBv, wide_create_release, false,
+                  BitVectorView::FromCanonicalLimbs(65, kBv65Limbs),
+                  "BV65 2^65-1")
+    ->Name("node/bv/wide_create_release");
+BENCHMARK_CAPTURE(NodeFp, special, 11, 53, true, "FP(11,53) -0")
+    ->Name("node/fp/special_create_release");
+BENCHMARK_CAPTURE(NodeFp, word, 11, 53, false, "FP(11,53) 1 + 2^-52")
+    ->Name("node/fp/word_create_release");
+BENCHMARK_CAPTURE(NodeFp, wide, 15, 113, false, "FP(15,113) 1 + 2^-112")
+    ->Name("node/fp/wide_create_release");
+BENCHMARK_CAPTURE(NodeRationalConversion, small, false)
+    ->Name("node/rational_conv/small_create_release");
+BENCHMARK_CAPTURE(NodeRationalConversion, wide, true)
+    ->Name("node/rational_conv/wide_create_release");
+
+using dandelion::node_bench::BuildFoldingDag;
+using dandelion::node_bench::FoldDag;
 using dandelion::node_bench::Replay;
 using dandelion::node_bench::Walk;
 using dandelion::node_bench::Workload;
+
+void NodeDag(benchmark::State& state, bool fold) {
+  try {
+    auto manager = NodeManager::Create().value();
+    const auto roots = BuildFoldingDag(manager);
+    const auto shape = Walk(roots);
+    const auto input = manager.GetStorageStats().value();
+    Check(
+        shape.Nodes() == input.live_nodes && shape.Edges() == input.live_edges,
+        "DAG fixture has live nodes outside its roots");
+    if (fold) {
+      {
+        const auto results = FoldDag(manager, roots);
+        Check(
+            results.size() == roots.size() && results.front() != roots.front(),
+            "DAG fixture did not produce folded roots");
+        ReportStorage(state, manager.GetStorageStats().value(), "folded_");
+      }
+      CheckStorage(manager.GetStorageStats().value(), input);
+    }
+
+    if (fold) {
+      for (auto iteration : state) {
+        (void)iteration;
+        const auto results = FoldDag(manager, roots);
+        benchmark::DoNotOptimize(results.data());
+      }
+    } else {
+      const std::function<dandelion::Result<void>(NodeView)> visit =
+          [](NodeView node) -> dandelion::Result<void> {
+        benchmark::DoNotOptimize(node);
+        return {};
+      };
+      for (auto iteration : state) {
+        (void)iteration;
+        dandelion::VisitDagPostorder(roots, visit).value();
+      }
+    }
+    CheckStorage(manager.GetStorageStats().value(), input);
+    state.counters["roots"] = static_cast<double>(shape.Roots());
+    state.counters["depth"] = static_cast<double>(shape.Depth());
+    ReportStorage(state, input);
+  } catch (const std::exception& error) {
+    state.SkipWithError(error.what());
+  }
+}
+
+BENCHMARK_CAPTURE(NodeDag, postorder, false)->Name("node/dag/postorder");
+BENCHMARK_CAPTURE(NodeDag, constant_fold, true)->Name("node/dag/constant_fold");
 
 enum class Scenario {
   kConstruct,

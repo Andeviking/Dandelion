@@ -20,12 +20,12 @@ struct ParseStats {
   // NOLINTBEGIN(readability-identifier-naming): Struct fields, snake_case.
   std::uint64_t bytes = 0;
   std::uint64_t commands = 0;
+  std::uint64_t committed_end_offset = 0;
   std::uint64_t assertions = 0;
   std::uint64_t definitions = 0;
   std::uint64_t max_command_bytes = 0;
   std::uint64_t reader_calls = 0;
-  std::uint64_t next_syntax_ns = 0;
-  std::uint64_t apply_ns = 0;
+  std::uint64_t read_command_ns = 0;
   std::uint64_t teardown_ns = 0;
   // NOLINTEND(readability-identifier-naming)
 };
@@ -37,8 +37,6 @@ struct ParsedQuery {
   std::optional<frontend::DiagnosticCode> diagnostic_code;
   std::optional<frontend::SourceSpan> diagnostic_span;
   ParseStats stats;
-  std::uint64_t applied_commands = 0;
-  std::uint64_t syntax_end_offset = 0;
   std::shared_ptr<const frontend::QueryContext> query;
   std::optional<frontend::Session> session;
   // NOLINTEND(readability-identifier-naming)
@@ -55,7 +53,6 @@ struct InspectReport : ParseStats, MemorySnapshot {
   std::optional<frontend::SourceSpan> diagnostic_span;
   std::string logic;
   std::uint64_t tokens = 0;
-  std::uint64_t applied_commands = 0;
   std::uint64_t checks = 0;
   std::uint64_t user_sorts = 0;
   std::uint64_t user_functions = 0;
@@ -83,11 +80,16 @@ struct InspectReport : ParseStats, MemorySnapshot {
 std::expected<std::string, std::error_code> LoadFile(
     const std::filesystem::path& path);
 // The session borrows input until teardown or destruction.
-ParsedQuery ParseFromText(std::string_view input, bool measure_phases = false);
+ParsedQuery ParseFromText(std::string_view input, bool measure_phases = false,
+                          bool canonicalize_commutative = false,
+                          bool capture_source_records = false);
 ParsedQuery ParseFromReader(std::string_view input, ReaderMode mode,
-                            bool measure_phases = false);
+                            bool measure_phases = false,
+                            bool canonicalize_commutative = false,
+                            bool capture_source_records = false);
 InspectReport Inspect(std::string_view input,
-                      std::optional<ReaderMode> mode = std::nullopt);
+                      std::optional<ReaderMode> mode = std::nullopt,
+                      bool canonicalize_commutative = false);
 std::string InspectToJson(const InspectReport& report);
 MemorySnapshot ReadProcessMemory();
 

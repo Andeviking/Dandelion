@@ -166,6 +166,22 @@ measured node accessors across rounds. Each read scenario verified matching
 checksums. The synthetic cases establish the access-pattern sensitivity at
 the component level. [Domain access implementation](../../src/node/node_internal.cppm)
 
+## Phase 3 · Declaration ranks, symbol lookup, table slots, and allocation
+
+Phase 3 used paired GCC 16.2 Release runs with the same corpus inputs and
+replay traces for each comparison. The archive is
+`/pub/netdisk2/zhangx/dandelion-frontend-bench/phase3_bench`.
+
+| Experiment | Result |
+| --- | --- |
+| Direct ordinary rank IDs with the existing declaration record size | Removed the 16-byte ordinary instance row. Peak RSS fell 13.6 MiB on Scheduling, 11.0 MiB on STP and 16.0 MiB in ASP graph replay. OISC parse CPU rose 1.9% across nine focused pairs, with every pair slower. Regrouping the manager counters increased the OISC slowdown to 3.9% in seven pairs. |
+| Smaller declaration record alongside direct IDs | The smaller record cut a further 6.9 MiB from Scheduling peak RSS. Sage2 parse CPU rose 1.2% across seven focused pairs with the initial implementation. The split implementation added 1.8% parse CPU on MCMPC in an eleven-pair confirmation. |
+| Lazy frontend rank publication and a 256-entry per-command owning cache | The lazy path cut STP parse CPU by about 3% against the original baseline. The cache also helped Scheduling and Sage2. They produced no clear peak RSS improvement beyond direct rank encoding, and BMC CPU was about 1.2% above the original baseline with either frontend variant. |
+| Weak pointer in the ordinary declaration with all nodes still indexed | Cached BMC parse CPU fell 6.0%. In the nine-pair focused MCM replay, the variant with a node header marker increased repeat and final-release CPU by 14.2% and 11.1%. The variant without a marker increased final-release CPU by 5.5%. |
+| Four-byte slots with address windows, a two-bit fingerprint, and full-width fallback | Ridecore's live and peak slot arrays went from 32/48 MiB to 16/24 MiB. Paired lookup CPU fell 3.8%, and OISC peak RSS fell 7.2%. Isolated Ridecore final release increased from 61 to 117 ms. |
+| Grow at 87.5% occupancy | Ridecore lookup peak RSS fell 5.1%. Lookup CPU rose 13.2%. Sage2 parse peak RSS rose 8.4%. |
+| Process-wide TCMalloc size classes | BMC peak RSS rose 31%, ASP replay peak RSS rose 21%, and Ridecore lookup peak RSS rose 19%. With 512 survivors and 32 KiB of live node blocks, RSS after release rose from 43.9 MiB to 51.9 MiB. The default glibc allocation path remained preferable for this workload set. |
+
 ## Evidence archive
 
 All directories below are under `/pub/data/zhangx/results`. The reports

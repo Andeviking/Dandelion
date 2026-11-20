@@ -192,8 +192,8 @@ TEST_P(OperatorSpelling, TypedKindOrderedOperandsAndBadRank) {
     EXPECT_EQ(root.GetSort().GetWidth(), width);
   }
   if (sort == SortKind::kFloatingPoint) {
-    EXPECT_EQ(root.GetSort().GetFpExponentWidth(), width);
-    EXPECT_EQ(root.GetSort().GetFpSignificandWidth(), width);
+    EXPECT_EQ(root.GetSort().GetFpFormat().value().ExponentWidth(), width);
+    EXPECT_EQ(root.GetSort().GetFpFormat().value().SignificandWidth(), width);
   }
   const auto children = root.GetChildren();
   ASSERT_EQ(children.size(), typed.values.size() - 1);
@@ -325,7 +325,7 @@ TEST(FrontendOperators, IndicesWidthsAndFormatsKeepDistinctFailureCategories) {
                      "(bvand #x00 #b0)",
                      "((_ + 1) 0 1)",
                      "((_ bv256 8))",
-                     "(_ bv256 8)",
+                     "((_ bv256 8) #x00)",
                      "(_ bv1 0)",
                      "(_ bv1 -1)",
                      "(_ bv1 2 3)"}) {
@@ -374,12 +374,13 @@ TEST(FrontendLiterals, ExactBvAndIntValuesAndFpCategories) {
     EXPECT_EQ(typed.values[i].term.Borrow().GetKind(), Kind::kBvValue);
     EXPECT_EQ(typed.values[i].term.Borrow().GetSort().GetWidth(), widths[i]);
   }
-  EXPECT_EQ(IntegerValue(typed.values[0].term.Borrow()), "1");
+  EXPECT_EQ(BvValue(typed.values[0].term.Borrow()), "1");
   EXPECT_EQ(typed.values[2].term, typed.values[3].term);
   EXPECT_EQ(typed.values[3].term, typed.values[4].term);
-  for (std::size_t i : {7u, 8u, 13u})
-    EXPECT_EQ(IntegerValue(typed.values[i].term.Borrow()),
-              "18446744073709551616");
+  for (std::size_t i : {7u, 8u})
+    EXPECT_EQ(BvValue(typed.values[i].term.Borrow()), "18446744073709551616");
+  EXPECT_EQ(IntegerValue(typed.values[13].term.Borrow()),
+            "18446744073709551616");
   EXPECT_NE(typed.values[7].term, typed.values[8].term);
   EXPECT_EQ(IntegerValue(typed.values[9].term.Borrow()), "0");
   EXPECT_EQ(IntegerValue(typed.values[10].term.Borrow()),
@@ -389,17 +390,45 @@ TEST(FrontendLiterals, ExactBvAndIntValuesAndFpCategories) {
   EXPECT_EQ(typed.values[12].term.Borrow().GetKind(), Kind::kIntNeg);
   EXPECT_EQ(Argument(typed.values[12].term, 0), typed.values[11].term.Borrow());
   for (const auto category :
-       {FpCategory::kNaN, FpCategory::kPositiveInfinity,
-        FpCategory::kNegativeInfinity, FpCategory::kPositiveZero,
-        FpCategory::kNegativeZero}) {
+       {numeric::FpCategory::kNaN, numeric::FpCategory::kPositiveInfinity,
+        numeric::FpCategory::kNegativeInfinity,
+        numeric::FpCategory::kPositiveZero,
+        numeric::FpCategory::kNegativeZero}) {
     const auto index = 14u + std::to_underlying(category);
-    EXPECT_EQ(typed.values[index].term.Borrow().GetValue()->GetFpCategory(),
+    EXPECT_EQ(typed.values[index]
+                  .term.Borrow()
+                  .GetValue()
+                  ->GetFloatingPoint()
+                  .value()
+                  .Category(),
               category);
   }
   EXPECT_NE(typed.values[17].term, typed.values[18].term);
   EXPECT_EQ(typed.values[19].term.Borrow().GetKind(), Kind::kFpConstruct);
-  ExpectError(Values("(_ bv18446744073709551616 64)"),
-              DiagnosticCode::kInvalidInput);
+  const auto reduced =
+      Require(Values("(_ bv256 8) #x00"
+                     " (_ bv18446744073709551616 64) (_ bv0 64)"));
+  ASSERT_EQ(reduced.values.size(), 4u);
+  EXPECT_EQ(reduced.values[0].term, reduced.values[1].term);
+  EXPECT_EQ(reduced.values[2].term, reduced.values[3].term);
+  EXPECT_NE(reduced.values[0].term, reduced.values[2].term);
+}
+
+TEST(FrontendLiterals, WideDecimalBvReducesAndCachesByWidth) {
+  // 2^66 + 2^64 + 1 retains the second limb at width 65 only.
+  const auto typed = Require(
+      Values("(_ bv92233720368547758081 65) (_ bv92233720368547758081 64)"
+             " (_ bv92233720368547758081 65) (_ bv92233720368547758081 64)"));
+  ASSERT_EQ(typed.values.size(), 4u);
+  for (std::size_t i = 0; i < typed.values.size(); ++i) {
+    const auto bits = typed.values[i].term.Borrow().GetValue()->GetBitVector();
+    ASSERT_TRUE(bits);
+    EXPECT_EQ(bits->Width(), i % 2 == 0 ? 65u : 64u);
+    EXPECT_EQ(bits->Chunk(0), 1u);
+    EXPECT_EQ(bits->Chunk(1), i % 2 == 0 ? 1u : 0u);
+  }
+  EXPECT_EQ(typed.values[0].term, typed.values[2].term);
+  EXPECT_EQ(typed.values[1].term, typed.values[3].term);
 }
 
 TEST(FrontendLiterals, RoundingModesFormatsAndRationalIdentityPrecedence) {
@@ -412,7 +441,7 @@ TEST(FrontendLiterals, RoundingModesFormatsAndRationalIdentityPrecedence) {
   for (std::size_t i = 0; i < 5; ++i) {
     EXPECT_EQ(modes.values[2 * i].term, modes.values[2 * i + 1].term);
     EXPECT_EQ(modes.values[2 * i].term.Borrow().GetValue()->GetRoundingMode(),
-              static_cast<RoundingMode>(i));
+              static_cast<numeric::RoundingMode>(i));
   }
   const auto& convert = modes.values[10].term;
   ASSERT_EQ(convert.Borrow().GetKind(), Kind::kFpFromRational);
@@ -545,8 +574,8 @@ TEST(FrontendOperators, AsymmetricFpConversionAndSignedZeroEquality) {
   EXPECT_EQ(convert.GetChildren()[0], values[2].term.Borrow());
   EXPECT_EQ(convert.GetChildren()[1], values[3].term.Borrow());
   const auto source = convert.GetChildren()[1].GetSort();
-  EXPECT_EQ(source.GetFpExponentWidth(), 8u);
-  EXPECT_EQ(source.GetFpSignificandWidth(), 24u);
+  EXPECT_EQ(source.GetFpFormat().value().ExponentWidth(), 8u);
+  EXPECT_EQ(source.GetFpFormat().value().SignificandWidth(), 24u);
   ASSERT_EQ(packed.GetChildren().size(), 1);
   EXPECT_EQ(packed.GetChildren()[0], values[4].term.Borrow());
   EXPECT_EQ(values[4].term.Borrow().GetSort().GetWidth(), 16u);
@@ -554,16 +583,18 @@ TEST(FrontendOperators, AsymmetricFpConversionAndSignedZeroEquality) {
     ASSERT_EQ(term.GetIndices().size(), 2);
     EXPECT_EQ(term.GetIndices()[0].ToDecimal(), "5");
     EXPECT_EQ(term.GetIndices()[1].ToDecimal(), "11");
-    EXPECT_EQ(term.GetSort().GetFpExponentWidth(), 5u);
-    EXPECT_EQ(term.GetSort().GetFpSignificandWidth(), 11u);
+    EXPECT_EQ(term.GetSort().GetFpFormat().value().ExponentWidth(), 5u);
+    EXPECT_EQ(term.GetSort().GetFpFormat().value().SignificandWidth(), 11u);
   }
   ExpectError(Values("((_ to_fp 5 11) #b000000000000001)", setup),
               DiagnosticCode::kInvalidInput);
   const auto positive = values[7].term.Borrow();
   const auto negative = values[8].term.Borrow();
   EXPECT_NE(positive, negative);
-  EXPECT_EQ(positive.GetValue()->GetFpCategory(), FpCategory::kPositiveZero);
-  EXPECT_EQ(negative.GetValue()->GetFpCategory(), FpCategory::kNegativeZero);
+  EXPECT_EQ(positive.GetValue()->GetFloatingPoint().value().Category(),
+            numeric::FpCategory::kPositiveZero);
+  EXPECT_EQ(negative.GetValue()->GetFloatingPoint().value().Category(),
+            numeric::FpCategory::kNegativeZero);
   EXPECT_EQ(values[5].term.Borrow().GetKind(), Kind::kEqual);
   EXPECT_EQ(values[6].term.Borrow().GetKind(), Kind::kFpEq);
   for (const auto& value : std::span(values).subspan(5, 2)) {
@@ -653,7 +684,7 @@ TEST(FrontendLiterals, DecimalBvIdentifierDigitsDifferFromNumeralTokens) {
   ASSERT_EQ(terms.values.size(), 2);
   EXPECT_EQ(terms.values[0].term, terms.values[1].term);
   EXPECT_EQ(terms.values[0].term.Borrow().GetSort().GetWidth(), 8u);
-  EXPECT_EQ(IntegerValue(terms.values[0].term.Borrow()), "1");
+  EXPECT_EQ(BvValue(terms.values[0].term.Borrow()), "1");
 }
 
 TEST(FrontendOperators, FreeFunctionPreservesMixedOrderedRankAndCanonicalName) {
@@ -664,7 +695,7 @@ TEST(FrontendOperators, FreeFunctionPreservesMixedOrderedRankAndCanonicalName) {
   const auto command = Require(Values("(|mix| true #xf 3)", setup, &query));
   ASSERT_EQ(query->GetFunctions().size(), 1);
   const auto term = command.values.at(0).term.Borrow();
-  EXPECT_EQ(Applied(term), query->GetFunctions()[0].decl.Borrow());
+  EXPECT_EQ(Applied(term), query->GetFunctions()[0].Borrow());
   ASSERT_EQ(term.GetChildren().size(), 3);
   EXPECT_EQ(term.GetChildren()[0].GetValue()->GetBool(), true);
   EXPECT_EQ(term.GetChildren()[1].GetSort().GetWidth(), 4u);

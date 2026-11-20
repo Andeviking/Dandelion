@@ -2,7 +2,13 @@
 
 This document records Dandelion's build-system design, CMake development standards, and performance validation methods for both human developers and agents. Research date: 2026-11-16.
 
-**Status: node and frontend libraries, development scaffold, GMP, GoogleTest, and optional Google Benchmark integration implemented.** A solver executable, SAT backend, and installation support remain future work. See [C++ style and developer tools](cpp-style.md) for executable checks, exact commands, verified tool versions, and current limitations. Future target names, build options, other dependency mechanisms, and solver test commands are proposals unless explicitly identified as implemented.
+The numeric util, Node, and frontend libraries, development scaffold, GMP,
+GoogleTest, and optional Google Benchmark integration are implemented. A solver
+executable, SAT backend, and installation support remain future work. See
+[C++ style and developer tools](cpp-style.md) for executable checks, exact
+commands, verified tool versions, and current limitations. Future target
+names, build options, other dependency mechanisms, and solver test commands
+are proposals unless explicitly identified as implemented.
 
 ## Reading guide
 
@@ -77,12 +83,22 @@ Shared expressions include nodes, sorts, declarations, and their management; the
 Use a small number of responsibility-based targets, with multiple source directories and C++ modules inside a target where appropriate. A library is not required for every theory, directory, or module. STATIC libraries are a reasonable default for reusable internal components; OBJECT libraries merit evaluation when the same objects must form multiple artifacts with compatible options. Verify usage requirements, PIC, sanitizer settings, and duplicate object inclusion rather than treating object reuse as automatically safe or faster.
 
 The `dandelion_frontend` target exports `dandelion.frontend` and links
-publicly to `dandelion_node`. GMP is a private Node dependency. With
-`DANDELION_BUILD_TESTS=OFF`, the frontend and Node targets build without
-GoogleTest or SAT discovery. Test builds discover the frontend suite under
-label `frontend` and build `dandelion_frontend_probe` for opt-in corpus
-validation. Any future SAT discovery belongs to its own build selection.
-[Frontend acceptance](frontend/implementation.md)
+publicly to `dandelion_node`. Node links publicly to `dandelion_util`,
+which exports `dandelion.util.numeric` and owns the private GMP dependency.
+Phase 4B migrated the frontend and the benchmark workloads to the typed
+Node APIs. With `DANDELION_BUILD_TESTS=OFF`, the frontend, Node, and util
+targets build without GoogleTest or SAT discovery. Test builds discover
+the frontend suite under label `frontend` and build `dandelion_frontend_probe`
+for opt-in corpus validation. Any future SAT discovery belongs to its own
+build selection. [Frontend acceptance](frontend/implementation.md)
+
+`DANDELION_BUILD_BENCHMARKS=ON` adds `dandelion_util_benchmarks`,
+`dandelion_node_benchmarks`, and `dandelion_frontend_benchmarks`. The
+Phase 5 workloads measure standalone numerics, typed Node interning, and
+benchmark-local DAG folding. Phase 6 uses these targets to measure the
+optimized numeric and Node paths. The Node and frontend workload libraries
+also build when tests are enabled with benchmarks disabled.
+[Benchmark integration](testing/benchmark.md)
 
 ## 3. Target-Based CMake Standards
 
@@ -287,13 +303,23 @@ Do not assume CaDiCaL and Kissat expose identical interfaces or capabilities. Ev
 
 GoogleTest is the required framework for all project test suites, including unit, component, integration, tooling, and corpus regression tests. CTest is the build system's test discovery and execution tool; it can run GoogleTest tests and is not an alternative assertion framework. Helper scripts and external programs may be used by GoogleTest cases where needed. [Testing strategy](testing/README.md), [CMake GoogleTest module](https://cmake.org/cmake/help/v4.5/module/GoogleTest.html)
 
-The project builds `dandelion_node` from public numeric/node modules and a private internal partition, independently of tests. It links GMP privately and propagates sanitizer runtime link requirements to static-library consumers. With tests disabled, GoogleTest and both test peers are absent. With tests enabled, `dandelion_node_tests` and its isolated GMP failure helper are added. See [node acceptance](testing/node-acceptance.md).
+The Node and util static libraries build independently of tests and propagate
+sanitizer runtime link requirements to their consumers. Enabling tests adds
+`dandelion_node_tests` and `dandelion_util_tests`, with labels `node` and
+`util`. The util suite runs the isolated GMP failure helper.
+[Node acceptance](testing/node-acceptance.md)
 
 The scaffold builds a shared GoogleTest main target, a module and GMP smoke executable, and, when enabled, the developer-tool test executable. The latter invokes the real developer tools and a small Python source-discovery helper; assertions and test cases are in GoogleTest. GoogleTest dependencies do not receive the project's warning or sanitizer compile policy. When an existing prebuilt GoogleTest or GMP is not instrumented, sanitizer coverage does not include its internals.
 
 Group test sources into executables around meaningful components rather than one executable per case or a single mandatory binary for all tests. Link only the tested components and the appropriate GoogleTest target. Frontend and expression tests must not require SAT or solver dependencies when their contracts do not use them. Test selection, source lists, and dependency discovery must preserve this separation during configuration as well as compilation.
 
-The current executables use `gtest_discover_tests()` with `PRE_TEST` and the `node`, `toolchain`, and `tooling` labels. Discovery executes each binary at test time and requires its runtime dependencies. `POST_BUILD` is another option where suitable. If many short cases make individual CTest process startup costly, measure a grouped registration that still runs GoogleTest, accepting coarser CTest reporting. A CTest label filters tests but does not by itself exclude them from a default run.
+The current executables use `gtest_discover_tests()` with `PRE_TEST` and the
+`node`, `util`, `frontend`, `benchmark-infrastructure`, `toolchain`, and
+`tooling` labels. Discovery executes each binary at test time and requires
+its runtime dependencies. `POST_BUILD` is another option where suitable. If
+many short cases make individual CTest process startup costly, measure a
+grouped registration that still runs GoogleTest, accepting coarser CTest
+reporting. A CTest label filters the tests selected for a run.
 
 Corpus regression tests use GoogleTest as well, with helper runners where useful. Make their selection and resource limits explicit, and keep them out of the default small test set through actual registration or configuration controls, not labels alone. Follow the [local dataset policy](testing/README.md#local-benchmark-data), including metadata-safe reads and safe copies for external solvers; do not download datasets without explicit user permission. Missing required inputs must be reported, while unavailable optional inputs must not be recorded as passing tests.
 

@@ -1,5 +1,5 @@
 export module dandelion.node;
-export import dandelion.numeric;
+import dandelion.util.numeric;
 import std;
 
 namespace dandelion::detail {
@@ -13,6 +13,56 @@ void ReleaseState(ManagerState* state) noexcept;
 }  // namespace dandelion::detail
 
 export namespace dandelion {
+
+enum class ErrorCode : std::uint8_t {
+  kNullObject,
+  kForeignManager,
+  kInvalidKind,
+  kInvalidArity,
+  kInvalidParameter,
+  kSortMismatch,
+  kInvalidLiteral,
+  kInvalidDatatype,
+  kBuilderClosed,
+  kInvalidTraversalState,
+  kUnsupportedFeature,
+  kResourceLimit,
+};
+enum class ResourceKind : std::uint8_t {
+  kNone,
+  kCppAllocation,
+  kSize,
+  kIdentitySpace,
+  kReferenceCount,
+};
+enum class DatatypeReason : std::uint8_t {
+  kNone,
+  kEmptyGroup,
+  kNoConstructor,
+  kInvalidParameterScope,
+  kNestedRecursiveSort,
+  kNonproductive,
+};
+struct NodeError {
+  // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
+  ErrorCode code;
+  // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
+  ResourceKind resource = ResourceKind::kNone;
+  // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
+  std::uint64_t operand_index = std::numeric_limits<std::uint64_t>::max();
+  // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
+  std::uint64_t parameter_index = std::numeric_limits<std::uint64_t>::max();
+  // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
+  DatatypeReason datatype_reason = DatatypeReason::kNone;
+};
+template <class T>
+using Result = std::expected<T, NodeError>;
+
+class ReferenceLimit final : public std::exception {
+ public:
+  const char* what() const noexcept override;
+};
+
 using NodeId = std::uint64_t;
 using SortId = std::uint64_t;
 using SortConstructorId = std::uint64_t;
@@ -157,21 +207,6 @@ enum class SortRecipeKind : std::uint8_t {
   kApply,
   kRecursive,
 };
-enum class FpSpecial : std::uint8_t {
-  kNaN,
-  kPositiveInfinity,
-  kNegativeInfinity,
-  kPositiveZero,
-  kNegativeZero,
-};
-enum class FpCategory : std::uint8_t {
-  kNaN,
-  kPositiveInfinity,
-  kNegativeInfinity,
-  kPositiveZero,
-  kNegativeZero,
-  kFiniteBits,
-};
 
 class SortView;
 class SortConstructorView;
@@ -181,9 +216,6 @@ class DatatypeGroupView;
 class SortRecipeView;
 class NodeView;
 class NodeManager;
-#ifdef DANDELION_NODE_TESTING
-class NodeTestPeer;
-#endif
 
 template <class View>
 class StateHandle {
@@ -225,9 +257,6 @@ class StateHandle {
 
  private:
   friend struct detail::Access;
-#ifdef DANDELION_NODE_TESTING
-  friend class NodeTestPeer;
-#endif
   StateHandle(detail::ManagerState* state, std::uint64_t id) noexcept
       : state_(state), id_(id) {}
   detail::ManagerState* state_ = nullptr;
@@ -298,8 +327,7 @@ class SortView {
   }
   SortKind GetKind() const noexcept;
   std::optional<std::uint32_t> GetWidth() const noexcept;
-  std::optional<std::uint32_t> GetFpExponentWidth() const noexcept;
-  std::optional<std::uint32_t> GetFpSignificandWidth() const noexcept;
+  std::optional<numeric::FpFormat> GetFpFormat() const noexcept;
   std::optional<SortView> GetArrayIndex() const noexcept;
   std::optional<SortView> GetArrayElement() const noexcept;
   std::optional<SortConstructorView> GetSortConstructor() const noexcept;
@@ -452,10 +480,10 @@ class SortRecipeView {
 class LiteralView {
  public:
   std::optional<bool> GetBool() const noexcept;
-  std::optional<IntegerView> GetInteger() const noexcept;
-  std::optional<FpCategory> GetFpCategory() const noexcept;
-  std::optional<IntegerView> GetFpBits() const noexcept;
-  std::optional<RoundingMode> GetRoundingMode() const noexcept;
+  std::optional<numeric::IntegerView> GetInteger() const noexcept;
+  std::optional<numeric::BitVectorView> GetBitVector() const noexcept;
+  std::optional<numeric::FloatingPointView> GetFloatingPoint() const noexcept;
+  std::optional<numeric::RoundingMode> GetRoundingMode() const noexcept;
 
  private:
   friend class NodeView;
@@ -498,13 +526,13 @@ class NodeIndices {
  public:
   class Index {
    public:
-    IntegerView Borrow() const noexcept { return view_; }
+    numeric::IntegerView Borrow() const noexcept { return view_; }
     std::string ToDecimal() const { return view_.ToDecimal(); }
 
    private:
     friend class NodeIndices;
-    explicit Index(IntegerView view) noexcept : view_(view) {}
-    IntegerView view_;
+    explicit Index(numeric::IntegerView view) noexcept : view_(view) {}
+    numeric::IntegerView view_;
   };
   class Iterator {
    public:
@@ -547,7 +575,7 @@ class NodeView {
   NodeIndices GetIndices() const noexcept;
   std::optional<DeclInstanceView> GetDeclaration() const noexcept;
   std::optional<LiteralView> GetValue() const noexcept;
-  std::optional<RationalView> GetRationalParameter() const noexcept;
+  std::optional<numeric::RationalView> GetRationalParameter() const noexcept;
   bool SameManager(NodeView other) const noexcept;
   friend bool operator==(NodeView left, NodeView right) noexcept;
 
@@ -575,9 +603,6 @@ class Node {
 
  private:
   friend struct detail::Access;
-#ifdef DANDELION_NODE_TESTING
-  friend class NodeTestPeer;
-#endif
   explicit Node(detail::NodeData* node) noexcept;
   detail::NodeData* node_ = nullptr;
 };
@@ -585,36 +610,53 @@ struct NodeHash {
   std::size_t operator()(const Node& node) const noexcept;
 };
 
-// Borrows mutable root slots. The accessor must only locate the same live
-// Node object at each index throughout the release call.
-struct RootRange {
-  // NOLINTBEGIN(readability-identifier-naming): Struct fields, snake_case.
-  void* context = nullptr;
-  std::size_t count = 0;
-  Node* (*at)(void* context, std::size_t index) noexcept = nullptr;
-  // NOLINTEND(readability-identifier-naming)
+// Borrows mutable root slots. The backing span must remain valid throughout
+// the release call.
+class RootRange {
+ public:
+  RootRange() noexcept = default;
 
-  template <auto Member, class Record>
-  static RootRange From(std::span<Record> records) noexcept {
-    return {
-        records.data(),
-        records.size(),
-        [](void* base, std::size_t index) noexcept -> Node* {
-          return &(static_cast<Record*>(base)[index].*Member);
-        },
-    };
+  static RootRange From(std::span<Node> roots) noexcept {
+    return {roots.data(), roots.size(),
+            [](void* base, std::size_t index) noexcept -> Node& {
+              return static_cast<Node*>(base)[index];
+            }};
   }
+
+  template <auto Member, class Record, std::size_t Extent>
+    requires std::is_member_object_pointer_v<decltype(Member)> &&
+             (Member != nullptr) && (!std::is_const_v<Record>) &&
+             requires(Record& record) {
+               { record.*Member } -> std::same_as<Node&>;
+             }
+  static RootRange From(std::span<Record, Extent> records) noexcept {
+    return {records.data(), records.size(),
+            [](void* base, std::size_t index) noexcept -> Node& {
+              return static_cast<Record*>(base)[index].*Member;
+            }};
+  }
+
+ private:
+  friend struct detail::Access;
+  using Accessor = Node& (*)(void*, std::size_t) noexcept;
+
+  RootRange(void* context, std::size_t count, Accessor at) noexcept
+      : context_(context), count_(count), at_(at) {}
+
+  void* context_ = nullptr;
+  std::size_t count_ = 0;
+  Accessor at_ = nullptr;
 };
 
 struct BuiltinOpView {
   // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
   Kind kind;
   // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
-  std::span<const Integer> indices;
+  std::span<const numeric::Integer> indices;
   // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
   std::optional<SortView> qualifier;
   // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
-  std::optional<RationalView> rational;
+  std::optional<numeric::RationalView> rational;
 };
 
 // A token is usable only with the open builder that created it. Moving
@@ -707,7 +749,7 @@ class NodeManager {
   // Consumes these handles together. Null handles are allowed. A foreign
   // handle rejects the entire batch before any handle is consumed.
   Result<void> ReleaseRoots(std::span<Node> roots);
-  // Validates every range and its handles before consuming the whole batch.
+  // Validates all handles before consuming the whole batch.
   // The manager reference keeps the state alive throughout the release.
   static Result<void> ReleaseRoots(const ManagerRef& manager,
                                    std::span<const RootRange> ranges) noexcept;
@@ -720,8 +762,10 @@ class NodeManager {
   Result<Sort> BoolSort();
   Result<Sort> IntSort();
   Result<Sort> RoundingModeSort();
-  Result<Sort> MakeBvSort(IntegerView width);
-  Result<Sort> MakeFpSort(IntegerView exponent, IntegerView significand);
+  Result<Sort> MakeBvSort(numeric::IntegerView width);
+  Result<Sort> MakeBvSort(std::uint64_t width);
+  Result<Sort> MakeFpSort(numeric::IntegerView exponent,
+                          numeric::IntegerView significand);
   Result<Sort> MakeArraySort(SortView index, SortView element);
   Result<SortConstructor> DeclareUninterpretedSort(std::string_view name_hint,
                                                    std::uint64_t arity);
@@ -736,26 +780,39 @@ class NodeManager {
   Result<DeclInstance> InstantiateDeclaration(
       DeclView declaration, std::span<const SortView> type_arguments);
   Result<Node> MakeBool(bool value);
-  Result<Node> MakeInt(IntegerView value);
-  Result<Node> MakeBvValue(SortView sort, IntegerView value);
-  Result<Node> MakeFpBits(SortView sort, IntegerView packed_bits);
-  Result<Node> MakeFpSpecial(SortView sort, FpSpecial value);
-  Result<Node> MakeRoundingMode(RoundingMode value);
+  Result<Node> MakeInt(numeric::IntegerView value);
+  Result<Node> MakeBvValue(SortView sort, numeric::BitVectorView value);
+  Result<Node> MakeBvWordValue(SortView sort, std::uint64_t value);
+  Result<Node> MakeFpValue(SortView sort, numeric::FloatingPointView value);
+  Result<Node> MakeRoundingMode(numeric::RoundingMode value);
   Result<Node> MakeFreshConstant(std::string_view name_hint, SortView sort);
   Result<Sort> CheckBuiltin(BuiltinOpView op,
                             std::span<const NodeView> children);
+  Result<Sort> CheckBuiltinOperands(BuiltinOpView op,
+                                    std::span<const Node> children);
   Result<Node> MakeBuiltin(BuiltinOpView op,
+                           std::span<const NodeView> children);
+  Result<Node> MakeWordIndexedBuiltin(Kind kind,
+                                      std::span<const std::uint64_t> indices,
+                                      std::span<const NodeView> children);
+  Result<Node> RebuildNode(NodeView original,
                            std::span<const NodeView> children);
   Result<Node> MakeApply(DeclInstanceView declaration,
                          std::span<const NodeView> arguments);
+  // A miss moves owners into child edges. Hits and errors leave slots intact.
+  Result<Node> MakeBuiltinConsuming(BuiltinOpView op, std::span<Node> children);
+  Result<Node> MakeWordIndexedBuiltinConsuming(
+      Kind kind, std::span<const std::uint64_t> indices,
+      std::span<Node> children);
+  Result<Node> RebuildNodeConsuming(NodeView original,
+                                    std::span<Node> children);
+  Result<Node> MakeApplyConsuming(DeclInstanceView declaration,
+                                  std::span<Node> arguments);
   Result<DatatypeBuilder> BeginDatatypeGroup(
       std::span<const DatatypeHeader> headers);
 
  private:
   friend struct detail::Access;
-#ifdef DANDELION_NODE_TESTING
-  friend class NodeTestPeer;
-#endif
   ManagerRef state_;
 };
 
@@ -799,63 +856,4 @@ Result<void> VisitDagPostorder(
     std::span<const Node> roots,
     const std::function<Result<void>(NodeView)>& visit);
 
-#ifdef DANDELION_NODE_TESTING
-struct NodeTestStats {
-  // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
-  std::uint64_t sorts;
-  // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
-  std::uint64_t sort_constructors;
-  // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
-  std::uint64_t declarations;
-  // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
-  std::uint64_t decl_instances;
-  // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
-  std::uint64_t datatype_groups;
-  // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
-  std::uint64_t live_nodes;
-  // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
-  std::uint64_t table_capacity;
-  // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
-  std::uint64_t next_node_id;
-  // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
-  std::uint64_t node_allocations;
-  // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
-  std::uint64_t node_reclamations;
-  // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
-  std::uint64_t allocation_attempts;
-  // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
-  std::uint64_t insertion_searches;
-  // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
-  std::array<std::uint64_t, 16> probe_histogram;
-  // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
-  std::uint64_t probe_slots;
-  // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
-  std::size_t probe_max;
-};
-class NodeTestPeer {
- public:
-  static void ForceCollisions(NodeManager& manager, std::uint64_t hash);
-  static void FailCreationAllocationAfter(std::size_t successful) noexcept;
-  static void ClearCreationFailure() noexcept;
-  static NodeTestStats GetStats(const NodeManager& manager) noexcept;
-  static std::uint64_t TypeEvaluations(const NodeManager& manager) noexcept;
-  static std::uint64_t BuiltinShapeChecks(const NodeManager& manager) noexcept;
-  static std::size_t DeclarationPayloadUsed(
-      const NodeManager& manager) noexcept;
-  static std::size_t NonemptyDeclarationDomains(
-      const NodeManager& manager) noexcept;
-  static void FailAllocationAfter(NodeManager& manager, std::size_t successful);
-  static void FailRetainAfter(NodeManager& manager, std::size_t successful);
-  static void ClearFailures(NodeManager& manager) noexcept;
-  static void SetNextNodeId(NodeManager& manager, NodeId next);
-  static void SetIdentityLimit(NodeManager& manager, std::uint64_t limit);
-  static void SetReferenceLimit(NodeManager& manager, std::uint64_t limit);
-  static void SetTableCapacityLimit(NodeManager& manager, std::size_t limit);
-  static void SetSizeLimit(NodeManager& manager, std::size_t limit);
-  static std::uint64_t RefCount(const Node& node) noexcept;
-  static std::uint64_t StructuralHash(const Node& node) noexcept;
-  static std::uint64_t StateRefCount(const NodeManager& manager) noexcept;
-  static std::uint64_t DestroyedStates() noexcept;
-};
-#endif
 }  // namespace dandelion

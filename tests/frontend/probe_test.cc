@@ -205,7 +205,7 @@ TEST(FrontendProbe, ComparisonPairsEveryWrittenRootInSourceOrder) {
     const auto check = [](std::string_view text, bool expected) {
       const auto query = RequireQuery(Parse(text));
       ASSERT_EQ(query->GetAssertions().size(), 1);
-      const auto root = query->GetAssertions()[0].term.Borrow();
+      const auto root = query->GetAssertions()[0].Borrow();
       EXPECT_EQ(EvalBool(*query, root, false), expected);
       EXPECT_EQ(EvalBool(*query, root, true), expected);
     };
@@ -246,10 +246,9 @@ TEST(FrontendProbe, EmptyComparisonAndFreshRecoveredDefinitionNames) {
       "(assert (or false\n(xor first\ndandelion_recovered__0)\n"
       "(xor second\ndandelion_recovered__1)\n))\n(check-sat)\n");
   const auto query = RequireQuery(Parse(recovered.output));
-  const auto defs = query->GetDefinitions();
-  ASSERT_EQ(defs.size(), 4);
+  ASSERT_EQ(query->GetDefinitionCount(), 0);
   ASSERT_EQ(query->GetAssertions().size(), 1);
-  const auto root = query->GetAssertions()[0].term.Borrow();
+  const auto root = query->GetAssertions()[0].Borrow();
   ASSERT_EQ(root.GetKind(), Kind::kOr);
   const auto disjunction = root.GetChildren();
   ASSERT_EQ(disjunction.size(), 3);
@@ -257,10 +256,12 @@ TEST(FrontendProbe, EmptyComparisonAndFreshRecoveredDefinitionNames) {
     const auto pair = disjunction[i];
     ASSERT_EQ(pair.GetKind(), Kind::kXor);
     ASSERT_EQ(pair.GetChildren().size(), 2);
-    EXPECT_EQ(Applied(pair.GetChildren()[0]), defs[i - 1].decl.Borrow());
-    EXPECT_EQ(Applied(pair.GetChildren()[1]), defs[i + 1].decl.Borrow());
+    EXPECT_EQ(pair.GetChildren()[0], pair.GetChildren()[1]);
   }
-  EXPECT_EQ(Applied(Argument(defs[3].body, 0)), defs[2].decl.Borrow());
+  EXPECT_EQ(Applied(disjunction[1].GetChildren()[0]),
+            query->GetFunctions()[0].Borrow());
+  ExpectChildren(disjunction[2].GetChildren()[0],
+                 {disjunction[1].GetChildren()[0]});
   EXPECT_FALSE(EvalBool(*query, root, false));
   EXPECT_FALSE(EvalBool(*query, root, true));
 }

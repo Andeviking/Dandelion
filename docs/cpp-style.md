@@ -234,8 +234,9 @@ module, exercise C++23 `std::to_underlying`, verify the GMP runtime version,
 and check exact large-integer and rational arithmetic even with `NDEBUG`. There
 is no solver executable or backend dependency.
 `DANDELION_BUILD_TESTS` defaults to ON for a top-level build and OFF as a
-subproject. With tests disabled, `dandelion_node` is still built using GMP,
-without GoogleTest or test-peer declarations and implementations.
+subproject. With tests disabled, the Node and util libraries build
+independently of GoogleTest and omit test-peer hooks. Util provides the GMP
+dependency for both libraries.
 
 Project warnings are `-Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion
 -Wshadow` for GCC/Clang. `DANDELION_WARNINGS_AS_ERRORS` defaults to OFF. The

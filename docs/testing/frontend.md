@@ -1,6 +1,6 @@
 # Frontend Testing
 
-Status: **implemented frontend test suite, including verified Phase 2 cases**.
+**Status.** Phase 1 and Phase 2 suites are implemented, with historical verified runs recorded in the implementation record. The review did not independently verify the current tree or complete coverage of each required subcase; the cases below remain acceptance requirements.
 The [acceptance record](../frontend/implementation.md) identifies the
 configurations and corpus slice exercised. This document applies the
 [testing strategy](README.md) to SMT-LIB input, name resolution, typing,
@@ -24,7 +24,7 @@ session are outside the current scope.
 
 The [frontend design](../frontend/design.md), [logic profiles](../frontend/logic-profile.md)
 and [semantic interfaces](../frontend/semantic-interfaces.md) select
-command-at-a-time execution, retained definitions, signature-based compatibility
+command-at-a-time execution, direct aliases, parameterized templates, signature-based compatibility
 and model-bound value queries. Production model obligations require their
 own solver-side tests in addition to a controlled frontend provider.
 
@@ -181,7 +181,8 @@ oracles, and reference implementations only on their common supported slice.
 - **FE-DEF-01:** test a definition applied with a shadowed caller name, nested
   definitions, repeated and unused parameters, nullary definitions, incorrect
   arity/sorts and nonrecursive name resolution. Inspect the owning definition
-  environment and defined-call identity, then compare small expansions against
+  environment and saturated-call identity for parameterized definitions and
+  direct body identity for nullary definitions, then compare small expansions against
   independent expected terms. The defined call is never an unconstrained UF or
   a separately user-declared model symbol.
 - **FE-DEF-02:** create a finite family of definitions with
@@ -271,10 +272,10 @@ oracles, and reference implementations only on their common supported slice.
   under QF_UFBV, which does not enable arrays. This is a frontend type and
   profile test; array satisfiability is tested by the solver separately.
 - **FE-INFO-01:** test `:category` with each documented string and reject an
-  unquoted or unknown category; accept string `:license`, string or quoted
+  non-string category in both modes and an unknown category in strict mode; accept string `:license`, string or quoted
   `:source`, and `sat`/`unsat`/`unknown` status. Test exact `2.6` and `2.7`,
-  unsupported well-formed other versions and invalid token classes. Metadata
-  preserves its order and never supplies the solver result.
+  unsupported well-formed other versions and invalid token classes. Captured metadata
+  preserves its order. Metadata never supplies the solver result.
 - **FE-DT-SHARING-01:** define `Dup(T)=Array(T,T)`, `A0(T)=T` and
   `A(n+1)(T)=Dup(A(n)(T))` as shared sort recipes, then match a `Box<T>`
   constructor field against `A12(Int)`. Count matched pairs and
@@ -336,7 +337,7 @@ oracles, and reference implementations only on their common supported slice.
   same model. Do not treat agreement on those three examples as proof that a
   finite constant-default table represents identity over all integers. In a
   separate fixture, use an acyclic dependency on another user function and
-  verify output order, source rank aliases and lifetime after the input buffer
+  verify output order, semantic rank aliases and lifetime after the input buffer
   is destroyed. A provider unable to export a selected model must report
   capability failure, not replace it with a different function after inspection
   has begun.
@@ -357,7 +358,7 @@ oracles, and reference implementations only on their common supported slice.
   model, unused user declarations and omission of definitions/`:named` aliases.
   In another export, set global `g=7` and use body `f(y)=g+y` with a formal
   name hint `g`; output must bind the formal distinctly and yield `f(2)=9`.
-  Check dependency order, original sort alias, and no forward references.
+  Check dependency order, a legal abbreviation for the semantic sort, and no forward references.
 - **FE-MODEL-10:** provide a shared body DAG `t0=x`, `t(n+1)=(+ t(n) t(n))`
   through `t12`. Verify capture-safe nested `let` output retains sharing and
   independently evaluates to `4096*x`; simultaneous bindings must not refer
@@ -477,10 +478,9 @@ should reject duplicate names in one simultaneous binding list.
 
 The semicolons and parentheses inside the string and quoted symbol are data,
 not comment or command delimiters. The two occurrences of `|x;y(z)|` resolve
-to the same declaration and the assertion is retained. If the frontend exposes
-the metadata payload, check the doubled quote according to the selected
-language revision; otherwise check it is safely accepted and does not alter
-subsequent commands. Pair this with an unterminated quoted symbol, which must
+to the same declaration and the assertion is retained. With source capture enabled, check the doubled quote in the captured
+payload. With capture disabled, check the null source view and equivalent
+typed assertions. Pair this with an unterminated quoted symbol, which must
 be reported as malformed input.
 
 ### FE-INT-001: exact large numeral
@@ -531,12 +531,132 @@ For a profile that accepts this logic and declaration syntax, check that
 term is BV9. A reference parser that ignores this logic name may still provide
 limited type evidence, but has not validated the complete input profile.
 
+## Phase 1 test design
+
+Add these GoogleTest cases before implementation. Run representative inputs
+through text and fragmented Reader adapters. Run binding, rollback and
+metadata cases with capture off and on. Run the applicable existing binding,
+syntax, model, datatype, canonicalization and benchmark suites as well.
+Derive each check from the written scope, exact sorts, declaration
+identities and provider fixture. Use test-only counters or fault hooks for
+storage and publication invariants, and preserve existing checked cases
+through the test-first transition.
+
+| Case | Fixture and expected result |
+| --- | --- |
+| FE-P1-ALIAS | Under QF_LIA declare `g : Int`. Establish a root for `(+ g 1)`, then define `(define-fun a () Int (+ g 1))`, `(define-const b Int a)` and a further chain using both forms. Uses of `a`, `b`, `(as b Int)` and the final alias reuse the original body node. In a `let` that shadows `g`, the body still references the global declaration. A local `b` shadows only the written use in its scope. Compare Node storage before and after the definitions with the body already live. There are no new declarations, instances or wrapper nodes, no semantic definition entries and no free function entries for these names. Repeat with an alias to a saturated parameterized call and confirm only the existing call identity is reused. |
+| FE-P1-ALIAS-ERROR | For both nullary forms reject an ill-sorted unused body, mismatched result sort, self-reference, forward or unbound reference, duplicate or active reserved name, and collision with a free function or a prior `:named` alias after dequoting. Reject positive-arity use and a mismatched `as` qualifier. Also reject a body containing an ill-sorted unused let RHS. A body with valid local binding, such as `(let ((x 1)) (+ x 2))`, is closed. Check the blamed token or body span from the source. After each body or rank failure for a fresh name, a legal command can bind that name. After a freshness error, the prior binding still resolves. |
+| FE-P1-QUERY | Statically check the three semantic spans, count and ordinal signatures, absent source getters, absent raw-ID overload and absent `TypedCommand::annotations`. Build two free declarations separated by parameterized templates, formals, a failed command, and a datatype group. Assert the same Bool formula twice. Verify the ordered duplicate roots, original free declaration and sort identities (including an unused declaration), datatype owners, logic, options and manager. `HasFunction` returns false for null, a foreign lookalike, an internal template, a formal and a datatype member. `FindDefinition` returns the exact committed ordinal record for each template and null for those non-template identities, original free functions, null and a foreign lookalike. Preserve ownership after input and session destruction. |
+| FE-P1-TEMPLATE | Store `f(a,b)=a-b` and `g(x)=f(x,f(x,1))`, with a nullary alias in between, and verify two templates in order, distinct ordered formals and saturated calls from one to the other. Check `f(5,2)=3`, `f(2,5)=-3` and `g(5)=1` with the independent small evaluator. Include one captured global and a caller-side shadow. Reject wrong arity, wrong argument or result sort, repeated formal and self-reference, including when the template or actual is unused. Retain the compressed call-count and scale checks of FE-DEF-02. |
+| FE-P1-NAME | Check `(! (! 1 :named inner) :named outer)` followed by sibling uses. Both aliases name the Int literal and publish in inner-then-outer order. Test a later parallel let RHS referring to a name from an earlier RHS, and reverse the order to fail. Check a name in a definition body is available after that definition, and repeated alias references and parameterized calls publish no names or annotations. Reject duplicate `:named` on one form, collisions after dequoting including a pending definition name, non-symbol names and `:named` in value requests. Check ordinary attributes and unsupported `:pattern`. |
+| FE-P1-ESCAPE | Swap the order of `(! 1 :named closed)` and an annotation on a local bound to that same literal across commands. Closedness follows the written occurrence. Reject a formal reference, an enclosing pattern variable and a reference appearing only in an unused actual of a parameterized call. Within a let binding `x`, naming `(let ((unused x)) 0)` succeeds, and naming `(let ((used x)) used)` fails. Reject an outer dependency retained by a first-match-unreachable branch. Accept naming the whole match when dependencies are confined to its own branch pattern scopes. Keep unused RHS and branch sort errors. Compare large binder-free and nested binder fixtures using test instrumentation to verify no per-operand escape data on the binder-free path and one reduction per written occurrence, including nested annotations. |
+| FE-P1-ROLLBACK | Begin with committed declarations, aliases and captured occurrences. Stage a new name in an early child and cause a late unbound name, open annotation or result-sort error. Repeat with malformed command syntax, which prevents application. For well-formed failures retry with the same name in a corrected command. Sweep applicable allocation checkpoints for name insertion, definition publication, source spelling and history storage, and sealing. Reacquire views after failure and compare all semantic ranges, the seven captured histories, options, state and old alias resolution to their committed values. A failed seal leaves aliases usable. A retry publishes exactly one effect. Drive a rejected constraint followed by a check and verify no solver invocation. |
+| FE-P1-SOURCE | Use one script with a quoted sort and free declaration, compound written ranks, both nullary commands, a parameterized definition, two identical assertions, nested named and ordinary annotations, and ordered repeated metadata before and after check. Capture off yields null at every phase. Capture on starts empty and records exact counts, order, names, ordinal mappings, shared typed identities, token renderings and byte spans across short reads. Check unchanged semantic observations across modes. Copy captured records explicitly, destroy the backing input and session, then verify the copies' spellings and owning handles. The query or owner alone keeps no session history. |
+| FE-P1-METADATA | Cross both capture values with both strict values. Accept each standard category and require default acceptance of `"check"` and an arbitrary string with doubled quotes. In strict mode those two yield invalid input at the value. Reject bare category symbols, a missing recognized value, extra values and an unclosed S-expression. Admit both exact versions and reject another well-formed decimal as unsupported and a quoted or integer version as invalid. Check all three status symbols, malformed status forms, both source forms, string license and opaque attributes with and without a value. Verify ordered captured repetitions and rollback. Use deliberately misleading `:status unsat` with a controlled `sat` result and check one engine call and its emitted answer. Pair a well-sorted nonlinear QF_LIA input with strict metadata enabled to exercise unchanged signature admission. |
+| FE-P1-SEAL | With models and capture off, build an unused, nonliteral alias body and another alias body reachable from repeated assertion roots and a retained parameterized template. After successful check, observe reclamation of the unused alias-only graph and survival of all expected query roots and signatures through Node inspection. Use a test-only batch observation to count distinct owning slots including repeated aliases of one node. Repeat with independent retained root/child handles, and with capture on so the independent source records keep their roots. Destroy the session, then drop query and remaining handles and check reclamation and table detachment with a separate ManagerRef. Repeat model-enabled with no captured history and prove the unused body still resolves in detached inspection. |
+| FE-P1-MODEL | Enable model production. Declare an unused function plus `|plain|` and `|needs space|`, and use nullary and parameterized sort aliases with a shared nested array rank. Include a nullary term alias, a `:named` term and a parameterized definition. Destroy the original input and session before calling either `ForModelText` or `ForModelReader`. Check full free export coverage, necessary quoting only, dependency ordering and ordered semantic domain and range. Reparse rank text under the sealed signature and compare concrete sort identities. Use a deep shared sort chain to require compact alias output, two equivalent aliases to check deterministic selection, and a repeated parameter recipe to distinguish equal from unequal actual positions. Verify unused alias and unseen sort resolution, qualified array abstract readback and same-owner rejection of a foreign model. Exercise missing, duplicate and foreign export entries with the existing response and flush boundary tests. |
+| FE-P1-INSPECT | Exercise the legacy and explicit default model overloads and all three option fields in both model adapters. Capture starts fresh after detachment despite original metadata or declarations. Accepted post-check metadata publishes only to the new session, and a strict rejection rolls back. Verify exact typed request input and span with or without capture, including both bare and qualified spellings of an exposed abstract value, ordinary quoted token spelling and a direct alias operand. An ordered-then-canonicalized request confirms option forwarding without changing printed input. |
+| FE-P1-NODE | Compare ordinary indexed parsing with checked Node construction for extract, extension and rotation. Include an exact index beyond one word where the selected rank allows it, and out-of-order or unrepresentable indices with exact diagnostic attribution. At widths 1, 64 and 65 compare binary, hexadecimal where applicable, and indexed decimal literals, including width reduction of an oversized indexed numeral and distinct widths sharing low bits. Verify declared ranks after destroying borrowed rank scratch. Use FE-OVERHAUL-09 and FE-OVERHAUL-10 for shared commutative policy and compare rebuilt parents that carry instance, index, qualifier or rational payloads. Verify original roots and failure diagnostics. |
+| FE-P1-NAMES | With long names, optional quoting, forced table growth and distinct colliding keys, resolve old free declarations, parameterized calls and aliases to their exact identities. Exercise rollback and retry after growth, absent-name probes and local shadows. Test-only observations verify manager-backed canonical keys for eligible declarations, stable pooled keys for aliases and no insertion on failed lookups. Inspect the built non-testing frontend for absence of `Checkpoint` calls and failure-hook state. The rollback suite exercises the testing build. |
+| FE-P1-BENCH | Parse a small script with both nullary forms, one parameterized definition, a named annotation, repeated metadata and one check. Timed parsing keeps capture off and counts three definition commands. Inspect captures source records, counts one semantic template plus the two nullary bodies in the graph walk, and retains schema version 1 command and occurrence counts. Verify assertion, signature and root counts by hand. Repeat with a failed final command and inspect only committed history. |
+
+For FE-P1-BENCH, use the following fixture.
+
+```smt2
+(set-info :status unknown)
+(set-info :status sat)
+(set-logic QF_LIA)
+(define-fun a () Int 1)
+(define-const b Int a)
+(define-fun id ((x Int)) Int x)
+(assert (= (id (! b :named n)) n))
+(check-sat)
+```
+
+Expect eight successful commands, one assertion, one check, three term
+definition commands and one semantic template. Inspection has two metadata
+records, one name, one annotation, six root occurrences and zero free user
+functions and sorts. The body of each nullary definition, the named term
+and the annotation share the literal `1`.
+
+For the model rank fixture, a nullary alias chain can use
+`S0 = Int` and `S(n+1) = Array(Sn, Sn)`. A short top alias must be selected
+over the expanded rank. Declare a free function with the top sort written in constructor form and
+verify its export selects the top alias, with identical output in both
+capture modes. Add a parameterized `Pair(T) = Array(T,T)` and a control
+`Array(Int,Bool)` that it cannot spell. For standalone canonicalization,
+place reorderable children under each payload-carrying parent and compare
+the result with independently constructed checked nodes of the expected order
+and rank. Check that textual diagnostics retain the written argument order.
+These tests measure structural work and ownership through explicit
+observations. They impose no timing or RSS thresholds.
+
+## Phase 2 test design
+
+These GoogleTest cases specify the
+[fused protocol](../frontend/semantic-interfaces.md#phase-2-command-processing-and-publication)
+and its acceptance requirements. Use the public
+`ReadCommand`, `Run` and `SyntaxValidator` paths, instrumented Reader
+and sink callbacks, and controlled engines and model providers. Confirm
+exact source IDs, offsets, lines, byte columns, diagnostic categories and
+structured errors when applicable. Distinguish an emitted engine response
+from a solver-free check descriptor. Retain the earlier acceptance cases
+and follow the project test-change rule during migration.
+
+| Case | Fixture and independent expectation |
+| --- | --- |
+| FE-P2-SPLIT | Run a fixture with nonzero source ID through text, a Reader split once at every boundary, and a Reader returning exactly one byte per call. Include simple and quoted names, an indexed extract, exact BV and decimal tokens, an echo with doubled quotes and a multibyte scalar, a comment containing UTF-8, and LF, CR and split CRLF. Use a Reader that overwrites the refill window. Verify full command spans, exact echo bytes, sort and declaration identities, and exact BV values from the written widths and digits. End the final command at a chunk boundary and require no EOF read until the next call. Exercise an identical fixture with capture enabled and compare captured token renderings and occurrence spans. |
+| FE-P2-COORD | With one-byte reads, place a BV width mismatch on the second argument in `(bvadd #x01 #b1)`, and an invalid significand index in `((_ to_fp 5 1) RNE #x00)`. Put the blamed operands or indices before a split CRLF, comment and multiple later tokens so the diagnostic outlives their windows. Check the structured operand or parameter index and exact token span. For an unattributed arity error in `(bvsub #x01)` require the full application span. Test invalid leading bytes, an overlong encoding, a surrogate, a bad continuation and EOF mid-scalar in quoted data or a comment. Check the point at the first byte, with a preceding valid multibyte scalar to distinguish byte and scalar columns. Use the coordinate fixture below as a fixed oracle. |
+| FE-P2-DEPTH | Generate 16,384 nested unary `not` applications over a declared Bool, and independently verify one child per level and the original leaf. Repeat inside an unterminated command after an early unbound operand and require terminal syntax error, no root publication and iterative cleanup. Drive an equally deep opaque metadata value valid and one delimiter short, with and without capture. With capture disabled test scratch high-water on a deep value and a shallow value containing many sibling atoms. Completed siblings require no retained metadata text or syntax records. |
+| FE-P2-WIDTH | Use 8,192 ordered operands in `and`, with distinguishable Bool leaves and repeated occurrences. Check ordered edges and exact multiplicity using checked Node identity. Add 4,096 distinct parallel `let` binders, with an outer `x` distinct from the new `x` RHS. In one later RHS use `x` and the name staged by an earlier RHS; in the body use the new `x`. Check the three references resolve to the outer term, staged alias and new local term respectively. Reverse the named uses to fail. An invalid unused RHS still fails. Compare binder-free and scoped frame observations. Verify an owning operand span goes to construction without materializing a second array of views, including with optional canonicalization on. |
+| FE-P2-FLAT | Combine nested shadowing, ordinary and indexed applications, wide sibling lists and a long indexed BV numeral in one-byte Reader mode. Check the typed edges and exact modulo value. For both capture settings, the term depth and width must not grow the retained syntax fragment count. Compare a late index error with the same command containing an extra command argument. The first case blames the written index and the second terminates with a syntax error. Split a quoted 65-bit BV numeral within the name, after the complete name and after the width. Verify the same exact value at each split and then read another indexed numeral in the same command. An extra index on a BV literal must report the index-count diagnostic for the full literal and leave the next assertion readable. |
+| FE-P2-DATATYPE | Use the mutual Tree/Forest group below with one-byte reads. Check the forward field of `node` resolves to `Forest Int` and the recursive `cons` fields resolve to `Tree Int` and `Forest Int`. Check that `nil` and `leaf` are finite witnesses, and type a qualified constructor use and a match. Inspect the previous group and sort ranges in a Reader callback between headers and fields. Check group publication after close, and rollback for a header/body count mismatch, an unknown late field sort and a nonproductive group. Retry the fresh failed names in well-formed cases. |
+| FE-P2-FP | With fragmented input under `QF_FP`, convert `(/ (- 1.5) (/ 3 2))` with `((_ to_fp 8 24) r ...)` and a declared symbolic RM `r`. Expect a Float32 rational conversion with exact reduced payload `-1/1` and only the RM child. For `(/ 1 (/ 0 3))` check the unsupported diagnostic spanning the entire `(/ 0 3)`, across CRLF and comments. Under `QF_UFFP`, in separate fixtures declare `|/|` or `|-|` with domain `(Bool Bool)` and BV1 range. Require signed-BV conversion on a valid bound call and an ordinary rank or type diagnostic on a bad call. Include `(/ (- 1) 2)` with only the inner head bound, and `(let ((/ #b1)) ((_ to_fp 8 24) r (/ 1 2)))` for a lexical binding. Use an unbound control to select the rational rank. Under `ALL`, use `(- (- 4) 1)` as the second operand. The outer binary minus disqualifies the candidate, and the Int result fails the FP/BV rank at that operand. Compare `((_ to_fp 8 24) r (- 1) #b1)` for wrong arity. With `(/ 1 (/ 0 3))` as the second operand and a third operand present, require an ordinary division diagnostic without the rational zero-divisor detail. |
+| FE-P2-PRECEDENCE | After a valid prefix, drive an early unbound-name error followed by an extra `assert` slot, an invalid token, a missing close or an I/O failure. Expect syntax or I/O ahead of unbound-name failure, no further semantic reductions after the error, and no reads after terminal failure. Contrast a well-formed command with two unbound occurrences: blame the first in reduction order and let the next call commit a legal assertion. Include a semantic error on an open head with a span closed only during drain, and a well-formed unsupported command with a malformed version of the same command. |
+| FE-P2-STAGING | Establish an assertion, a declaration and a captured named occurrence. In the next command, pause refill after reducing `(! true :named n)` and before finishing the surrounding `and`. The Reader inspects `GetPrefix()`, `GetOptions()`, `GetPhase()` and `GetSourceRecords()` on every callback. Compare all committed ranges and history counts to the snapshots from before the call. A subsequent operand `n` resolves within that command. On success observe exactly one assertion and named occurrence after return. With a late ill-sorted operand, observe the old prefix and successfully retry with the same name. With a malformed tail, observe the old prefix and terminal syntax. Repeat with capture off. Assert that plain declarations and assertions create no staging overlay in either capture mode. |
+| FE-P2-REENTRANCY | During a refill, observe the committed prefix through all four Session getters. Attempt nested `ReadCommand` and `Run` on the active Session, and separately nested `SyntaxValidator::ReadNext` on the active validator. Require `kInvalidState` for each nested call, then verify the outer read completes with its exact expected result and intact state. |
+| FE-P2-RESOURCE | Sweep frontend and applicable Node allocation checkpoints across lexical scratch growth, live grammar and operand growth, overlay insertion, pending text and source histories, descriptor preparation, staged sort/function publication, datatype recipes and commit, and sealing. Inject each failure after a successful prefix. Assert exact resource classification, no new visible effects, and surviving original handles. Recover and retry the same spelling after a well-formed failure if grammar reached the boundary. Pair one recoverable semantic allocation fault with a malformed tail and require grammar to win. When frame growth prevents completion, require termination and zero later Reader calls. Compare capture-on and capture-off state and require one effect on successful retry. |
+| FE-P2-INPUT-IO | From a prior committed alias and assertion, return an explicit I/O error, throw, or return a byte count beyond window capacity during the next command with pending aliases. Check `kInputIo` at the current point, preserved explicit error code, rollback and terminal no-read behavior. Compare a zero-byte successful read at the same truncated offset, which is terminal syntax. A zero-byte success between commands ends normally. |
+| FE-P2-RUN-GATE | With model production enabled and a controlled `unknown` result without a candidate, run `(get-value (missing))` and require `kModelUnavailable` ahead of unbound-name failure. Compare an empty list, missing close and extra request slot, which yield syntax. Pair valid and malformed `get-model` after `unsat` and `:reason-unknown` after `sat`; valid forms fail state, malformed ones fail grammar. Test a pre-check request and a disabled-model request as phase/option controls. In every rejected request check one prior engine invocation where a check succeeded, no evaluation or model rendering, and no response bytes except earlier responses and one diagnosed error. After `unknown`, verify reason output uses the actual reason even without a candidate. |
+| FE-P2-CHECK-EXIT | Have the Reader return through the `check-sat` closing byte, then require engine count one and a complete flushed result on the next callback, before yielding either EOF or a suffix. Use a buffered bad suffix with write/flush and diagnostic event logging, and verify the result precedes the suffix error. A truncated check never calls the engine. For `exit`, offer a suffix that would throw if fetched separately and a buffered suffix containing illegal UTF-8 and delimiters. Check one committed exit descriptor, any enabled success response, no suffix lexing and no extra Reader call. A malformed exit yields an error. |
+| FE-P2-RESPONSES | Exercise fixed and dynamic response tags with allocation observation at descriptor construction. Verify exact text for the supported fixed info and option defaults, unsupported harmless queries and the actual reason. Check that toggling `:print-success` governs its own acknowledgement. For `echo`, span refills inside doubled quotes, CRLF and UTF-8 and compare the exact raw string token. With no response tag check no write and no flush. Destroy the source/session before reading the returned echo payload. |
+| FE-P2-VALUES | With a controlled owner and capture both off and on, read a multi-term request containing comments, quoted spellings, a direct alias, a bare exposed abstract name and its qualified form. Check normalized token spacing, exactly one qualifier per abstract reference, untouched quoted lookalikes, exact request spans and typed identities, and retained text after source destruction. Compare a late ill-sorted, malformed or unsupported request against the same valid first term. No evaluation or value-response byte occurs in any failing variant. Cover the QF_UFIDL negative-value exception, an unknown abstract name, a solver-free request that needs an unavailable model binding, same-owner detached resolution and a foreign owner sharing the query. |
+| FE-P2-VALUE-OUTPUT | Prepublish one abstract name with a complete response. In a later two-value response, stage a distinct value and fail a write after its spelling has partly or wholly escaped. Separately fail flush after all bytes, fail evaluation of the second term after earlier bytes, and inject allocation failure preparing a new registry entry. Assert failure leaves the stream terminal with no appended error after any committed byte, no later command processed, and no new visible binding. In a detached session on the returned owner, resolve the earlier name, reject the uncommitted name, then retry and publish the new name using the next committed ordinal. Include a control that fails before the first byte and can emit one complete error if the sink is usable. |
+| FE-P2-SYNTAX-ONLY | Read an undeclared application and an assertion before logic using `SyntaxValidator` and require headers with exact spans; the typed reader diagnoses missing logic or bindings as applicable. Check well-formed excluded forms, malformed nested binders, split metadata and syntax-only exit on buffered malformed bytes. Confirm the grammar path can run without a semantic session, factory or owning whole-command syntax records. |
+| FE-P2-BENCH | Run the Phase 1 benchmark fixture above through all fused adapters. Expect eight committed commands, three term definitions, one template, one assertion and one check. Stop on a well-shaped failing suffix and verify the schema 2 counts and committed-prefix offset. Check read timing and teardown fields and report integration without timing or RSS thresholds. |
+
+For FE-P2-COORD, the bytes `(echo "é")\r\n(echo "` followed by `E2 82`
+and EOF put the incomplete scalar at offset 20, line 2, column 8.
+Its span is empty at that point. For delayed operand and index attribution,
+compute endpoints from the fixture's explicitly recorded byte positions
+as the fixture is built, using literal line fragments and hard-coded
+column expectations.
+
+For FE-P2-DATATYPE use this group under `ALL`.
+
+```smt2
+(declare-datatypes ((Tree 1) (Forest 1))
+  ((par (T) ((leaf (value T)) (node (children (Forest T)))))
+   (par (U) ((nil) (cons (first (Tree U)) (rest (Forest U)))))))
+```
+
+For resource and lifetime observations, use testing-only checkpoints
+and counters at the responsible operation. Preserve the existing
+allocation and I/O diagnostic policies and check progress only through
+observable boundaries. Run the applicable frontend and Node cases under
+GCC and Clang and the working sanitizer configuration in the
+[acceptance procedure](../frontend/design.md#build-and-acceptance-commands).
+Record unavailable configurations and the first missing-interface build
+accurately. The structural cases use bounded sizes and require no corpus
+or solver backend.
+
 ## Case-level traceability
 
 The table links the documented requirements to existing cases. The
 [acceptance record](../frontend/implementation.md#build-and-test-evidence)
-records the Phase 2 and historical suite results. The Phase 2 cases below
-extend the listed observations.
+records the baseline and earlier suite results. Existing case names and
+baseline observations are traceability evidence. The Phase 1 cases above
+govern the revised API and output expectations.
 
 | Requirement | Existing cases and observations |
 | --- | --- |
@@ -556,11 +676,11 @@ extend the listed observations.
 | Provider signature and model response boundary. | `RejectsIncompleteOrOutOfOrderExportsAndForeignValues`, `ValidNodeRanksCannotSmuggleSortsOutsideTheSignature` and `FpRoundingFailureRespectsModelResponseBoundary`. [model_test.cc](../../tests/frontend/model_test.cc#L393) |
 | Benchmark regression and oracle disposition. | `ClassifyTest` checks process and protocol records. `RunnerVerdictTest` checks the report and exit status with synthetic process outcomes, including zero sample XOR evidence. [benchmark_regression_test.py](../../tests/frontend/benchmark_regression_test.py) |
 
-## Phase 2 test design
+## Baseline refinement cases
 
-The GoogleTest suite implements these Phase 2 cases. The
-[Phase 2 run](../frontend/implementation.md#verified-phase-2-run) records
-their verification before the post-fix cleanup. The
+The GoogleTest suite implements these baseline refinements. The
+[verified frontend baseline run](../frontend/implementation.md#verified-frontend-baseline-run)
+records their verification before the post-fix cleanup. The
 [operator schemas](../node/operators.md), [logic profiles](../frontend/logic-profile.md)
 and [frontend semantic interfaces](../frontend/semantic-interfaces.md)
 provide the oracles for exact success results and failure diagnostics.
@@ -571,7 +691,7 @@ provide the oracles for exact success results and failure diagnostics.
 | --- | --- |
 | FE-RANK-02, `operator_test.cc` | Strengthen the per-spelling negatives using the rank of each case. For fixed ranks, remove one operand where the remaining form cannot select another accepted rank, and append one otherwise well-sorted operand. For n-ary ranks, go below the declared minimum and keep an accepted larger instance. Test incorrect sorts at the positions with distinct restrictions, including FP rounding mode and later FP value operands, `ite` condition and branch agreement, BV width agreement, and array index and element ranks. For indexed operators vary the index count, token class or range where meaningful. Keep overload transitions and Core `and`/`or` short ranks as positive controls. |
 | FE-RANK-SPAN-02, `operator_test.cc` | In an otherwise valid multiline request, use `(bvadd #x00 #b0)`. Expect `kInvalidInput`, retained `NodeError` with `operand_index=1` and the exact `SourceSpan` of `#b0`. Exercise the shared application diagnostic mapping with a `NodeError` attributed to the first written `to_fp` index. The frontend produces this error during minimum-bound validation. Direct Node construction with a negative index also produces an attributed error, but the indexed SMT-LIB form accepts only numerals for these operators. Verify the full application span on a builtin error with neither index. Check source ID, offsets and line/byte columns. For `((_ to_fp 5 11) RNE (/ 1 (/ 0 3)))`, expect `kUnsupported` and the exact span of `(/ 0 3)`. |
-| FE-PROFILE-SHAPE-02, `sort_datatype_test.cc` and `operator_test.cc` | Under QF_SAT, `(Array Real)` and a `declare-datatypes` group with unequal header and body counts are invalid. Well-shaped Array or datatype declarations stay unsupported. `((_ fp.to_real 0) true)` is invalid because `fp.to_real` is unindexed. A plain `fp.to_real` application or an excluded regex operator with the expected numeral indices remains unsupported. Reject wrong regex index counts and symbolic indices. |
+| FE-PROFILE-SHAPE-02, `sort_datatype_test.cc` and `operator_test.cc` | Under QF_SAT, `(Array Real)` is invalid (`kInvalidInput`), and a `declare-datatypes` group reports its first deferred `kUnsupported` diagnostic under QF_SAT and `kInvalidInput` for unequal header and body counts under QF_DT (with grammar failure winning when unclosed). Well-shaped Array or datatype declarations under QF_SAT stay unsupported. `((_ fp.to_real 0) true)` is invalid because `fp.to_real` is unindexed. A plain `fp.to_real` application or an excluded regex operator with the expected numeral indices remains unsupported. Reject wrong regex index counts and symbolic indices. |
 | FE-FP-02, `operator_test.cc` | Convert a known FP(8,24) operand using `((_ to_fp 5 11) rm f)`. Check `kFpConvert`, ordered children `rm,f`, exact indices 5 and 11, and FP result components 5 and 11 in that order. A BV16 packed operand selects `kFpFromBits` and its BV15 companion is invalid. Parse Core `=` and `fp.eq` with the same ordered `(_ +zero 5 11)` and `(_ -zero 5 11)` operands. Check distinct zero identities, Bool result and `kEqual` versus `kFpEq`. Core equality distinguishes the signs and `fp.eq` equates them, so losing either kind or zero sign changes the meaning. |
 | FE-ARRAY-RANK-02, `operator_test.cc` | For `a : (Array Bool Int)`, check `(select a true)`, `(store a true 8)` and `((as const (Array Bool Int)) 8)`. Check exact index and element identity on the returned array sort and the ordered operands. Independently change the select index to Int, the store index to Int, the store element to Bool and the constant-array value to Bool. Each fails its own rank. Add a positive control over `(Array Int Bool)` to check the inverse ordering of the two sorts. |
 | FE-PROFILE-02, `profile_test.cc` | For every registry row, assert the complete ordered root list and exact count. Derive the expected sequence from the written fixture: base `kEqual`, BV `kEqual` with `kBvNot`, Int `kEqual` with `kIntPow` over `kIntMul` and a `kIntAdd` right operand, array `kArraySelect`, datatype tester `kApply`, FP `kFpEq`, restricted Int `kIntLe`, and free function `kApply` for a U-permission row. Select only the applicable entries and check tester versus free declaration identity. Add standalone QF_UFLIA `(assert (= (div x 2) 3))` and typed value `(div x 2)` with declared Int `x`. Require `kIntDiv`, ordered Int operands and Int result in both contexts. Reject a colliding `div` declaration and preserve explicit UF identity when that spelling is declared under QF_UFIDL. |
@@ -584,15 +704,15 @@ provide the oracles for exact success results and failure diagnostics.
 
 | ID and target | Fixture and expected observations |
 | --- | --- |
-| FE-ROLLBACK-02, `command_test.cc` | For each of option update, metadata append, logic selection, query sealing and free sort/function publication, supply two identical commands in the stream. Inject a deterministic allocation failure in the first `Apply`, inspect after it is consumed, then apply the duplicate successfully. Test option fields and absence of a success descriptor, exact ordered metadata, before-logic phase and empty logic, building phase with the same assertions and metadata before successful sealing, and exact prior declaration counts/identities with the failed spelling reusable. After retries require exactly one published effect per command. Sweep the applicable publication checkpoints at these boundaries, with a clean prefix as control. |
+| FE-ROLLBACK-02, `command_test.cc` | For each of option update, metadata append, logic selection, query sealing and free sort/function publication, supply two identical commands in the stream. Inject a deterministic allocation failure in the first `ReadCommand`, inspect after it is consumed, then read the duplicate successfully. Test option fields and absence of a success descriptor, exact ordered metadata, before-logic phase and empty logic, building phase with the same assertions and metadata before successful sealing, and exact prior declaration counts/identities with the failed spelling reusable. After retries require exactly one published effect per command. Sweep the applicable publication checkpoints at these boundaries, with a clean prefix as control. |
 | FE-ROLLBACK-NAME-02, `binding_test.cc` | In a command with an initial valid `:named staged` annotation, trigger an error inside a later nested annotation with an open lexical reference or a conflicting name. Check that no assertion, source annotation or new alias from the failed command is published. Retry a corrected command using the same fresh spellings. Check that the successful names and annotations occur in source order and the earlier committed prefix is retained. |
 | FE-DRIVER-02, `driver_test.cc` | Enable `:print-success`, set logic, assert `false`, disable `:print-success`, request an unknown option, and check with a controlled engine returning `unsat`. Expect exactly `success\nsuccess\nsuccess\nunsupported\nunsat\n` and five flushes. An invalid post-check command adds one complete error and one flush. In a separate script enabling success then exiting, expect `success\nsuccess\n`, two flushes and no suffix processing. Compare `(set-logic QF_SAT)(assert false)(check-sat)` with the same script inserting `(reset-assertions)` before check. The control engine returns `unsat` only with the single retained false assertion and `sat` if it is missing. The reset script must have exactly `unsupported\n`, one flush, status 1, zero engine calls and its committed false assertion intact. |
-| FE-READER-02, `syntax_test.cc` and `driver_test.cc` | Return complete logic and assertion commands and a partial next command from the reader, then throw during that command. Check `kInputIo` at the known boundary with exact source coordinates, `kTerminated`, preservation of the complete prefix and no pending partial command. A second `NextSyntax` reads no bytes. For driver execution, require one complete error and its flush, no suffix processing and no check invocation for an incomplete check. Use EOF and an explicit `ReadResult` I/O error at that boundary as separate controls. |
+| FE-READER-02, `syntax_test.cc` and `driver_test.cc` | Return complete logic and assertion commands and a partial next command from the reader, then throw during that command. Check `kInputIo` at the known boundary with exact source coordinates, `kTerminated`, preservation of the complete prefix and no pending partial command. A second `ReadCommand` reads no bytes; verify the corresponding terminal behavior with `SyntaxValidator::ReadNext`. For driver execution, require one complete error and its flush, no suffix processing and no check invocation for an incomplete check. Use EOF and an explicit `ReadResult` I/O error at that boundary as separate controls. |
 | FE-MODEL-CREATE-02, `model_test.cc` | Move the sole provider and a query into `ModelOwner::Create` with an ineligible answer or model-disabled query. Check `kModelFailure`, no owner, and one provider destruction while any supplied query remains live. Use a destructor counter and a weak query sentinel without an independent owning query in the failure fixture. Exercise an injected construction allocation failure if available at that boundary, with the corresponding resource diagnostic. A successful construction keeps the provider alive through owner release. |
 | FE-MODEL-COMMIT-02, `model_test.cc` | Publish an existing abstract name in a successful response. In a later multi-value request, write a pair containing a fresh abstract name, then fail the second evaluation. Separately fail the sink with a short write and with a flush error after all bytes. Retain the owner outside the failing driver, reopen inspection and verify only the earlier name resolves. In a successful retry, repeated equal values share one new name and that name is readable after flush. Apply the same check to `get-model` with an early record containing a staged proxy followed by an invalid record. Check exact output prefix, flush counts, and absence of a second diagnostic after response bytes. |
 | FE-READER-EXCEPTIONS-02, `syntax_test.cc` | Deliver a partial command after a complete committed prefix, then throw `std::bad_alloc` or `std::runtime_error` from the reader. Require `kInputIo` at the exact read boundary, an unchanged committed prefix, and immediate termination with no subsequent read. |
 | FE-MODEL-RESERVE-02, `model_test.cc` | Publish `@value0`, then arm the allocation fault once the sink accepts the last value pair or function record containing two fresh names. Fail each capacity allocation in turn, with and without a flush callback. Require a C++ allocation diagnostic, exact output ending at the final body record, no flush, and lookup of `@value0` alone. Retry and verify that the new names are published and resolve with the same ordinals. |
-| FE-MODEL-BOUND-02, `model_test.cc` | Create two owners from the very same sealed query and manager. Expose `@value0` in both for different controlled values. For both `ForModelText` and `ForModelReader`, pass the second owner to `Apply` of a session bound to the first and require `kModelFailure`, consumption of the failed command and no lookup or evaluation in the other owner. A following identical request with the default binding and one with the original explicit owner both obtain the original value. |
+| FE-MODEL-BOUND-02, `model_test.cc` | Create two owners from the very same sealed query and manager. Expose `@value0` in both for different controlled values. For both `ForModelText` and `ForModelReader`, pass the second owner to `ReadCommand` of a session bound to the first and require `kModelFailure`, consumption of the failed command and no lookup or evaluation in the other owner. A following identical request with the default binding and one with the original explicit owner both obtain the original value. |
 | FE-MODEL-SORT-TEXT-02, `model_test.cc` | Under ALL, define `A0(T)=T` and `A(n+1)(T)=Array(A(n)(T),A(n)(T))` through depth 12 or greater. Return an abstract value of a concrete application such as `(A12 Bool)` and export a matching qualified term. Exercise the shared sort in a generated abstract-value ascription and in a generated constructor or constant-array qualifier as applicable. Verify the compact alias keeps rendered bytes bounded by the written spelling, resolves to the exact same sort in the sealed signature, and survives release of input text. Use a finite deterministic size/work assertion that an unfolded exponential sort would exceed. Keep a small alias-free sort control and check parameter order with an asymmetric alias. |
 
 The post-fix scale fixture extends FE-MODEL-SORT-TEXT-02 through depth 64
@@ -610,7 +730,7 @@ provider. Use one valid fixture and mutate one part per case.
 | --- | --- |
 | Scalar description | Missing description, null node, a nonliteral term of the correct sort, a literal of a different sort, and a literal from a different manager. Require `kModelFailure`. |
 | Datatype description | Missing or null constructor instance, selector or tester supplied as constructor, wrong constructor instance/sort, wrong field count, wrong field sort, same-sort foreign field value, and a cycle through a repeated active semantic key. Require `kModelFailure`. A correctly typed finite value with a repeated sibling key is a valid control. |
-| Export signature and bodies | Missing, duplicate, foreign or extra declarations, forward reference, wrong result sort, wrong number of formals, repeated or foreign formal, wrong formal sort or kind, unbound formal, and operation or sort outside the active signature. Require `kModelFailure`. A correct dependency-ordered export keeps the exact original ranks. |
+| Export signature and bodies | Missing, duplicate, foreign or extra declarations, forward reference, wrong result sort, wrong number of formals, repeated or foreign formal, wrong formal sort or kind, unbound formal, and operation or sort outside the active signature. Require `kModelFailure`. A correct dependency-ordered export keeps the exact semantic domain and range. |
 | Export proxies | Missing proxy mapping, repeated mapping for one declaration, a foreign value or proxy, and a proxy with a wrong sort where constructible at the tested boundary. Require rejection. Two distinct valid proxies of one semantic value must share its printed name. |
 | Callback and response boundary | A provider error or exception before the first model response byte yields one complete diagnostic if the sink is usable. A description or export validation fault in a later record leaves exactly the written prefix with no appended error. In each case keep earlier check output, assert exact flush counts, verify no trailing command is applied and inspect name visibility as in FE-MODEL-COMMIT-02. |
 
@@ -650,7 +770,8 @@ scripts.
 `tests/frontend/overhaul_test.cc` is registered with the frontend CTest suite.
 It exercises the [overhaul contracts](../frontend/design.md) through the
 public session API and the test-only frontend and Node inspection hooks.
-The cases precede implementation of the new interfaces and counters.
+Use source capture when checking successful provenance. Use the semantic
+context and exact diagnostics with capture disabled.
 
 | Case | Fixtures and independent expectations |
 | --- | --- |
@@ -658,10 +779,10 @@ The cases precede implementation of the new interfaces and counters.
 | FE-OVERHAUL-02 | Shift CRLF, UTF-8 and doubled quotes across the 64 KiB boundary and render a quoted token longer than two reader windows. Inject a reader error at each byte boundary of a command after a committed prefix. Check exact failure position, error code, committed metadata and termination. Compare an incomplete UTF-8 token across splits. Deliver a separate unread malformed suffix after `exit` and assert the reader is never called for it, including when some suffix bytes were already buffered. |
 | FE-OVERHAUL-03 | Compare wide and deep value lists on text and reader paths, with and without forced widening. Verify exact rendering and spans, every ordered child of a wide node, and the full deep chain. Normal growth allocates multiple pages and reports zero copies and promotions. A low threshold reports promoted pages while preserving all observed results. |
 | FE-OVERHAUL-04 | A named `let` with an unused RHS referencing an outer binder is closed. Check shadowing and simultaneous outer resolution on used RHSs, and reject an unused but ill-typed RHS. An open reference still fails when it resolves to the same node as a closed occurrence. A first-match-unreachable branch still produces valid annotation events and still fails if it has an external dependency. Failed commands publish no names, annotations or assertions, and a later command can reuse the spellings. A nested named chain publishes innermost first and visits one operand occurrence per annotation. |
-| FE-OVERHAUL-05 | Check quoted function spellings and ordered rank views after reader backing and the session are destroyed. Exercise the existing string and vector comparisons, indexing, size, back and iteration. Reject an owning `std::vector<std::string>` rank member at compile time. Look up free declarations on either side of gaps due to definitions, formals, a failed command and datatype publication. Reject nonfree, null and foreign declarations. Force structural node-table collisions and verify complete declaration and literal identity, including equal BV values with multiple spellings and unequal widths. |
+| FE-OVERHAUL-05 | Exercise free membership across declaration gaps and exact BV structural identity as in FE-P1-QUERY and FE-P1-NODE. Check quoted spellings, ordered rank text and independent record copies with FE-P1-SOURCE. |
 | FE-OVERHAUL-06 | Observe a cold miss, small-key hit, oversized bypass and eviction with exact integer readback. Concrete BV and FP sort occurrences reuse resolved sorts while differing keys keep their correct widths or formats. Access each of 8,192 distinct short keys twice in succession and verify one hit per key. Replay every key once after the same warm-up in a fresh session and require some replay misses. This observes eviction without picking which keys should survive. Repeat a 16,384-digit integer as the oversized-key fixture. |
 | FE-OVERHAUL-07 | Sweep apply-time allocation checkpoints in a declaration with repeated sorts and an assertion with repeated literals. Preserve the original function, assertion and name records on every injected resource failure. Apply a repeated command in the same session and check its typed and rendered contents and published counts. |
-| FE-OVERHAUL-08 | Drop the last query owner after the session ends. Duplicate owners of one term occur in assertions, a definition body, named terms and annotations. With a separately retained root or child, check exact survivors, identities and table shrinkage. With neither, check reclamation and full table detachment through the retained manager. |
+| FE-OVERHAUL-08 | Use FE-P1-SEAL to check alias reclamation and captured owners, with duplicate root handles, independently retained children and final table detachment. |
 | FE-OVERHAUL-09 | Verify every permitted operator family at its applicable arity and ordered controls in both enabled parsing and standalone normalization. Compare child identities against explicit source operands or independently sorted eligible positions. Keep FP rounding and FMA addend positions fixed, and preserve the order of signed zeros in `fp.min` and `fp.max`. Unlisted controls include ordered comparisons, subtraction, concatenation, implication, ordered UF arguments, `ite`, select and store. |
 | FE-OVERHAUL-10 | Legacy and explicit default options preserve ordered sums. Enabled parsing and the standalone batch and single-root overloads merge equivalent `ite`, `and` and UF parents after a child is reordered. Verify original standalone roots, repeated operands, nested operator boundaries, query publication, and original source rendering. Attribute a type error to its written operand with normalization enabled. A 512-operand permutation checks exact sorted child IDs and stable node IDs across independent text and reader sessions. |
 

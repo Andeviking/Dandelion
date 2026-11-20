@@ -37,9 +37,11 @@ TEST_F(Identity, AllApplicableKeyFieldsSurviveForcedCollision) {
             Op(Kind::kFpFromRational, {rm.Borrow()}, fmt, {}, q3.Borrow()));
   const auto fp = Fp(8, 24);
   const auto other_format = Fp(2, 2);
+  const auto nan = SpecialFp(Format(8, 24), FpSpecial::kNaN);
+  const auto other_nan = SpecialFp(Format(2, 2), FpSpecial::kNaN);
   EXPECT_NE(
-      Take(manager_.MakeFpSpecial(fp.Borrow(), FpSpecial::kNaN)),
-      Take(manager_.MakeFpSpecial(other_format.Borrow(), FpSpecial::kNaN)));
+      Take(manager_.MakeFpValue(fp.Borrow(), nan.Borrow())),
+      Take(manager_.MakeFpValue(other_format.Borrow(), other_nan.Borrow())));
   const std::array domain = {z.Borrow()};
   const auto d1 = Take(manager_.DeclareFunction("f", domain, z.Borrow()));
   const auto d2 = Take(manager_.DeclareFunction("f", domain, z.Borrow()));
@@ -100,4 +102,141 @@ TEST_F(Identity, RationalKeyKeepsEachChangedComponentLive) {
   EXPECT_EQ(one_third, make(2, 6));
 }
 
+}  // namespace dandelion::testing
+
+namespace dandelion::testing {
+namespace {
+
+TEST_F(Identity, BorrowedNumericKeysOutliveSourceValuesAndFacade) {
+  NodeTestPeer::ForceCollisions(manager_, 15);
+  const auto bv = Bv(129);
+  const auto fp = Fp(8, 65);
+  auto integer_input = Number("-340282366920938463463374607431768211457");
+  auto bv_input =
+      ExactBv(129, View(Number("340282366920938463463374607431768211457")));
+  auto fp_input = FpBits(Format(8, 65), View(Number("18446744073709551617")));
+  auto integer = Take(manager_.MakeInt(integer_input.Borrow()));
+  auto bitvector = Take(manager_.MakeBvValue(bv.Borrow(), bv_input.Borrow()));
+  auto floating = Take(manager_.MakeFpValue(fp.Borrow(), fp_input.Borrow()));
+  auto rounding = Take(manager_.MakeRoundingMode(RoundingMode::kRne));
+  const std::array format{Integer(8), Integer(65)};
+  const auto convert = [&](RationalView value) {
+    return Op(Kind::kFpFromRational, {rounding.Borrow()}, format, {}, value);
+  };
+  auto rational = convert(View(Take(
+      Rational::Make(View(Number("-18446744073709551617")), IntegerView(3)))));
+  const auto rational_view = *rational.Borrow().GetRationalParameter();
+  const auto int_view = *integer.Borrow().GetValue()->GetInteger();
+  const auto bv_view = *bitvector.Borrow().GetValue()->GetBitVector();
+  const auto fp_view = *floating.Borrow().GetValue()->GetFloatingPoint();
+
+  auto i = std::move(integer_input);
+  auto b = std::move(bv_input);
+  auto f = std::move(fp_input);
+  EXPECT_EQ(Take(manager_.MakeInt(i.Borrow())), integer);
+  EXPECT_EQ(Take(manager_.MakeBvValue(bv.Borrow(), b.Borrow())), bitvector);
+  EXPECT_EQ(Take(manager_.MakeFpValue(fp.Borrow(), f.Borrow())), floating);
+  i = Integer(0);
+  b = ExactBv(1, IntegerView(0));
+  f = SpecialFp(Format(2, 2), FpSpecial::kPositiveZero);
+
+  std::vector<Node> colliders;
+  for (const auto text : {"340282366920938463463374607431768211457",
+                          "-340282366920938463463374607431768211458",
+                          "-680564733841876926926749214863536422913"}) {
+    const auto value = Number(text);
+    colliders.push_back(Take(manager_.MakeInt(value.Borrow())));
+    EXPECT_NE(colliders.back(), integer);
+  }
+  for (const auto text :
+       {"18446744073709551617", "340282366920938463463374607431768211458"}) {
+    const auto value = ExactBv(129, View(Number(text)));
+    colliders.push_back(
+        Take(manager_.MakeBvValue(bv.Borrow(), value.Borrow())));
+    EXPECT_NE(colliders.back(), bitvector);
+  }
+  for (const auto text : {"36893488147419103233", "18446744073709551618"}) {
+    const auto value = FpBits(Format(8, 65), View(Number(text)));
+    colliders.push_back(
+        Take(manager_.MakeFpValue(fp.Borrow(), value.Borrow())));
+    EXPECT_NE(colliders.back(), floating);
+  }
+  const auto ratio_owner = Take(
+      Rational::Make(View(Number("-18446744073709551617")), IntegerView(3)));
+  const auto changed_numerator = Take(
+      Rational::Make(View(Number("-18446744073709551616")), IntegerView(3)));
+  const auto changed_denominator = Take(
+      Rational::Make(View(Number("-18446744073709551617")), IntegerView(5)));
+  colliders.push_back(convert(changed_numerator.Borrow()));
+  colliders.push_back(convert(changed_denominator.Borrow()));
+  EXPECT_NE(colliders[colliders.size() - 2], rational);
+  EXPECT_NE(colliders[colliders.size() - 1], rational);
+  EXPECT_NE(colliders[colliders.size() - 2], colliders.back());
+  const auto before = NodeTestPeer::GetStats(manager_);
+  for (std::int64_t value = 0; value < 40; ++value)
+    colliders.push_back(Int(value));
+  EXPECT_GT(NodeTestPeer::GetStats(manager_).table_capacity,
+            before.table_capacity);
+  for (const auto& node : colliders)
+    EXPECT_EQ(NodeTestPeer::StructuralHash(node), 15);
+
+  const auto b_owner =
+      ExactBv(129, View(Number("340282366920938463463374607431768211457")));
+  const auto f_owner =
+      FpBits(Format(8, 65), View(Number("18446744073709551617")));
+  EXPECT_EQ(Take(manager_.MakeInt(
+                View(Number("-340282366920938463463374607431768211457")))),
+            integer);
+  EXPECT_EQ(Take(manager_.MakeBvValue(bv.Borrow(), b_owner.Borrow())),
+            bitvector);
+  EXPECT_EQ(Take(manager_.MakeFpValue(fp.Borrow(), f_owner.Borrow())),
+            floating);
+  EXPECT_EQ(Take(manager_.MakeInt(int_view)), integer);
+  EXPECT_EQ(Take(manager_.MakeBvValue(bv.Borrow(), bv_view)), bitvector);
+  EXPECT_EQ(Take(manager_.MakeFpValue(fp.Borrow(), fp_view)), floating);
+  EXPECT_EQ(convert(ratio_owner.Borrow()), rational);
+  EXPECT_EQ(convert(rational_view), rational);
+
+  NodeTestPeer::FailAllocationAfter(manager_, 0);
+  NodeTestPeer::FailRetainAfter(manager_, 0);
+  EXPECT_EQ(integer.Borrow().GetValue()->GetInteger()->MagnitudeChunk(2), 1);
+  EXPECT_EQ(bitvector.Borrow().GetValue()->GetBitVector()->Chunk(2), 1);
+  EXPECT_EQ(
+      floating.Borrow().GetValue()->GetFloatingPoint()->FiniteBits()->Chunk(1),
+      1);
+  const auto fraction = rational.Borrow().GetRationalParameter();
+  ASSERT_TRUE(fraction);
+  EXPECT_EQ(fraction->Numerator().MagnitudeChunk(1), 1);
+  EXPECT_EQ(fraction->Denominator().TryUint64(), 3);
+  EXPECT_EQ(Take(manager_.GetStorageStats()).numeric_backing_bytes, 0);
+  const auto retain = manager_.RetainNode(integer.Borrow());
+  Resource(retain, ResourceKind::kReferenceCount);
+  const auto allocate = manager_.MakeInt(IntegerView(40));
+  Resource(allocate, ResourceKind::kCppAllocation);
+  NodeTestPeer::ClearFailures(manager_);
+
+  colliders.clear();
+  manager_ = {};
+  EXPECT_EQ(int_view.ToDecimal(), "-340282366920938463463374607431768211457");
+  EXPECT_EQ(bv_view.Chunk(2), 1);
+  EXPECT_EQ(fp_view.Format(), Format(8, 65));
+  const auto int_copy = int_view.Copy();
+  const auto bv_copy = bv_view.Copy();
+  EXPECT_EQ(rational_view.Numerator().ToDecimal(), "-18446744073709551617");
+  const auto fp_copy = fp_view.Copy();
+  const auto rational_copy = rational_view.Copy();
+  integer = {};
+  bitvector = {};
+  floating = {};
+  rational = {};
+  rounding = {};
+  EXPECT_EQ(rational_copy.Borrow().Numerator().ToDecimal(),
+            "-18446744073709551617");
+  EXPECT_EQ(rational_copy.Borrow().Denominator().TryUint64(), 3);
+  EXPECT_EQ(int_copy.ToDecimal(), "-340282366920938463463374607431768211457");
+  EXPECT_EQ(bv_copy.Borrow(), b_owner.Borrow());
+  EXPECT_EQ(fp_copy.Borrow(), f_owner.Borrow());
+}
+
+}  // namespace
 }  // namespace dandelion::testing

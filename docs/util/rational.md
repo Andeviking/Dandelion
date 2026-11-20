@@ -1,49 +1,83 @@
 # Rational
 
-Status: **proposed extension of an existing implemented value**. `Make`,
-normalization, borrowing, ownership, `ParseDecimalFraction`, `Negate`
-and `Divide` are implemented. The wider arithmetic design follows below.
+**Status.** The standalone value and arithmetic are implemented in Phase 3.
 
-## Value and callers
+## Canonical value and storage
 
-Represent `n/d` with Integer numerator `n`, positive Integer denominator `d`,
-`gcd(abs(n),d)=1`, and unique zero `0/1`. Equality compares the canonical pair;
-hash both mathematical components and never addresses or GMP limbs. An
-independently callable `Make(n,d)` rejects zero denominator and copies and
-normalizes inputs; negative denominators transfer their sign to the numerator.
-Comparison is mathematical, and output is an unambiguous canonical fraction
-or integer; SMT-LIB lexical output is the frontend/model printer's job.
+A `Rational` denotes `n/d` with `d > 0`, `gcd(abs(n),d)=1`, and unique
+zero `0/1`. Normalize after construction and every operation. Move a
+negative denominator's sign into the numerator before publishing the
+result. Equal fractions have identical canonical components and equal
+hashes.
 
-Exact Rational is needed for the selected closed concrete `to_fp` grammar and
-is also useful to integer linear relaxations and exact FP rounding. None of
-these creates user-level Real terms or makes a rational relaxation an integer
-solution. The frontend grammar is `Q ::= numeral | decimal | (- Q) |
-(/ Q Q)` in the Real-constant argument of `to_fp`. Decode decimals exactly as
-an integer over a power of ten, reject a zero denominator at every nested `/`
-as `kUnsupportedFeature` at that frontend profile boundary, normalize once
-valid, and retain an arbitrary RM expression as the node's child. The numeric
-`Make` itself reports its established `kInvalidParameter` for denominator zero.
-Rational zero has no negative sign; conversion of an exact Real zero produces
-positive FP zero. Symbolic Real and `fp.to_real` input remain outside scope.
+Use 16 bytes on the supported 64-bit target. The first word is a union of
+`int64_t` numerator and an exclusive opaque pointer to a holder for one
+`mpq_t`. The second word holds the `uint64_t` denominator or the zero
+sentinel for the pointer alternative. A real denominator is always
+positive, so zero can select the pointer without sacrificing any valid
+word fraction or consuming pointer bits. A reduced fraction fits inline
+whenever its numerator fits `int64_t` and its denominator fits
+`uint64_t`. This includes `INT64_MIN/1` and `1/UINT64_MAX`.
+Inline storage, copying, borrowing, and the word fast paths use no heap
+allocation. Wide copies own independent GMP components. Move resets to
+`0/1`. [Shared ownership](design.md#ownership-and-public-operations)
 
-## Operations and representation
+`Rational::Borrow()` returns the numerator and denominator as
+`IntegerView`s. Word views carry their values directly. Large components
+borrow read-only GMP limbs. A published node can also supply a view of
+its packed components. The component accessors allocate no storage.
+A borrowed component shares its backing storage's lifetime bound.
+An owning Rational reports the size of its holder and significant limbs
+once.
+
+## Operations
 
 | Operation | Contract |
 | --- | --- |
-| Construct, copy, move, borrow, inspect numerator/denominator | Independent owned value; existing no-throw move leaves source `0/1`, self-move is valid, failed copy assignment preserves destination. Views require a live owner. |
-| Sign, equality, compare, hash, canonical output | Exact; compare via cross products or an equivalent cancellation algorithm, with actual representation and allocation failures handled. |
-| Integer promotion, exact integer check, floor, ceiling, truncation | Promote as `n/1`; report nonintegral exact conversion separately; floor/ceiling/truncation have their mathematical meanings for negatives. |
-| Negate, absolute, add, subtract, multiply, divide | Exact canonical result. Checked division rejects a zero divisor; no implicit interpretation of a source division by zero. Cross-cancellation is allowed but not semantically observable. |
-| Compare with dyadics and scale by a power of two | Needed for correct FP conversion; check representational arithmetic for shifts and allocation sizes. A compressed exponent or early comparison can avoid unnecessary materialization; do not impose a discretionary intermediate-size quota. |
+| `Make(n,d)` and Integer promotion | Copy the exact inputs and reduce. Zero denominator gives `kDivisionByZero`. Integer promotion uses denominator one. |
+| `ParseDecimalFraction` | Decode two nonempty ASCII digit sequences separated by one dot as an exact fraction over a power of ten. Reject signs, spaces, exponents, and malformed forms with `kInvalidText`. Trim trailing fractional zeros before scaling. |
+| `+`, `-`, `*`, `/` | Exact canonical arithmetic. Division by zero gives `kDivisionByZero`. |
+| `Negate`, `Abs` | Exact, including promotion for signed minimum when necessary. |
+| Sign, equality, hash, and `Compare` | Sign and equality inspect canonical components. Compare orders by exact numerical value. Hash combines the two component values. |
+| `Floor`, `Ceil`, `Trunc`, `IsInteger` | Round exactly toward negative infinity, positive infinity, or zero, respectively. `IsInteger` tests denominator one. |
+| Exact Integer conversion and canonical output | Integral values convert to their numerator. Checked exact conversion of a nonintegral value gives `kInvalidArgument`. Diagnostic text is a canonical integer or reduced fraction. |
 
-Division and general arithmetic support known conversion and relaxation
-callers. Extra operations such as rational powers, continued fractions or
-specialized fused updates are algorithm candidates, not required surface area
-until a real caller establishes their contracts. The initial implementation
-retains two `Integer`s, as the node API returns their borrowed views and their
-small forms can avoid big-number allocation. GCD/cross-cancellation or a
-temporary `mpq_t` can implement exact operations. A permanent `mpq_t` may
-reduce conversions for large fractions but would need stable compatible
-Integer views or a deliberate API migration, and it changes allocation/copy
-costs. Both are unmeasured. Denominator sign, normalization and strong failure
-guarantees apply irrespective of representation; GMP limb OOM remains fatal.
+The frontend handles the closed numeral/decimal/unary-minus/division
+syntax in the Real-constant argument of `to_fp`. A zero denominator at
+any nested division is outside that input form. Rational zero has no
+sign. In rational-to-FP conversion it becomes positive zero. A symbolic
+rounding mode remains a node child until a concrete mode is available.
+[FP input profile](../node/operators.md#6-floating-point)
+
+## Word arithmetic and GMP fallback
+
+For word components, compute unsigned magnitudes safely and keep signs
+separate where needed. `Make` divides out the machine-word GCD before
+checking the canonical range. For addition and subtraction with
+denominators `d1,d2`, set `g=gcd(d1,d2)` and scale the numerators by
+`d2/g` and `d1/g`. Combine the signed products with checked
+`__int128` or unsigned `__int128` magnitudes. For a nonzero sum
+numerator `t`, the remaining common divisor is `gcd(abs(t),g)`, which
+uses a machine-word remainder modulo `g`. Divide it out before checking
+the stored numerator and denominator ranges. For multiplication, cancel
+each numerator against the other denominator before multiplying. For
+division, reject zero first, then handle the second fraction's reciprocal
+and cancel across the product. Check signs and bounds before narrowing.
+Comparison of word fractions uses exact cross-products. Integral rounding
+uses quotient and remainder, adjusting by one only in the required
+direction.
+
+Use GMP when the checked word path cannot complete. Borrow large
+components and use the Integer stack bridge for word operands when
+calling integer primitives. For GMP rational arithmetic use canonical
+inputs and protect each working limb count before any growth. Keep
+scratch `mpq_t` and `mpz_t` objects under RAII. Where cross-product
+comparison needs scratch, check the actual working count or compare via
+exact quotient/remainder steps. Before publishing a result, inspect
+the reduced components for word fit. For a large result, allocate the
+opaque holder and transfer each GMP component into its canonical
+`mpq_t` with `mpz_swap`. A failed holder allocation clears the scratch
+components and preserves all inputs.
+The FP rounder consumes exact components with a separate power-of-two
+scale and avoids materializing a large Rational where a shifted
+comparison suffices. [FP rounding kernel](floating-point.md#exact-rounding-kernel)

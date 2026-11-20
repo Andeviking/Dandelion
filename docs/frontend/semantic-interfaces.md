@@ -1,15 +1,19 @@
 # Frontend Semantic and Protocol Interfaces
 
-**Status: implemented frontend interfaces with pending contract refinements.**
+**Status.** The Phase 2 command protocol is the active interface. The
+Phase 1 section records the previous split protocol.
+The [implementation record](implementation.md) describes verification.
 The public C++23 module `dandelion.frontend` builds independently of the
-production solver and SAT backend. See the [Phase 2 test design](../testing/frontend.md#phase-2-test-design)
-for pending cases. The [representation target](design.md#resources-and-representation)
+production solver and SAT backend. See the [Phase 1 test design](../testing/frontend.md#phase-1-test-design)
+for acceptance cases. The [representation target](design.md#resources-and-representation)
 uses 64-bit structural IDs, indices and counts for nodes, edges and
 declarations, including arities. BV width and the FP components `e` and
 `s` remain `uint32_t`, with the same checked FP total width. No
 discretionary quota applies.
 
-## Command processing and publication
+## Phase 1 command processing and publication
+
+This section describes the historical split reader. The [Phase 2 protocol](#phase-2-command-processing-and-publication) defines current command processing.
 
 Separate the one-command syntax boundary from semantic publication so a
 model-dependent command can be resolved against the actual result:
@@ -39,8 +43,8 @@ survives that point owns or interns what it needs.
 `Apply` resolves names, scopes, sorts and the active
 [logic profile](logic-profile.md), and uses checked NodeManager factories.
 It owns a command-local transaction containing pending dictionary entries,
-typed roots, occurrence records and option/phase changes. Check and allocate
-before publishing. Success commits the frontend-visible effects of that
+typed roots, optional source records and option/phase changes. Check and
+allocate before publishing. Success commits the frontend-visible effects of that
 command, then returns a typed descriptor. Failure restores frontend-visible
 state and destroys scratch. As in the existing node contract, independent node
 factory calls can consume internal IDs or retain capacity even if a later
@@ -125,67 +129,199 @@ original string token, including quotes and doubled quotes. These responses
 do not enable the String theory.
 [SMT-LIB 2.7 §§4.1.2, 4.1.7–4.1.8, 4.2.1 and 4.2.8](https://smt-lib.org/papers/smt-lib-reference-v2.7-r2026-09-09.pdf)
 
-## Query and definition ownership
+## Phase 2 command processing and publication
 
-A frontend session owns one NodeManager state and a mutable query builder
-until `check-sat`. Its owner stores the active profile, original ordered
-assertion roots, original user-declared sort and function signature,
-datatype-group owners, definition table and source metadata needed for
-diagnostics and output. The solver-visible original signature includes unused
-user declarations. Definitions and `:named` aliases are recorded separately
-from free user declarations. Preserve the original source name and rank
-syntax of each user function declaration, including sort aliases, in owned
-records for model output after reader scratch or the session facade is gone.
+```cpp
+// Session
+Outcome<std::optional<TypedCommand>> ReadCommand(
+    const ModelOwner* model = nullptr);
+RunResult Run(const Engine& engine, const ResponseSink& sink);
 
-At the only `check-sat`, seal the builder into an immutable owning
-`QueryContext` held by a `std::shared_ptr<const QueryContext>`. It holds its
-own `ManagerRef`, nodes, declarations, datatype groups and definition
-records. The synchronous `Engine` callback receives a borrowed
-`const QueryContext&` and a copy of `SessionOptions`. The driver creates a
-`ModelOwner` with the *same owning context reference* and the returned
-provider before exposing a model or response. A
-returned state cannot escape independently while retaining only borrowed
-query data. `ModelOwner::Create` consumes the provider and destroys it
-exactly once on failure, while any supplied query is still alive. The
-`ModelOwner` owns its model-local bindings and retains the context. The
-driver and later inspection sessions created with
-`Session::ForModelText` or `Session::ForModelReader` share that owner,
-including the same bindings and names. In a model-bound session,
-`Apply()` uses the bound owner. An explicit pointer to that same owner is
-also valid. Passing a different owner is a `kModelFailure` and consumes
-the pending command before any model-dependent name resolution. The
-original owner remains bound even if the two owners share the sealed
-query and NodeManager. Retaining a model keeps it alive beyond the
-original session or source storage.
+// The existing free function forwards to Session::Run.
+RunResult Run(Session& session, const Engine& engine, const ResponseSink& sink);
 
-Sharing this context is a lifetime mechanism, not permission to access a
-NodeManager state concurrently. The existing one-thread-at-a-time rule still
-applies. The session keeps its name lookup information available for later
-value requests, but assertions, declarations and definitions do not change
-after the check.
-
-Each nonrecursive function definition has this logical record:
-
-```text
-DefinedFunction {
-  Decl internal_decl;              // fresh, same NodeManager state
-  DeclInstance internal_instance;  // exact domain and range
-  vector<Decl> formals;            // distinct kFormal identities
-  Node body;                       // typed in this definition's scope
-  source name and span;
-}
-DefinitionTable: DeclId -> DefinedFunction, in declaration order
+// SyntaxValidator, a separate owning reader with independent scanner state.
+static Outcome<SyntaxValidator> FromText(std::string_view text,
+                                         std::uint32_t source = 0);
+static Outcome<SyntaxValidator> FromReader(Reader reader,
+                                           std::uint32_t source = 0);
+Outcome<std::optional<CommandHeader>> ReadNext();
 ```
 
-The frontend obtains the declaration with `FreshFunction`, its ordinary
-instance with `InstantiateDeclaration` and no type arguments, creates distinct
-formals with `MakeFormal`, and constructs every call with `MakeApply`. A
-zero-argument definition is a zero-argument application.
-Only earlier definitions and previously visible declarations can occur in a
-definition body, so the definition graph is acyclic. Caller names cannot
-capture the resolved identities in the body. Formals may appear in owned
-definition bodies and their local templates; they must not occur free in an
-assertion root or a model-query root.
+An engaged result from `ReadCommand` describes a committed command. Its
+header contains the command kind and full source span. Its query, values
+and response payload have independent lifetimes. A disengaged result
+means boundary EOF or an already terminated session. A successful
+`exit` returns its descriptor once and leaves the session terminated.
+`ReadCommand` follows the short-read, EOF and suffix behavior above.
+`SyntaxValidator` is move-only and borrows text for its reading lifetime,
+or owns its `Reader` callback. It checks token and command grammar and
+returns only a header, including for syntactically valid excluded
+commands. Its lexical, grammar and input-I/O failures are terminal. It
+needs no logic, NodeManager, pending syntax, or semantic session state.
+
+**Reentrancy contract:** During a synchronous `Reader` callback, a Session may
+be inspected read-only
+through `GetPrefix()`, `GetOptions()`, `GetPhase()` and `GetSourceRecords()`;
+these expose the committed prefix. Recursive calls to `ReadCommand()` or
+`Run()` on the same active Session, and to `SyntaxValidator::ReadNext()` on
+the same active validator, are rejected cleanly with `kInvalidState` without
+corrupting the active parsing state. This applies when the outer Session call
+is either `ReadCommand()` or `Run()`. Concurrent access remains unsupported.
+
+Command processing observes the following order.
+
+1. Scan and reduce the command against the committed prefix, with local
+   binder scopes and a sparse overlay for names required before the
+   command closes. While reading, `GetPrefix()`, `GetOptions()`,
+   `GetPhase()` and `GetSourceRecords()` expose only committed state,
+   including when a user `Reader` calls them synchronously during refill.
+   Inspection in that callback is read-only. Borrowed observations must
+   be reacquired after the mutating call returns. Same-instance recursive
+   reading and execution are rejected as described above.
+2. If state, model eligibility, semantic checking, or recoverable
+   elaboration first fails, keep that diagnostic and finish validating the
+   same command with the same lexer and grammar frames. Suppress all
+   subsequent semantic actions. Late-bound enclosing spans are completed
+   when their frame closes. The diagnostic keeps scalar marks, structured
+   error details and message data stable across refills. The first
+   encountered lexical, grammar, or input-I/O failure takes precedence
+   and terminates reading. If grammar
+   can be completed, return the first deferred diagnostic and allow
+   another `ReadCommand`. A resource failure that prevents grammar from
+   reaching the boundary terminates reading with its resource diagnostic.
+3. After the closing delimiter and all checks, prepare the descriptor,
+   binding slots, owner and source ranges, and any phase transition. The
+   final publication uses only nonthrowing operations. Any recoverable
+   preparation failure preserves the committed signature, roots,
+   options, phase and source history. Private capacity and IDs from
+   independent successful Node factories can survive rollback. Existing
+   bounded literal-cache entries remain private. The
+   datatype builder retains its own stricter failure guarantee.
+
+`ReadCommand` alone is solver-free. It seals a query on `check-sat` and
+checks the session phase and options for later inspection commands. A
+descriptor can represent `get-model`, `:reason-unknown` or an ordinary
+typed `get-value` even when the caller has no solver result. A request
+that needs unavailable `@` bindings has the model-dependent diagnostic.
+A supplied model is borrowed for the call. For model access it must own
+this session's sealed query. A mismatch is `kModelFailure`. A detached inspection session defaults to
+its retained owner and rejects a different supplied owner, even on the
+same query. These checks have grammar precedence.
+
+`Session::Run` uses the same reader with private access to the actual
+answer, reason and eligible owner. Phase and option checks precede
+result checks. After grammar validation, the execution gate rejects model
+requests after `unsat` as invalid state and reports `kModelUnavailable`
+when an otherwise eligible check has no inspectable owner. An explicit
+`:reason-unknown` requires an actual `unknown` result. The reader can
+disable early semantic reductions for a request already known to fail
+this gate. Such diagnostics take effect at the complete grammar boundary,
+ahead of model-dependent term resolution. The solver-free missing-binding
+diagnostic is `kModelDependent`. Detached execution starts with
+its owner's retained answer and reason.
+
+For a committed `check-sat`, `Run` invokes the engine once, validates
+the result and flushes it before asking for another command. For a complete
+`exit`, it consumes the closing delimiter, emits any required
+acknowledgement and returns without lexing buffered suffix bytes or reading
+again. The immediate-exit and response-failure policies above still
+apply. Before writing any `get-value` response bytes, the reader admits
+every request and owns its normalized input text, typed term and span.
+Evaluation and printing can then stream. Newly staged abstract names
+become visible only after the full response and successful flush.
+
+```cpp
+enum class CommandResponse {
+  kNone,
+  kSuccess,
+  kUnsupported,
+  kTrue,
+  kFalse,
+  kZero,
+  kStdout,
+  kStderr,
+  kName,
+  kVersion,
+  kAuthors,
+  kErrorBehavior,
+  kUnknownReason
+};
+
+struct TypedCommand {
+  CommandHeader header;
+  std::variant<CommandResponse, std::string> response = CommandResponse::kNone;
+  std::shared_ptr<const QueryContext> query;
+  std::vector<ValueRequest> values;
+};
+```
+
+The driver maps fixed response tags to static text, including configured
+project metadata. The unknown-reason tag uses the retained result. Only
+`echo` uses the string alternative, which owns the original token, including
+its quotes, doubled quotes and any raw newlines. Command kinds dispatch engine invocation
+and model responses. Acknowledgements use the newly committed option
+for the same command, including an option that disables its own
+acknowledgement. Descriptors own only text requested by their payloads.
+
+## Query and definition ownership
+
+A frontend session owns a NodeManager reference and a mutable query builder.
+At the only `check-sat`, it seals the builder into a
+`std::shared_ptr<const QueryContext>`. The context owns the manager, original
+ordered Bool roots, original free sort and function declarations (including
+unused declarations), datatype groups, active logic, sealed options and
+parameterized definition templates. Declaration ranges preserve publication
+order. Assertions preserve input order and duplicate occurrences.
+
+The semantic accessor contract keeps `GetManager()`, `GetLogic()`,
+`GetOptions()` and `GetDatatypeGroups()` and provides these typed ranges
+and lookups.
+
+```cpp
+std::span<const Node> GetAssertions() const noexcept;
+std::span<const SortConstructor> GetUserSorts() const noexcept;
+std::span<const Decl> GetFunctions() const noexcept;
+bool HasFunction(DeclView decl) const noexcept;
+
+struct DefinedFunction {
+  Decl decl;
+  std::vector<Decl> formals;
+  Node body;
+};
+
+std::size_t GetDefinitionCount() const noexcept;
+const DefinedFunction& GetDefinition(std::size_t ordinal) const noexcept;
+const DefinedFunction* FindDefinition(DeclView decl) const noexcept;
+```
+
+`GetDefinition` requires an in-range ordinal and enumerates parameterized
+definitions in publication order. `FindDefinition` returns null for null,
+foreign or non-definition declarations. Same-manager ID indexing is internal.
+`HasFunction` accepts only original free user function or constant
+declarations of this query, with gaps in their IDs allowed. Views and
+references borrow the immutable context for its lifetime. When obtained from
+`Session::GetPrefix()`, they are valid until the next mutating session
+operation. Manager access follows Node's one-thread-at-a-time contract.
+
+A nullary `define-fun` or `define-const` validates its fresh canonical name,
+scope, complete typed body and declared result sort, then binds the name
+directly to an owning reference to that closed body. `:named` uses the same
+direct-body binding and its own occurrence-level scope and publication rules.
+Both resolve by reusing the root, with zero arguments and exact sort for any
+qualifier. These aliases introduce no `Decl`, `DeclInstance`,
+`DefinedFunction`, wrapper `kApply` or model export entry. Reuse never
+replays source annotations or publishes names.
+
+For a parameterized definition, obtain a fresh internal declaration with
+`FreshFunction`, an ordinary instance via `InstantiateDeclaration` with no
+type arguments, and distinct ordered formals with `MakeFormal`. Use the
+resolved instance for saturated checked `MakeApply` calls. The template
+holds only its declaration, formals and body. The name being defined is
+reserved and invisible in its body. References to definitions therefore go
+to earlier definitions. Resolved identities in the body survive caller
+shadowing. Free formals are confined to templates and cannot escape into
+assertion or model-request roots.
 
 A `kApply` of an internal declaration whose ID occurs in the definition
 table **means the associated definition**, never an uninterpreted function.
@@ -214,15 +350,126 @@ and [Bitwuzla's lambda elimination](https://github.com/bitwuzla/bitwuzla/blob/8d
 are evidence for retaining definitions beyond parsing; neither proves a
 Dandelion performance result.
 
+### Source records
+
+```cpp
+struct ParseOptions {
+  bool canonicalize_commutative = false;
+  bool capture_source_records = false;
+  bool strict_metadata = false;
+};
+
+// Session
+const SourceRecords* GetSourceRecords() const noexcept;
+static Outcome<Session> ForModelText(std::shared_ptr<ModelOwner> model,
+                                     std::string_view text,
+                                     ParseOptions options,
+                                     std::uint32_t source = 0);
+static Outcome<Session> ForModelReader(std::shared_ptr<ModelOwner> model,
+                                       Reader reader, ParseOptions options,
+                                       std::uint32_t source = 0);
+```
+
+`FromText`, `FromReader`, `ForModelText` and `ForModelReader` retain their
+existing overloads and each accepts `ParseOptions` before the optional
+source ID in its options overload. See the [metadata rules](logic-profile.md#metadata).
+
+`SourceRecords` is the session-owned history of committed source occurrences.
+Each of its seven collections preserves event order, including repeated
+occurrences sharing a typed node.
+
+```cpp
+struct UserFunction {
+  Decl decl;
+  std::string source_name;
+  std::vector<std::string> source_rank;
+  SourceSpan where;
+};
+
+struct DefinitionSource {
+  CommandKind kind;
+  std::string source_name;
+  std::vector<std::string> source_rank;
+  SourceSpan where;
+  Node body;
+  std::optional<std::size_t> definition_ordinal;
+};
+
+struct SourceRecords {
+  std::vector<Assertion> assertions;
+  std::vector<UserSort> user_sorts;
+  std::vector<UserFunction> functions;
+  std::vector<DefinitionSource> definitions;
+  std::vector<NamedTerm> named_terms;
+  std::vector<Annotation> annotations;
+  std::vector<Attribute> metadata;
+};
+```
+
+| Collection | Record contents |
+| --- | --- |
+| Assertions | Owning typed root and occurrence span, in assertion ordinal order. |
+| User sorts | Owning original sort constructor, written name and declaration span. |
+| Free functions | Owning original declaration, written name, ordered written domain and result sort spellings, and declaration span. |
+| Definitions | Written name and rank, command kind and span, owning typed body, and the semantic definition ordinal for a parameterized template. Includes both nullary forms and parameterized `define-fun`. |
+| Named terms | Canonical alias name, owning typed body and occurrence span. |
+| Annotations | Owning typed term, occurrence span and ordered attributes, including `:named`. |
+| Metadata | Ordered `set-info` attributes, including repeats, each with its keyword, optional value and span. |
+
+Source ranks list domain sorts in declaration order followed by the result
+sort. Captured spellings own their backing storage. Preserve token spelling,
+including quoting, and normalize inter-token trivia for rendered forms.
+Named terms store the lookup name, and the corresponding annotation
+attribute contains the written spelling.
+`GetSourceRecords()` returns null with capture off, and a borrowed view
+valid until the next mutating session operation with capture on. Clients
+may copy the records and backing data they need beyond that lifetime.
+Rollback restores all seven histories to the committed prefix. Sealing
+preserves the session history without copying it into the query or model.
+`QueryContext` has no `GetNamedTerms()`, `GetAnnotations()`,
+`GetMetadata()` or `GetDefinitions()`. Session metadata is accessed through
+`SourceRecords`. `TypedCommand` has no unconditional annotations field.
+`TypedValue` / `ValueRequest` still owns the typed term, normalized input
+rendering and its source location for `get-value`, in either capture mode.
+Copied source records preserve ownership of nodes and spellings. Interpreting
+any parameterized calls they contain still requires the matching query.
+
+### Sealing and inspection ownership
+
+The synchronous engine borrows the sealed query and receives a copy of
+`SessionOptions`. The driver creates a `ModelOwner` with that same owning
+query reference and the provider before exposing a model or result.
+`ModelOwner::Create` consumes the provider and destroys it exactly once on
+failure while any supplied query remains live.
+
+With model production enabled, sealing freezes the textual environment and
+the query privately retains it for inspection. It contains the term and sort
+bindings, including direct-body aliases and sort abbreviation candidates.
+The model owner retains the query and its environment. A detached model
+session shares these and the model-local value registry, so it can resolve
+names and construct admitted sorts absent from the assertions after both
+source and original session are destroyed. It starts with empty source
+history when capture is requested. A model-bound session defaults to its
+bound owner. An explicit pointer to that same owner is valid. A different
+owner produces `kModelFailure` and consumes the pending command, even when
+both owners share the query. The original owner remains bound.
+
+With model production disabled, successful sealing releases textual lookup
+and batch-releases the alias table's owning `Node` references. Solver-facing
+roots and signature data, retained templates and any independently owned
+source records remain valid. A failed seal leaves the builder and its lookup
+environment usable for retry.
+
 ## Frontend admission and solver fragment selection
 
 The frontend validates each written definition body once and checks every
-application's argument count and sorts. It records the call with its declaration
-identity and ordered arguments; it does not enter a definition body when
-constructing that call. The selected [input profile](logic-profile.md) does
-not require an assertion-shape check, virtual expansion, a persistent shape
-DAG or a fragment classifier in the frontend. Command-local source records
-remain necessary for syntax, scope, `:named` closedness and diagnostics.
+application's argument count and sorts. A parameterized call records its
+declaration identity and ordered arguments without entering the body.
+A nullary reference directly reuses the resolved body. The selected
+[input profile](logic-profile.md) does not require an assertion-shape check,
+virtual expansion, a persistent shape DAG or a fragment classifier in the
+frontend. Transient syntax, lexical dependency marks and source locations
+support scope, `:named` closedness and diagnostics in either capture mode.
 
 For a family `f0(x)=x` and `fn(x)=f(n-1)(f(n-1)(x))`, including under
 `QF_LIA`, the frontend retains the definitions and the final call as written.
@@ -365,7 +612,11 @@ For each post-check `get-value`:
    can only resolve names from earlier completed responses.
 
 `get-model` uses the same registry and covers all and only user-declared
-function/constant symbols, including unused ones, with their original ranks.
+function/constant symbols, including unused ones. Print each canonical
+declared name with necessary SMT-LIB quoting. Use the exact ordered domain
+and range from `Decl::GetDomain()` and `Decl::GetRange()` (the semantic
+declaration view) for the rank. Equivalent legal sort spellings may differ
+from the written rank, and optional quoting may be omitted.
 The model provider supplies a typed export whose interpretation agrees with
 the same total model used for `get-value`. The frontend does not require the
 provider's internal function representation to be a finite table.
@@ -384,18 +635,17 @@ name; distinct values do not. Datatype fields can contain such proxies.
 Bodies may use admitted theory operations, datatype symbols, formal parameters,
 mapped model-bound abstract values, and user functions defined by an earlier
 record. Order records by these dependencies; no forward user-function
-references are emitted. Source sort aliases in original declared ranks remain
-available from the owning context. For generated sort text, `SortText`
-uses available, well-scoped alias spellings that resolve to the exact
-concrete sort in the sealed signature. Apply this to abstract values,
-datatype result qualifiers and constant-array ascriptions. Respect alias
-parameter order and sort identity. In particular, a shared sort represented
-compactly by an available alias must be rendered without walking or emitting
-its exponentially unfolded tree. Work follows the reachable sort
-representation and emitted spelling. Explicit syntax that inherently
-repeats a sort can take work proportional to its output size. Allocate
-printable formal and `let` names
-by declaration identity, avoiding capture of referenced user, theory,
+references are emitted. For ranks and generated sort text, `SortText` uses
+the same alias-aware printer. Nullary `define-sort` binds a concrete sort
+and registers its name as an abbreviation candidate. Parameterized aliases
+match resolved recipe identities with ordered arguments and consistent
+repeated parameters.
+Memoize sort spelling choices and recipe matching over the reachable DAG
+for the response. The [rendering design](design.md#semantic-rank-rendering)
+specifies compact selection and termination. The same rules apply to abstract
+value ascriptions, datatype result qualifiers and constant-array ascriptions.
+Allocate printable formal and `let` names by declaration identity,
+avoiding capture of referenced user, theory,
 datatype and abstract-value names and of other binders in scope. Name hints
 alone never determine a binding. Preserve substantial DAG sharing in printed
 model bodies using capture-safe, dependency-ordered nested `let` bindings

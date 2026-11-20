@@ -55,7 +55,9 @@ portions of SMT-LIB below. The capability targets describe future solving.
 - Support declaration and non-recursive definition commands, `let`, indexed
   operators, datatype declarations and `match`, `assert`, and one `check-sat`.
   Process commands as a stream and emit the check result without waiting for
-  EOF; `exit` terminates input processing. The intended interface also includes
+  EOF. The Phase 2 protocol flushes the result before the next command read.
+  A complete `exit` stops at its closing delimiter, including when suffix
+  bytes are already buffered. The interface also includes
   `get-info`, `get-option`, `echo`, and model queries against the retained
   result. See the [frontend design](frontend/design.md).
 - Report unsupported commands, options, sorts, or operators according to the
@@ -154,7 +156,7 @@ establish a result, another applicable path may be tried or the result is
 
 | Component | Responsibility |
 | --- | --- |
-| Frontend | Parse commands and declarations, resolve symbols, check sorts, and report unsupported or invalid input. |
+| Frontend | Validate commands and publish an owning typed query. Resolve bindings, check sorts, and diagnose unsupported or invalid input. |
 | Expression layer | Store typed terms, sorts, declarations, constants, and their shared subexpressions. |
 | Rewriter / preprocessor | Simplify formulas with sound transformations while preserving information needed for results. |
 | SAT interface | Translate Boolean structure and BV encodings into SAT, invoke a backend, and expose assignments and results. |
@@ -172,17 +174,32 @@ logic label is not evidence that every operator appearing in a script is
 supported. Unsupported constructs are reported clearly instead of being
 silently discarded.
 
-Nonrecursive definitions retain their typed bodies and applications until a
-consumer has a reason to process them. A query or model containing such an
-application must retain its definition environment; a defined symbol is not
-an unconstrained UF. The frontend checks its active signatures and types but
-does not expand calls merely to enforce a label's assertion fragment. A
-solver must justify fragment-specific reasoning from actual formula semantics.
-The selected [frontend interfaces](frontend/semantic-interfaces.md)
-specify sealed query ownership, retained definitions and model-local values;
-the [input profiles](frontend/logic-profile.md) specify registered labels.
-The frontend implements these interfaces and exercises them with controlled
-providers. Production solving and model semantics require separate implementation.
+In the active Phase 1 frontend contract, nullary `define-fun`,
+`define-const` and closed `:named` occurrences bind directly to owning
+typed bodies during elaboration. Parameterized nonrecursive definitions retain
+typed templates and saturated applications. A consumer interpreting such
+an application retains the matching definition environment. The frontend
+checks active signatures and types, and the solver justifies fragment-specific
+reasoning from actual formula semantics.
+
+The [Phase 2 command protocol](frontend/semantic-interfaces.md#phase-2-command-processing-and-publication)
+specifies one grammar-aware read and elaboration operation per command.
+The frontend reduces typed subterms as input arrives and publishes the
+command only after its closing delimiter and all checks. A reader callback
+can observe only the committed prefix. If semantic or result-state checking
+fails early, grammar validation continues so a malformed tail is reported
+first. A separate syntax validator serves tooling without a logic or
+signature. Whole-command syntax storage is unnecessary for either path.
+
+The sealed query owns typed roots in assertion order, the original typed
+signature, datatype groups, options and parameterized templates. Optional
+source records belong to the session. For model-enabled queries, keep the
+sealed textual environment available for inspection. With model production
+disabled, release textual lookup and alias root ownership at seal.
+The [frontend interfaces](frontend/semantic-interfaces.md) specify those
+lifetimes and the [input profiles](frontend/logic-profile.md) specify
+admission. The [implementation record](frontend/implementation.md) describes
+baseline behavior and verification.
 
 The expression layer represents at least:
 
@@ -208,6 +225,13 @@ uses; otherwise its API must prohibit that lifetime. A query-owned manager is a
 candidate, not a measured choice. Allocation layout, handles, interning, and
 reclamation are implementation decisions rather than reasons to weaken these
 identity and lifetime invariants.
+
+The [Phase 2 Node contract](node/design.md#phase-2-consuming-construction)
+allows checked factories to transfer disposable owning operands into a new
+parent after all fallible preparation. A factory retains the canonical
+parent on a hit and preserves the caller's operand slots on hits and
+recoverable errors. Each stored edge owns one reference, including repeated
+edges to the same child.
 
 Numerals and BV constants require exact arithmetic and must not be silently
 limited to a host machine word. Internal exact rational numbers can be used by
@@ -568,7 +592,11 @@ rounding modes, function and uninterpreted-sort interpretations, arrays, and
 datatype values. Values shared by multiple theories must agree. When model
 output or value queries are requested after `sat`, the emitted representation
 must follow the supported SMT-LIB interface and denote a model of the
-original assertions.
+original assertions. Model export covers every original free declaration,
+including unused symbols, using its canonical name with necessary quoting
+and the semantic domain and range. The printer uses well-scoped aliases to
+render exact sorts compactly. Elaboration-time aliases and parameterized
+definitions introduce no independent model entries.
 
 After a check, value requests arrive as subsequent commands and may contain
 well-sorted terms absent from the assertions. Same-model abstract values
@@ -577,6 +605,11 @@ their identities and interpretations belong to that model, not to the user
 declaration namespace. A model accompanying `unknown`, if available, is a
 candidate and is not certified to satisfy the original assertions. If none is
 available, model inspection reports that fact rather than fabricating one.
+
+Phase 2 admits all written terms of a value request before emitting the
+first response byte. Evaluation and rendering can stream after admission.
+The model publishes newly rendered abstract names only after the full
+response is written and flushed, independently of command publication.
 
 The model component composes transformation-specific recovery operations in
 reverse dependency order and coordinates completion of total functions and

@@ -1,11 +1,10 @@
 # Node Implementation Plan
 
-Status: **implemented first-version storage and algorithms**. This document
-selects one concrete implementation for the contracts in [design.md](design.md)
-and [operators.md](operators.md). It is not a stable binary ABI or a claim of
-superior runtime performance. Future implementations can change internal
-structures while preserving observable semantics, ownership, and error
-guarantees.
+This plan records the implemented first-version storage and algorithms.
+Phase 1 and Phase 2 additions are implemented and have recorded verified test
+runs. Phase 4A implements the Phase 1C numeric boundary and storage. Internal
+structures can change while preserving the observable semantics, ownership,
+and error guarantees in [design.md](design.md) and [operators.md](operators.md).
 
 ## 1. Stores and internal representations
 
@@ -32,6 +31,27 @@ for datatype declarations. Parameterized instances use a transparent
 `unordered_set` keyed by declaration and arguments. A nonparameterized
 datatype declaration also caches its single instance, including its
 substituted signature.
+
+### Phase 1 BV width cache
+
+Use one internal BV sort ID lookup shared by both `MakeBvSort` overloads and
+width-producing builtin inference. Check positivity and the `uint32_t`
+limit before indexing or narrowing. Derived width calculations must also
+check for arithmetic overflow before lookup. The initial cache in
+`ManagerState` is a fixed array of 64 `SortId` slots for widths 1 through
+64, indexed by `width - 1`. This covers widths through one machine word
+with a direct lookup. Zero marks an empty slot. Wider valid widths use the
+ordinary sort interner.
+
+A populated slot returns the canonical ID without probing the sort table.
+Fill an empty slot only after the ordinary interner returns a published
+sort ID. Failed interning leaves the slot empty. Published sorts live as
+long as their state, so the cache needs no invalidation or owning handles.
+The public factories still acquire a checked state reference for the
+owning result. Inference uses the borrowed ID within the manager state.
+Facades attached to the same state share the cache.
+
+### Store publication
 
 Reserve each destination store before publishing an instance. If the instance
 needs a hash index, insert the prepared record after reserving the ID and
@@ -61,7 +81,7 @@ Frontend name checks do not replace the builder's structural validation.
 
 ## 2. NodeData and payload
 
-The node header occupies 56 bytes on the supported 64-bit builds:
+The implemented node header occupies 56 bytes on the supported 64-bit builds:
 
 ```cpp
 struct NodeData {
@@ -77,6 +97,7 @@ struct NodeData {
   std::uint16_t inline_child_count;
   std::uint8_t kind_code;
   PayloadTag payload_tag;
+  std::uint32_t literal_limb_count;
 };
 ```
 
@@ -92,12 +113,11 @@ layout. The header and payload shapes are private implementation details.
 | Payload form | Constructed object |
 | --- | --- |
 | No payload | No additional object. |
-| Bool, rounding mode, FP special | The corresponding scalar; special FP values carry only their canonical category. |
-| Int or wide BV/finite FP value | One owned canonical `Integer`. |
-| Word-sized BV or finite FP bits | An unsigned 64-bit word, including the full unsigned range. |
+| Bool and rounding mode | The corresponding scalar. |
+| Int, BV, and FP literals | Word, inline limb array, or tag-only encoding as detailed below. |
 | Application | A `DeclInstanceId`. |
 | Indexed operation | One or two 32-bit indices, or an owned `Integer` when a permitted unbounded index exceeds 32 bits. |
-| Rational FP conversion | Two 32-bit format parameters and one canonical `Rational`. |
+| Rational FP conversion | Two 32-bit format parameters followed by compact words or packed magnitudes. |
 
 The factory validates sign, arity, sort, and bounds, then selects the unique
 representation of the mathematical value. Borrowed index and literal views
@@ -106,6 +126,91 @@ or FP format. A const-array result sort is the complete array qualifier and
 participates in its structural key. Payloads own their exact values
 independently of caller objects, and padding does not participate in equality
 or hashing.
+
+### Phase 1C numeric payloads
+
+The 56-byte header uses four former padding bytes for the trimmed
+`uint32_t` limb count on wide literals.
+Literals have no children. The sizes below are requested node block sizes on
+the supported 64-bit layout, including the header.
+
+| Payload form | Tail and requested bytes |
+| --- | --- |
+| `kIntWord` | One signed `int64_t` for every value in the signed word range, including `INT64_MIN`. **64 bytes**. |
+| `kBvWord` | One `uint64_t` for every magnitude that fits in a word. The sort supplies the width. **64 bytes**. |
+| `kFpWord` | One `uint64_t` for finite nonzero packed bits that fit in a word. The sort supplies the format. **64 bytes**. |
+| FP specials | Separate payload tags for NaN, positive and negative infinity, and positive and negative zero. The tag carries the entire category. **56 bytes** with an empty tail. |
+| Wide Int, BV, and finite FP | One aligned inline array of `L` significant `uint64_t` limbs in increasing order of significance. The header holds `L`, and two wide Int tags distinguish positive and negative magnitudes. **`56 + 8L` bytes**. |
+| `kRationalConversion` (small) | One RM child slot, two `uint32_t` format indices, an `int64_t` numerator and a positive `uint64_t` denominator. **`56 + 8 + 8 + 16 = 88` bytes**. |
+| Rational conversion (wide) | After the same child slot and format indices, store `uint32_t` numerator and denominator limb counts, then their trimmed magnitude arrays in that order. Two private wide tags encode the numerator sign. **`80 + 8(Ln + Ld)` bytes**. |
+
+Zero Int and BV values use their word forms. A wide magnitude has a nonzero
+highest limb and may contain zero lower limbs. Wide BV and finite FP require
+at least two significant limbs, regardless of the declared width or format.
+An Int outside the signed word range can still have a one-limb magnitude,
+including `2^63` and `-2^63-1`. It uses the wide Int encoding with `L = 1`,
+still requesting 64 bytes. Extract signed magnitudes with unsigned operations
+so the magnitude of `INT64_MIN` cannot overflow. The little-endian limb order
+refers to significance. Each limb uses native object representation.
+
+A small rational has a signed word numerator and an unsigned word
+denominator, matching the [util small representation](../util/rational.md#canonical-value-and-storage).
+Whenever either component exceeds its word range, pack both normalized
+magnitudes into the wide rational tail. Normalized zero stays in the small
+representation as `0/1`. The wide counts determine each component's span
+without separate pointers or allocations. Existing layout rules for
+unbounded builtin indices (`kIndexWide`) still use an owned Integer with
+separate backing when required.
+
+### Phase 1C construction, borrowing, and reclamation
+
+Select the payload tag from the checked canonical input before hashing. A
+signed-word Int carries its normalized word through hashing, comparison, and
+construction. Wide keys borrow numeric views and use their exact magnitudes,
+including an inline unsigned word above `INT64_MAX`. Every construction path
+uses the same canonical tag and value. Structural identity includes the
+explicit literal sort, the Int sign, the FP special category, and the full
+applicable limbs. Rational conversion identity includes
+both format indices and both exact normalized components. Read only
+initialized fields. Storage addresses and padding are outside the key.
+A hit requires only the checked result retain after lookup.
+
+Use one layout calculation for candidate sizing and accounting. On a miss,
+check count conversions, array lengths, alignment, additions, and backing
+size before allocating. For the packed rational this includes the sum
+of the two array lengths. Start aligned `uint64_t` array lifetimes
+in the byte block and copy significant limbs. Word, packed, and tag-only
+payloads need no secondary owner or allocation. With the table capacity and
+result sort already available, a wide literal miss needs a single `NodeData`
+allocation.
+
+Build util views from the node's word or immutable limb span, with the sort
+supplying the BV width or FP format. A rational view reads both packed
+components directly. The view representations accept canonical words and
+read-only limb spans independently of their owner's type. The numeric
+module can therefore consume these views with no dependency on Node.
+These views acquire no ownership and remain valid while the node is live,
+including across unique-table growth. The numeric implementation adapts
+aligned borrowed limbs to GMP input through a stack
+`mpz_roinit_n` descriptor for the duration of a call. Verify the supported
+GMP ABI's `mp_limb_t` compatibility with `uint64_t`, 64 usable bits per limb,
+and representability of the signed limb count before creating the descriptor.
+Keep the borrowed descriptor read-only, never clear it as an owning `mpz_t`,
+and use separate owned storage for GMP outputs. GMP types stay in
+implementation units. Copying a view into an independent util owner may
+allocate. The Node accessor itself is allocation-free.
+
+Finish all payload writes and state acquisition before publishing or
+transferring input owners. A size, allocation, or retain failure releases any
+candidate block and balances the candidate's state reference and any retained
+child prefix. No entry or `NodeId` is published. Phase 2 consuming failures
+leave all input owners intact. A changed rational rebuild borrows the
+original parameter while preparing the key and copies it to the candidate
+before any transfer. Erase the table entry while the node key is live, then
+free the block once. Trivial tail fields have no separate numeric destructor
+or limb deallocation. The recoverable guarantees cover checked size and C++
+allocation failures. GMP allocation failure during a util operation still
+follows its process-termination policy.
 
 ## 3. Allocation and C++ lifetime
 
@@ -131,11 +236,18 @@ fit the default allocation alignment, checked statically.
 
 1. Obtain the block and placement-create a `std::byte[]` covering it.
 2. Construct the header and, when required, its trailing 64-bit child count.
-3. For a nonempty child array use non-allocating placement array new with
-   value initialization at the checked aligned offset. Construct any payload
-   at its own checked offset.
-4. Retain the state. Retain each child and write its pointer to the next
-   slot in the same pass. On failure release only the retained prefix.
+3. For a nonempty child array, use non-allocating placement array new at
+   the checked aligned offset to start the array and pointer lifetimes.
+   The first version value-initializes the slots. Phase 1 permits
+   default-initialized placement construction (`::new (address) NodeData*[n]`)
+   with no whole-tail zero fill. Construct any payload at its own checked
+   offset.
+4. Retain the state. For each successfully retained child, assign its pointer
+   once to the next slot and advance the retained-prefix count. On failure,
+   rollback reads and releases only that prefix, including each retained
+   occurrence of a repeated child. Leave the unwritten suffix unread.
+   Destroy any constructed payload and free the candidate storage, and
+   release the state reference if it was acquired.
 5. Publish the node after all references have been acquired.
 6. During destruction, release child references, destroy the payload and
    header, end the applicable storage lifetime, and use matching delete.
@@ -192,9 +304,7 @@ result back into the structural hash. This avoids the algebraic cancellation
 possible with the scalar fold across two arbitrary chunks. Apply `mix` after
 all fields.
 
-Hash based on mathematical value, not GMP limb width, address, or internal
-allocation. Obtain chunks without allocating; handle `GMP_NUMB_BITS` and
-possible nails rather than assuming the host limb is exactly 64 value bits.
+Hash the mathematical value using the util view's allocation-free chunks.
 The exact hash is internal, not a serialized or cross-version contract.
 
 A query key borrows the already validated children and value views only until
@@ -233,6 +343,20 @@ significant GMP storage, and manager metadata arrays and records. Hash
 containers expose entry and bucket counts. The table peak includes the
 overlap of old and replacement slot buffers. Process RSS additionally
 includes allocator overhead, unused pages, the workload and runtime libraries.
+
+### Phase 1C storage accounting
+
+`NodeStorageStats::node_bytes` sums requested sizes of live published node
+blocks, including the header, child storage, alignment, and every inline
+payload byte. Reconstruct each size from the same layout rules and validated
+counts used for the allocation, independently of limits set for later
+allocations. `numeric_backing_bytes` continues to count
+separately owned numeric backing, such as for a GMP-backed wide builtin
+index. Inline limbs, packed rational components, and FP categories add zero
+to this field. Hash table and manager metadata have their own existing
+counters. Candidate blocks and caller-owned numeric values are outside the
+live-node totals. The snapshot remains allocation-free and retains no
+objects.
 
 ## 5. Checked construction and rollback
 
@@ -292,12 +416,94 @@ orphaned, inaccessible declarations on a failed fresh-constant request.
 The instance points directly to the staged monomorphic declaration
 signature and uses the same dense publication step as any ordinary instance.
 
+### Phase 1 word construction and rebuild
+
+`MakeWordIndexedBuiltin` reads the caller's borrowed word span directly
+through the same builtin shape and index rules. Use the canonical index key
+and storage selection used for exact `Integer` inputs. In particular, a word
+above `UINT32_MAX` can still be a valid exact rotate or divisible index.
+The lookup can represent these larger words with an unsigned `IntegerView`
+without allocating a temporary `Integer` vector. For a valid
+`MakeBvWordValue` request, use the ordinary BV word key with the explicit sort
+ID. Share the BV kind and fit checks. Compare the word's bit length to the
+width so every word fits at widths of at least 64.
+
+For `RebuildNode`, validate the original, the span length, and each
+replacement's manager and concrete sort at its position. Compare child
+pointers during the scan. An entirely unchanged sequence, including an empty
+one, takes only the checked retain of the original after validation. It
+does not hash a key, probe the table, allocate a candidate, or acquire new
+child references.
+
+For a changed sequence, form the ordinary lookup key from the original
+kind and stored payload with the new child order. Keep the existing key's
+explicit-sort convention. In particular, use the original result sort as
+the qualifier for `kArrayConst`, and keep the explicit-sort field zero for
+intrinsically typed builtins and `kApply`. Carry the original result
+`SortId` separately into candidate construction. Borrow wide indices and
+rational data from the live original during lookup, and copy them into
+owned payload storage on a miss. Reuse the regular lookup and publication
+steps with the established result sort and without builtin shape checking,
+type inference, or declaration signature rechecking. On recoverable
+failure, restore references, destroy constructed payload and storage, and
+leave the original and table entries valid. A failed miss consumes no
+`NodeId`. The existing table capacity and GMP failure rules apply.
+
 C++ allocation failure is translated to `kResourceLimit/kCppAllocation` by
 factories after rollback. Checked state/child retain failures are translated
 to `kResourceLimit/kReferenceCount`; owning-handle copies outside a factory
 throw `ReferenceLimit` as described in [design.md](design.md#7-errors-and-factory-guarantees).
 GMP limb OOM follows GMP's process-termination contract, not this rollback
 promise.
+
+### Phase 2 operand move-in
+
+The [consuming factories](design.md#phase-2-consuming-construction) use
+the existing checked construction and rebuild rules, reading their ordered
+children through a typed range. Use a compile-time accessor for borrowed
+`NodeView` and owning `Node` ranges in rank validation, hashing, equality
+and candidate preparation. Both accessors obtain the same node identity
+and sort. Use the existing key's exact indices, qualifier, rational or
+declaration-instance payload. The frontend passes a contiguous slice of
+its owning operand buffer while its separately indexed source marks stay
+in source order. Raw byte strides and a temporary view array are unnecessary.
+`CheckBuiltinOperands` shares the check-only inference routine through the
+owning accessor, so optional source-order diagnostic replay can use the
+same buffer.
+
+The transfer path targets per-edge retain traffic on construction misses
+while preserving prompt reclamation and the owning public handle. Keeping
+borrowed construction for shared input views avoids requiring new temporary
+owners from callers that already have a live root.
+[Node architecture review](/pub/netdisk2/zhangx/dandelion-frontend-bench/qf_bv_compare/review_philosophy_node.md)
+
+1. Probe for the same canonical parent as the borrowed path. Check
+   and acquire the result retain on a hit, including the unchanged
+   rebuild shortcut. An exact hit and a failed retain leave all input
+   handles intact.
+2. On a miss, complete shape, rank and ownership checks. Check the ID,
+   size and alignment calculations, ensure table capacity, and allocate
+   and construct the candidate header, child slots and owned payload.
+   Retain the manager state. Recompute the insertion slot after any
+   table growth. Copy or otherwise acquire any borrowed payload while
+   its source is live. Leave the candidate's initialized-edge count at
+   zero during preparation.
+3. Once every fallible operation has succeeded, detach the internal
+   pointer from each input handle and initialize its corresponding edge
+   by nonthrowing operations. Each detach nulls one handle and performs
+   neither a retain nor a release. Advance the initialized-edge count for
+   each stored slot. Set the parent count to one, assign its ID, publish
+   it into the reserved table slot, and return the adopting owner.
+   There is no error path after the first detach.
+
+Pre-transfer rollback releases any candidate state ownership and
+destroys its constructed payload and storage. It owns no edges to drop.
+The borrowed path retains its initialized-edge rollback. Both paths
+share ordinary parent destruction, which releases one edge per slot
+even for duplicates. The move-in path preserves stable reference counts
+without temporarily incrementing any child's count. Reference limits
+still apply to state and returned hit ownership. The factory retains
+the existing error translation, table-growth and derived-sort guarantees.
 
 ## 6. Reference counts and reclamation
 
@@ -436,7 +642,11 @@ the concrete-rational compatibility grammar.
   call must carry its definition table; the internal declaration is not a
   free UF. A consumer may later perform capture-safe substitution when needed.
   Formal placeholders remain in definition bodies, not free in query roots.
-  The production solver will consume this table.
+  The Phase 1 Node boundary requires retained declarations and instances for
+  definitions with formals. It permits a closed nullary definition to share
+  its typed body directly and keep its definition and occurrence information
+  in the frontend. Calls with formals within an aliased body still require
+  the owning definition table.
 - The frontend checks source scope and active signatures without expanding
   defined calls to enforce catalog fragment shapes. A model-only abstract
   value is a fresh internal constant whose meaning is supplied by its owning
@@ -470,63 +680,34 @@ alone do not constitute a complete array model.
 
 ## 9. Source organization and build integration
 
-The implementation files and logical responsibilities are:
+The `dandelion_node` static library publishes `dandelion.node` in its
+`PUBLIC` C++ module file set. The implementation units cover node handles
+and factories, sort and declaration stores, datatype builders, builtin
+rules, the unique table, and DAG traversal. They import the primary
+interface through `module dandelion.node;` and import the non-exported
+`dandelion.node:internal` partition explicitly. A separate `PRIVATE` C++
+module file set keeps that partition inside the target.
 
-```text
-src/node/
-  numeric.cppm             numeric.cc
-  node.cppm                node.cc
-  node_internal.cppm       sort_store.cc
-  decl_store.cc            datatype_builder.cc
-  kind_rules.cc            unique_table.cc
-  traversal.cc
-tests/node/
-  node_test_peer.cc        numeric_test.cc
-  sort_test.cc             declaration_test.cc
-  datatype_test.cc         operator_test.cc
-  identity_test.cc         lifetime_test.cc
-  traversal_test.cc        failure_test.cc
-  boundary_test.cc         value_test.cc
-  category_test.cc         frontend_boundary_test.cc
-  gmp_failure_test.cc      gmp_oom_probe.cc
-```
+### Phase 1C module and test boundary
 
-One `dandelion_node` STATIC target owns the two named modules
-`dandelion.numeric` and `dandelion.node`. Publish module interfaces through
-`PUBLIC FILE_SET CXX_MODULES` and compile implementation sources privately.
-The node interface re-exports the numeric module when its public declarations
-use numeric types. `node_internal.cppm` provides the non-exported
-`dandelion.node:internal` partition in a separate `PRIVATE` CXX_MODULES file
-set. It imports the primary interface and defines shared internal types once.
-Node implementation units declare `module dandelion.node;` and explicitly
-`import :internal;`. The public interface neither imports nor re-exports the
-private partition. Never repeatedly include a header defining the same
-module-attached internal types in several module implementation units: the
-multiple definitions violate the C++ one-definition rule even if a compiler
-does not diagnose them. [C++23 ODR](https://timsong-cpp.github.io/cppwp/n4950/basic.def.odr),
-[CMake module visibility](https://cmake.org/cmake/help/v4.5/manual/cmake-cxxmodules.7.html#module-visibility)
+`dandelion_node` links publicly to `dandelion_util`, with an ordinary
+`import dandelion.util.numeric;` in the Node module. Consumers which name
+numeric types import the util module explicitly. Node exports its own
+diagnostics and `ReferenceLimit` and translates util failures at the checked
+factory boundary. Util links privately to GMP and supplies the link
+dependency for consumers of the static libraries.
+[Node error contract](design.md#phase-1c-error-translation),
+[Util build and module layout](../util/implementation.md#build-and-module-layout)
 
-Use C++23 and `import std` on the verified GCC/Clang
-toolchains; include `gmp.h` only in an implementation global module fragment.
-The GMP C API is private to the module and `GMP::GMP` is a private dependency.
-A final executable linking the static library must still receive the required
-GMP link dependency. The node target does not find or link a SAT backend.
+In test builds, `node_test_peer.cc` is a private Node implementation unit
+that uses `Access` from `:internal`. The Node and util peer declarations
+live in test-only headers with global module attachment. Initial manager
+and util fault hooks are thread-local. Existing-manager hooks are per
+state. Tests use the public modules and the test headers. Product builds
+omit the hooks.
+[Node tests](../testing/node.md#phase-1c-typed-literals-and-inline-numeric-payloads)
 
-When `DANDELION_BUILD_TESTS` is enabled, compile `node_test_peer.cc` as a
-private implementation source of `dandelion_node`, where it can import the
-private partition. Expose its narrowly scoped controls through a test-only
-`NodeTestPeer` declaration in the primary interface, enabled only in that
-build. It is not a supported product API. Test executables import the public
-node module and call that peer; they do not import a private partition from
-another target. Controls for existing managers are per state and are established before
-the corresponding operation. Manager creation and standalone numeric values
-use narrowly scoped test-only thread-local controls, since no state exists
-at those boundaries. Without tests, neither
-the peer declarations, friend declarations, nor peer source is built. Under
-the same test-build condition in the primary interface, export the peer's
-forward declaration before affected handles, add their friend declarations,
-and export the peer definition after the handles. Keep test-enabled and
-test-disabled module artifacts in their own correctly configured builds.
+### Build and test requirements
 
 Follow [cmake.md](../cmake.md): list owned sources explicitly, apply
 `dandelion_configure_target()`, use existing dependency resolution and
@@ -579,6 +760,19 @@ and [SMTInterpol's term factory and checker](https://smt-comp.github.io/2023/sys
 These describe different implementations and do not establish Dandelion's
 performance.
 
+### Phase 1C allocation measurements
+
+On the target 64-bit glibc allocator, the 56-byte header-only FP special
+request fits a 64-byte chunk. Use requested bytes for `NodeStorageStats`
+and measure allocator effects separately in a Release run using that
+allocator.
+
+Keep the 48-byte header as a separate A/B benchmark candidate after the
+56-byte Phase 1C implementation. Hold payload encodings, workloads,
+toolchain, build configuration, and allocator fixed. Compare requested node
+bytes, allocation counts and size classes, peak RSS, and construction and
+reclamation time on matched word, special, wide, and mixed node workloads.
+Record reproducible measurements before adopting the smaller header.
 
 ## 11. Concrete implementation notes
 

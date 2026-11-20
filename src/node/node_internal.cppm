@@ -1,8 +1,18 @@
 module dandelion.node:internal;
 import dandelion.node;
+import dandelion.util.numeric;
 import std;
 
 namespace dandelion::detail {
+
+using numeric::BitVectorView;
+using numeric::FloatingPointView;
+using numeric::FpFormat;
+using numeric::FpSpecial;
+using numeric::Integer;
+using numeric::IntegerView;
+using numeric::RationalView;
+using numeric::RoundingMode;
 
 static_assert(std::numeric_limits<std::size_t>::digits <=
               std::numeric_limits<std::uint64_t>::digits);
@@ -22,6 +32,11 @@ inline void Require(
     std::uint64_t operand = std::numeric_limits<std::uint64_t>::max()) {
   if (!condition) Fail(code, ResourceKind::kNone, operand);
 }
+NodeError TranslateNumericError(
+    numeric::NumericError error, bool literal,
+    std::uint64_t operand = std::numeric_limits<std::uint64_t>::max(),
+    std::uint64_t parameter =
+        std::numeric_limits<std::uint64_t>::max()) noexcept;
 template <class T, class Function>
 Result<T> Guard(Function&& function) {
   try {
@@ -32,6 +47,8 @@ Result<T> Guard(Function&& function) {
       return function();
   } catch (const Failure& failure) {
     return std::unexpected(failure.error);
+  } catch (numeric::NumericError error) {
+    return std::unexpected(TranslateNumericError(error, false));
   } catch (const ReferenceLimit&) {
     return std::unexpected(
         NodeError{ErrorCode::kResourceLimit, ResourceKind::kReferenceCount});
@@ -317,24 +334,55 @@ struct BuilderData {
 enum class PayloadTag : std::uint8_t {
   kNone,
   kBool,
-  kInteger,
+  kIntWord,
+  kIntWidePositive,
+  kIntWideNegative,
   kBvWord,
-  kFpSpecial,
+  kBvWide,
   kFpWord,
   kFpWide,
+  kFpNaN,
+  kFpPositiveInfinity,
+  kFpNegativeInfinity,
+  kFpPositiveZero,
+  kFpNegativeZero,
   kRoundingMode,
   kDeclaration,
   kIndex1,
   kIndexWide,
   kIndex2,
   kRationalConversion,
+  kRationalWidePositive,
+  kRationalWideNegative,
 };
-struct RationalPayload {
+struct RationalWords {
   // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
   std::array<std::uint32_t, 2> indices;
   // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
-  Rational value;
+  std::int64_t numerator;
+  // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
+  std::uint64_t denominator;
 };
+struct RationalPackedPrefix {
+  // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
+  std::array<std::uint32_t, 2> indices;
+  // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
+  std::uint32_t numerator_limbs;
+  // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
+  std::uint32_t denominator_limbs;
+};
+constexpr bool IsWideLiteral(PayloadTag tag) noexcept {
+  return tag == PayloadTag::kIntWidePositive ||
+         tag == PayloadTag::kIntWideNegative || tag == PayloadTag::kBvWide ||
+         tag == PayloadTag::kFpWide;
+}
+constexpr bool IsWideRational(PayloadTag tag) noexcept {
+  return tag == PayloadTag::kRationalWidePositive ||
+         tag == PayloadTag::kRationalWideNegative;
+}
+constexpr bool IsFpSpecial(PayloadTag tag) noexcept {
+  return tag >= PayloadTag::kFpNaN && tag <= PayloadTag::kFpNegativeZero;
+}
 struct NodeData {
   static constexpr auto kExternalChildCount =
       std::numeric_limits<std::uint16_t>::max();
@@ -363,6 +411,8 @@ struct NodeData {
   std::uint8_t kind_code;
   // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
   PayloadTag payload_tag;
+  // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
+  std::uint32_t literal_limb_count;
   inline Kind GetKind() const noexcept { return static_cast<Kind>(kind_code); }
   inline bool IsRetiring() const noexcept { return kind_code & kRetiring; }
   inline std::uint64_t ChildCount() const noexcept {
@@ -371,23 +421,23 @@ struct NodeData {
         reinterpret_cast<const std::uint64_t*>(storage + sizeof(NodeData)));
   }
 };
+template <class Child = const NodeView>
 struct QueryKey {
   // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
   Kind kind;
   // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
   SortId input_sort;
   // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
-  std::span<const NodeView> children;
+  std::span<Child> children;
   // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
   PayloadTag tag = PayloadTag::kNone;
   // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
   bool boolean = false;
   // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
   IntegerView integer = IntegerView(0);
+  // kIntWord stores the signed value converted modulo 2^64.
   // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
   std::uint64_t word = 0;
-  // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
-  FpCategory fp_category = FpCategory::kNaN;
   // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
   RoundingMode rounding_mode = RoundingMode::kRne;
   // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
@@ -400,6 +450,17 @@ struct QueryKey {
 std::span<NodeData* const> Children(const NodeData* node) noexcept;
 const void* Payload(const NodeData* node) noexcept;
 void* Payload(NodeData* node) noexcept;
+std::span<const std::uint64_t> LiteralLimbs(const NodeData* node) noexcept;
+std::array<std::uint32_t, 2> RationalIndices(const NodeData* node) noexcept;
+RationalView ReadRational(const NodeData* node) noexcept;
+#ifdef DANDELION_NODE_TESTING
+Result<std::size_t> CheckNumericNodeSize(PayloadTag tag, std::uint64_t limbs,
+                                         std::uint64_t denominator_limbs,
+                                         std::size_t limit);
+Result<std::size_t> CheckNumericTailSize(std::size_t prefix,
+                                         std::uint32_t limbs,
+                                         std::size_t limit);
+#endif
 template <class T>
 T& Value(NodeData* node) noexcept {
   return *std::launder(static_cast<T*>(Payload(node)));
@@ -409,8 +470,8 @@ const T& Value(const NodeData* node) noexcept {
   return *std::launder(static_cast<const T*>(Payload(node)));
 }
 void DestroyPayload(NodeData* node) noexcept;
-std::uint64_t HashKey(const QueryKey& key) noexcept;
-bool EqualKey(const NodeData* node, const QueryKey& key) noexcept;
+template <class Child>
+std::uint64_t HashKey(ManagerState* state, const QueryKey<Child>& key) noexcept;
 
 class UniqueTable {
  public:
@@ -421,8 +482,10 @@ class UniqueTable {
     std::size_t slot;
   };
   UniqueTable();
-  ProbeResult Probe(const QueryKey& key, std::uint64_t hash) noexcept;
-  ProbeResult ProbePlain(Kind kind, std::span<const NodeView> children,
+  template <class Child>
+  ProbeResult Probe(const QueryKey<Child>& key, std::uint64_t hash) noexcept;
+  template <class Child>
+  ProbeResult ProbePlain(Kind kind, std::span<Child> children,
                          std::uint64_t hash) noexcept;
   bool EnsureSpace(ManagerState* state);
   std::size_t FindVacant(std::uint64_t hash) noexcept;
@@ -474,6 +537,8 @@ struct ManagerState {
   // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
   std::array<SortId, kScalarSortCount> scalar_sorts{};
   // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
+  std::array<SortId, 64> bv_sorts{};
+  // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
   std::unordered_set<const SortRecord*, SortHash, SortEqual> sort_index;
   // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
   std::vector<std::unique_ptr<const SortConstructorRecord>> sort_constructors;
@@ -520,11 +585,17 @@ struct ManagerState {
   // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
   std::uint64_t reclamations = 0;
   // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
+  std::uint64_t candidate_frees = 0;
+  // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
   std::uint64_t allocation_attempts = 0;
   // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
   std::uint64_t type_evaluations = 0;
   // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
   std::uint64_t builtin_shape_checks = 0;
+  // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
+  std::uint64_t hash_computations = 0;
+  // NOLINTNEXTLINE(readability-identifier-naming): Struct field, snake_case.
+  std::uint64_t sort_table_lookups = 0;
 #endif
   ~ManagerState() noexcept;
 };
@@ -646,6 +717,12 @@ class StateLease {
   ManagerState* state_;
 };
 struct Access {
+  static std::size_t RootCount(const RootRange& range) noexcept {
+    return range.count_;
+  }
+  static Node& RootAt(const RootRange& range, std::size_t index) noexcept {
+    return range.at_(range.context_, index);
+  }
   static ManagerState* State(const NodeManager& manager) noexcept {
     return manager.state_.state_;
   }
@@ -657,6 +734,7 @@ struct Access {
     return view.state_;
   }
   static inline NodeData* Data(NodeView view) noexcept { return view.node_; }
+  static inline NodeData* Data(const Node& node) noexcept { return node.node_; }
   static NodeView ViewNode(NodeData* node) noexcept { return NodeView(node); }
   static Node OwnNode(NodeData* node) noexcept { return Node(node); }
   static NodeData* TakeNode(Node& node) noexcept {
@@ -709,9 +787,8 @@ void CheckView(
   Require(!view.IsNull(), ErrorCode::kNullObject, operand);
   Require(Access::State(view) == state, ErrorCode::kForeignManager, operand);
 }
-inline NodeData* CheckNode(ManagerState* state, NodeView node,
+inline NodeData* CheckNode(ManagerState* state, NodeData* data,
                            std::uint64_t operand) {
-  auto* data = Access::Data(node);
   Require(data != nullptr, ErrorCode::kNullObject, operand);
   Require(data->state == state, ErrorCode::kForeignManager, operand);
   return data;
@@ -799,6 +876,7 @@ std::uint32_t PositiveWidth(IntegerView value, std::uint32_t minimum = 1);
 // Both format components have already been validated.
 std::uint32_t CheckedFpWidth(std::uint32_t exponent, std::uint32_t significand);
 SortId InternSort(ManagerState* state, SortKey key);
+SortId BvSortId(ManagerState* state, std::uint64_t width);
 // Only primitive sorts with no parameters use this cache.
 inline SortId ScalarSortId(ManagerState* state, SortKind kind) {
   auto& id = state->scalar_sorts[std::to_underlying(kind)];
@@ -817,20 +895,31 @@ inline void PublishSingleInstance(ManagerState* state, DeclId declaration,
   state->instances.push_back({declaration});
   record.single_instance = id;
 }
-QueryKey BuiltinKey(ManagerState* state, BuiltinOpView op,
-                    std::span<const NodeView> children);
+template <class Child>
+QueryKey<Child> BuiltinKey(ManagerState* state, BuiltinOpView op,
+                           std::span<Child> children);
+template <class Child>
+QueryKey<Child> WordIndexedBuiltinKey(ManagerState* state, Kind kind,
+                                      std::span<const std::uint64_t> indices,
+                                      std::span<Child> children);
 void CheckPlainBuiltinShape(ManagerState* state, Kind kind,
                             std::size_t child_count);
-SortId InferBuiltinSort(ManagerState* state, const QueryKey& key);
-SortId CompleteKeySort(ManagerState* state, const QueryKey& key);
-Node InternNode(ManagerState* state, const QueryKey& key);
+template <class Child>
+SortId InferBuiltinSort(ManagerState* state, const QueryKey<Child>& key);
+template <class Child>
+SortId CompleteKeySort(ManagerState* state, const QueryKey<Child>& key);
+template <class Child>
+Node InternNode(ManagerState* state, const QueryKey<Child>& key,
+                SortId established_sort = 0);
+template <class Child>
 Node InternPlainBuiltin(ManagerState* state, Kind kind,
-                        std::span<const NodeView> children);
+                        std::span<Child> children);
 struct CandidateDeleter {
   void operator()(NodeData* node) const noexcept;
 };
 using Candidate = std::unique_ptr<NodeData, CandidateDeleter>;
-Candidate PrepareNode(ManagerState* state, const QueryKey& key,
+template <class Child>
+Candidate PrepareNode(ManagerState* state, const QueryKey<Child>& key,
                       SortId result_sort, std::uint64_t hash);
 Node PublishNode(ManagerState* state, std::size_t slot,
                  Candidate candidate) noexcept;

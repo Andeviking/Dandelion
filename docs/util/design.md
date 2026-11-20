@@ -1,182 +1,149 @@
-# Numeric Layer: Scope and Shared Contracts
+# Numeric Layer Contracts
 
-Status: **proposed design for review**. The contracts below describe the
-recommended future layer. Implemented node contracts remain authoritative
-until migration. See [implementation.md](implementation.md) for precise
-compatibility requirements.
+**Status.** Phase 1B design specification implemented by the standalone
+module in Phase 3.
 
 ## Responsibility and dependency direction
 
-The frontend accepts syntax and logic profiles; it validates literals and
-indices before publishing them. The independently callable node and numeric
-factories also validate their own external inputs. A `NodeManager` checks
-sorts, managers, arities and identities, owns immutable payload copies, and
-interns syntax. Numeric values have no manager, declaration, solver, SAT,
-or frontend dependency. Rewriting and model evaluation invoke numeric
-operations on concrete values; symbolic terms and type rules remain in the
-node layer. The theory procedures and coordinator own symbolic encodings,
-underspecified functions, model consistency and recovery. A numeric value is
-not a theory solver or an expression.
+The static library `dandelion_util` owns exact concrete arithmetic and
+numeric value identity. Its sole public module is `dandelion.util.numeric`.
+The value and error declarations live in namespace `dandelion::numeric`.
+The library depends on the C++ standard library and privately on GMP 6.3
+or newer. Node, frontend, and future evaluator and theory code depend on
+numeric services. NodeManager, NodeError, DatatypeReason, and ReferenceLimit
+belong to the node layer and are outside the numeric import and link graph.
+[Module layout and migration](implementation.md)
 
-| Value | Identity and purpose | Primary clients |
-| --- | --- | --- |
-| `Integer` | Mathematical element of Z; unbounded exact signed value. | Int constants and indices, IDL/LIA/NIA, BV conversions, rational and FP algorithms. |
-| `BitVector` | Pair `(w,u)` with `w > 0` and `0 <= u < 2^w`; width is part of identity. | BV constants, constant folding, encoding and models, FP interchange. |
-| `Rational` | Mathematical element of Q in canonical numerator/denominator form. | Closed rational FP input, exact rounding and arithmetic relaxations, not a user Real sort. |
-| `FloatingPointValue` | A format `(e,s)` plus an abstract SMT-LIB FP value; one NaN within a format and distinct signed zeros. | FP constants, ground evaluation, model construction and checking. |
-| `RoundingMode` | Five valid enum values, shared by FP and nodes. | FP evaluation, encoding and model. |
+| Owner | Responsibility |
+| --- | --- |
+| Numeric layer | Check its own external inputs, preserve exact value invariants, and evaluate concrete operands |
+| Node layer | Check manager membership, arity, sorts, and indices, retain immutable payloads, and intern structural keys |
+| Frontend | Interpret syntax and logic profiles, attach source diagnostics, and render SMT-LIB values |
+| Rewriter, theory, and model code | Apply sound rewrites, encode symbolic operations, interpret total functions consistently, and validate original queries |
 
-Value comparison and hashing are independent of manager identity, allocation
-address, and storage representation. Equal values must hash equally; collisions
-require full equality. Hashes are internal, need not be stable across versions,
-and are not serialization. Values of different BV widths or FP formats are
-different typed values even if their numeric interpretations coincide. This
-does not make differently sorted SMT terms comparable. FP core identity and
-IEEE `fp.eq` are separate operations.
+`Integer` represents Z. `Rational` represents Q for exact conversions and
+integer algorithms such as linear relaxations. The frontend profile admits
+closed rational constants in the selected FP conversion form. Symbolic Real,
+`fp.to_real`, and general Real solving are outside the profile. Polynomials,
+algebraic numbers, intervals, and other algorithm-specific representations
+belong to the procedures that require their invariants.
+[Frontend profile](../frontend/logic-profile.md)
 
-Polynomials, linear forms, intervals, infinitesimals, algebraic numbers and
-root isolation have invariants tied to specific algorithms. They belong with
-the arithmetic procedure that actually needs them; their requirements and
-exactness must be designed there. Rational relaxations do not create a Real
-input sort or establish an integer model. An algebraic-number implementation
-may be useful to a future NIA method even in a Real-free language, but is not
-required merely because another solver has one. A format descriptor is a
-supporting concept, not an extra numeric domain or a plugin framework.
+`BitVector` identifies a width and unsigned residue. `FloatingPointValue`
+identifies a format and an abstract value, with one NaN per format and two
+distinct signed zeros. Core equality and nonallocating hash are based on
+canonical mathematical value and, for BV and FP, the width or format.
+Equal values hash equally. Hash collisions require full equality. Hashes
+serve in-memory lookup and carry no serialization or version-stability
+contract. IEEE `fp.eq` is a separate operation. Core `=`, `distinct`, and
+`ite` polymorphism, chainable comparisons, and n-ary folds are handled by
+the caller according to the node operator inventory. [Node operators](../node/operators.md)
 
-## Common API and failure policy
+## Ownership and public operations
 
-The operation names in the type documents describe required callable behavior,
-not final spelling. Values own their payload and can be copied independently.
-Public borrowing is read-only, does not prolong an owner's lifetime, and is
-available on lvalues only; `Borrow()` on an rvalue is deleted. The existing
-`IntegerView` can also directly contain a small integer and be constructed
-independently; a large view borrows its owner's storage. A copied view does
-not own a GMP limb, node, manager or temporary. Calls may borrow inputs
-only for the call; no result may retain a borrowed argument. Published node
-values are immutable even if the caller later changes or destroys an input.
-No writable GMP object or limb is exported. Moves and destruction are
-`noexcept`; Integer moves leave zero and Rational moves leave 0/1, including
-the existing self-move guarantees. Proposed BV and FP moves leave a valid
-value, with the exact moved-from value selected and tested before implementation.
-Copy assignment provides the strong guarantee if C++ allocation fails. The
-initial proposed moved-from BV is BV1 zero, and moved-from FP is F(2,2)
-positive zero; reset must not allocate. Self-move preserves the value.
+Values own independent payloads. Copying a wide value duplicates its backing
+storage. Move and destruction are `noexcept`. Moving from a distinct
+object resets it to Integer zero, Rational `0/1`, BV1 zero, or F(2,2)
+positive zero, respectively. Self-copy and self-move preserve the value.
+Move and reset allocate nothing. Copy assignment has the strong guarantee.
+Checked value-producing functions use `NumericResult<T>`. C++ copy
+construction and assignment can propagate `std::bad_alloc` where their
+language-defined signatures require them. Existing throwing formatting and
+copy conveniences, where retained for node callers, keep their contract.
 
-New potentially allocating calculations use an expected-like
-`NumericResult<T>` with a nonallocating error carrying invalid input,
-representational size or C++ allocation failure. A separately specified
-cancellation mechanism may report cancellation when actually requested; it
-does not introduce a per-operation quota. A division API requiring a nonzero
-operand has a checked external wrapper; a validated internal helper can rely
-on that precondition.
-Mismatched widths/formats are rejected at independently callable boundaries;
-internally typed nodes establish operand compatibility. Do not repeat checks
-already guaranteed by an immutable value's construction. APIs with no
-recoverable failure, such as sign, equality, and nonallocating hash, return
-directly. Existing `Integer::ParseDecimal`, `Rational::Make`, Node factory
-`Result` types and exception guarantees are preserved through a compatibility
-adapter; they are not silently changed to the new error type.
+`IntegerView` and `RationalView` provide the read-only access specified by
+their type documents. `Borrow()` is lvalue-only. A borrow of backing storage
+requires its owner to remain alive and unchanged, including when the owner
+is a node or a Rational component. Inline Integer views can hold a signed
+or unsigned word by value. BV and FP operations take read-only references
+to their owning values. `NumericResult<T>` and `FpOutcome<T>` own any
+contained numeric values. Numeric APIs expose no writable limbs or GMP
+objects and retain no caller borrow beyond a call, except explicit views.
+Infallible queries such as width, sign, core equality, and hash return
+directly.
 
-The following illustrative signatures make the intended value and failure
-boundaries concrete; they do not fix final names or binary layout:
+## Checked errors
 
 ```cpp
-NumericResult<std::pair<Integer, Integer>> DivMod(
-    IntegerView dividend, IntegerView nonzero_divisor);
-NumericResult<BitVector> FromIntegerModulo(
-    std::uint32_t width, IntegerView value);
-NumericResult<FpOutcome<FloatingPointValue>> Min(
-    FloatingPointView left, FloatingPointView right);
-NumericResult<FpOutcome<BitVector>> ToUnsignedBv(
-    FloatingPointView value, RoundingMode mode, std::uint32_t width);
+enum class NumericError : std::uint8_t {
+  kInvalidText, kInvalidArgument, kValueOutOfRange, kDivisionByZero,
+  kSizeLimit, kCppAllocation,
+};
+
+template <class T>
+using NumericResult = std::expected<T, NumericError>;
 ```
 
-`FpOutcome<T>` is a tagged result: a defined value, two explicitly allowed
-values, or an unspecified value of the stated destination type/format. Its
-unspecified case retains the destination width or format when `T` is
-runtime-sized. Accessors require the matching tag. It has no implicit
-conversion to `T`.
-The outer error distinguishes failure to compute from a valid underspecified
-outcome. The checked `DivMod` still verifies a nonzero divisor at this
-independently callable boundary; internal code may call an unchecked helper
-after establishing it. The illustrative `uint32_t` widths match the retained
-node representation boundary; final method names and error layout remain
-proposals.
+| Code | Condition |
+| --- | --- |
+| `kInvalidText` | Text violates the numeric entry point's grammar |
+| `kInvalidArgument` | Invalid width, format minimum, rounding-mode code, radix, index, operand shape, or exactness precondition |
+| `kValueOutOfRange` | A valid value falls outside a requested checked value domain, such as a negative or oversized BV literal |
+| `kDivisionByZero` | A checked Integer or Rational operation requires a nonzero divisor or denominator |
+| `kSizeLimit` | A valid input or operation requires a size outside an actual representation or backend capacity |
+| `kCppAllocation` | A project-controlled C++ allocation fails in a checked operation |
 
-An operation is atomic from its caller's perspective: it returns the exact
-value or an actual representational, allocation or externally requested
-cancellation outcome; it never returns a truncated number. Do not impose
-discretionary input, intermediate-size, work or memory quotas. Checked
-`uint32_t`, `size_t`, container and GMP index capacities remain applicable
-where actually used. A valid value that an existing representation cannot
-hold is not an invalid literal. For an accepted query, propagate inability to
-compute to the rewriter/solver so it can retain the term, use another sound
-path, or return `unknown`; an input or size error is reported at its owning
-boundary.
+Errors are fixed-size and carry no allocated message. Callers attach
+diagnostic context. Independently callable APIs validate widths, formats,
+indices, modes, and divisors before entering kernels that rely on those
+invariants. Multiple invalid conditions may be diagnosed in either order
+when each reported condition applies. An optional narrowing query may
+return an empty optional for a value outside its target range. For BV
+division the standard specifies values for zero divisors. FP division has
+its own defined special values, independently of Integer or Rational
+division.
 
-GMP >= 6.3 is the existing private implementation dependency. Its default
-limb allocation failure may terminate the process, so neither expected nor
-C++ exceptions promise recovery from arbitrary GMP OOM. Do not install a
-process-wide GMP allocator or throw through GMP callbacks. Check actual sizes
-and representation arithmetic before GMP operations where needed; this cannot
-guarantee survival of actual allocation failure. No fatal exit justifies a
-solver answer.
-The process-wide allocator and reference-count failure behavior of the
-current node API remain unchanged.
+Validate lengths, sums, products, limb counts, byte counts, and backend
+requirements before computing or narrowing them. Width and format limits
+come from `uint32_t`, including the FP sum. Allocation sizes and count
+representations come from `size_t` and the actual storage or GMP operation,
+including required scratch and spare limbs. A conservative estimate alone
+cannot establish that a result or an operation exceeds capacity. Use a
+tighter bound or a capacity-safe computation when a bound straddles the
+limit. Check the supported backend's allocation and entry-point types,
+including `mp_bitcnt_t`, `mp_size_t`, and the allocation count used by
+`mpz_t`. GMP 6.3 uses an `int` for that allocation count even when
+`mp_size_t` is wider. The layer imposes no discretionary width, work, or
+memory quota. [GMP integer internals](https://gmplib.org/manual/Integer-Internals)
 
-## Operator ownership and cross-type paths
+Operations publish a complete canonical result only after successful
+preparation. Errors leave input values and existing borrows intact.
+Project-controlled allocation failures can be recovered at the checked
+boundary. GMP limb allocation failure terminates the process. Production
+code uses the default GMP allocator and allows neither exceptions nor
+nonlocal exits through its allocation callbacks.
+[GMP allocation contract](https://gmplib.org/manual/Custom-Allocation)
 
-This table covers the inventory in [node operators](../node/operators.md).
-For each listed numerical family, the corresponding value document specifies
-the ground operation. `fold` means that a rewriter or evaluator applies the
-binary operation in the node's specified order; the node factory continues to
-retain the operation. A value operation alone never proves a symbolic rewrite
-or a mixed-theory result.
+## Concrete FP outcomes and solver callers
 
-| Input kinds | Concrete responsibility | Other responsibility |
-| --- | --- | --- |
-| Int literals, `-`, `+`, `-`, `*`, `div`, `mod`, `abs`, `**`, comparisons, `divisible` | Integer operations; fold n-ary forms and handle negative exponent as specified. | Preserve `div`/`mod` with zero divisor as an underspecified total function, including congruence; logic restrictions are frontend-owned. |
-| BV literals, Boolean/bitwise arithmetic, signed and unsigned div/rem/mod, shifts, comparisons and overflow predicates | BitVector operations with exact width and total BV corner cases. | Node type checking, n-ary folds and symbolic BV encoding remain separate. |
-| `concat`, `extract`, `repeat`, extensions, rotations, `bvcomp` | BitVector operations and checked result-width computations. | Node retains exact original indices, even semantically equivalent rotation indices. |
-| `ubv_to_int`, `sbv_to_int`, `int_to_bv` | Explicit unsigned/signed interpretation and modulo conversion. | Coordinator/encoding must enforce these relations on symbolic values. Literal construction is not modulo conversion. |
-| `fp`, bit reinterpretation, FP/Rational/BV conversions, FP arithmetic, comparisons and classification | FP value operations with explicit format, rounding and choice outcomes; use BV and Rational as required. | Symbolic FP-to-BV lowering, consistent underspecified interpretations and model reconstruction belong to FP theory and model. |
-| Rounding-mode values, core `=`, `distinct`, `ite` | RM identity; per-sort value equality, including FP core equality. | Node and general evaluator handle polymorphism, n-ary chain/pair rules, and conditionals. |
-| Arrays, UF, DT and their applications | No compound value or function interpretation is invented here. | Other components retain total interpretations, extensionality, congruence, datatype and shared-value obligations. |
+`FpOutcome<T>` is an owning tagged sum. It carries one defined `T`,
+two distinct allowed `T` values of the same destination type, or an
+unspecified result constrained only by its destination type. Store the two
+alternatives inline as value objects and the unspecified destination as
+its checked BV width or `FpFormat`, with no candidate payload. Accessors
+require the matching tag. There is no implicit conversion to `T`.
 
-`Integer -> Rational` is exact with denominator one. `Rational -> Integer`
-requires an explicit rounding rule or exact-integral check. `Integer <-> BV`
-distinguishes modulo conversion from checked literal construction. `BV -> FP`
-chooses signed or unsigned interpretation explicitly. FP construction from
-bits is reinterpretation, not numeric rounding. FP-to-BV first rounds to an
-integer and checks the rounded result's range. An exact finite FP value may be
-viewed as a dyadic value internally; materializing it as a Rational can require
-substantial storage and is not mandatory for classifying a value.
+`Min` and `Max` return `NumericResult<FpOutcome<FloatingPointValue>>`.
+Their opposite-zero cases are the two-choice outcome. `ToSignedBv` and
+`ToUnsignedBv` return `NumericResult<FpOutcome<BitVector>>`, with an
+unspecified BV destination for NaN, infinities, and rounded out-of-range
+integers. Other FP operations with a unique result return that value
+directly or in `NumericResult<T>` as appropriate. An invalid destination,
+allocation failure, or size failure uses the outer error even when the
+input would otherwise have a semantic outcome.
+[Floating-point value and operation contracts](floating-point.md)
 
-## Current boundary and the proposed bridge
+For a fixed operator, indices, and ordered semantic argument tuple, every
+occurrence must agree on the result. This includes equal NaNs constructed
+from different payloads, explicit rounding modes, and FP values carried
+through arrays, UF, and datatypes. A rewriter can fold a defined outcome.
+A model can choose an allowed result if it preserves congruence and
+satisfies the original query. Integer `div` and `mod` by zero stay in the
+caller’s total-function semantics and never invoke checked `DivMod`.
 
-Today `src/node/numeric.cppm` exports `Integer`, `IntegerView`, `Rational`,
-`RationalView`, `NodeError`, `Result`, and `ReferenceLimit`; `numeric.cc`
-implements the numbers and reference-limit message. Small Integer values use
-signed `int64_t`; bigger ones own a private GMP integer. Rational stores two
-Integers and uses GMP rational normalization. Numeric arithmetic beyond the
-existing parse, compare, normalization and inspection APIs is not implemented.
-
-BV nodes currently store an Integer plus a BV sort, not a BitVector object.
-FP nodes store a category plus Integer finite bits and an FP sort, not an FP
-value object. Rational conversion nodes own normalized rational payloads. A
-proposed borrowed `BitVectorView` can pair the existing sort width with the
-existing Integer view; a proposed `FloatingPointView` can pair the sort format
-with the existing category and finite-bit view. Neither view owns its node.
-This avoids an immediate node payload change and allows `LiteralView`'s
-existing `GetInteger`, `GetFpCategory`, and `GetFpBits` to keep their contracts.
-Standalone values own the same semantic information independently of a node.
-If future storage differs, these accessors still need valid borrowed results;
-an adapter that returns a view of a temporary is invalid.
-
-Node structural identity includes kind, sort and canonical payload; it is not
-general term equality. The exact index on `rotate` remains part of the node
-key even if reduced modulo width during evaluation. NaN bit encodings share
-one node per sort, signed zeros remain distinct, and constant-child `fp` or
-`to_fp` applications remain operator nodes. New numeric comparisons or
-folding do not alter these facts. Existing factory rollback, failure mapping,
-references and tests remain in force.
+At an input boundary, report invalid input and actual resource failures
+through that boundary's diagnostics. During solving, keep the original
+term, use another sound procedure, or return `unknown` when computation
+is needed and no sound result can be established. Numeric failure and
+process termination give no basis for `sat` or `unsat`.
+[Models and results](../architecture.md#8-models-and-results)

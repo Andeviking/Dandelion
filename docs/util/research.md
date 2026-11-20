@@ -1,142 +1,66 @@
-# Numeric Representation Research
+# Numeric Architecture Research
 
-Status: **research evidence for the proposed design**, 2026-11-16. This is a
-study of the linked versions and selected files, not an exhaustive audit of
-every configuration or a benchmark. Revisions below are fixed tags or commits;
-the standard pages state their theory revision. Source observations are not
-measurements of Dandelion. The choices derived from them are independent.
+**Status.** Research supporting the active Phase 1B design. The current
+design choices are specified in the type documents. The observations below
+describe pinned sources and small historical experiments.
 
-## Bitwuzla 0.10.0
+## Exact value representations
 
-- [`Integer`](https://github.com/bitwuzla/bitwuzla/blob/0.10.0/src/util/integer.h)
-  owns an `mpz_t`; it is not the small/large tagged Integer proposed here.
-  Its API exposes GMP for its own implementation. This is evidence of one
-  design, not a reason for Dandelion to expose GMP.
-- Its [`BitVector`](https://github.com/bitwuzla/bitwuzla/blob/0.10.0/src/bv/bitvector.h)
-  stores width and a union of an inline unsigned word or GMP integer. The
-  inline threshold follows `unsigned long`: typically 64 bits on 64-bit Unix
-  and 32 on 64-bit Windows, to avoid truncation at GMP interfaces. Its
-  operators include the usual modular, signed and unsigned BV operations.
-  This width-dependent split suggests a useful future comparison, not a
-  measured advantage over Dandelion's compatibility-oriented baseline.
-- [`FloatingPoint`](https://github.com/bitwuzla/bitwuzla/blob/0.10.0/src/fp/floating_point.h)
-  stores format sizes and an MPFR value; its
-  [implementation](https://github.com/bitwuzla/bitwuzla/blob/0.10.0/src/fp/floating_point.cpp)
-  sets exponent ranges, handles nearest-away and subnormalization, and
-  canonicalizes a NaN when producing bits. The separate
-  [SymFPU representation](https://github.com/bitwuzla/bitwuzla/blob/0.10.0/src/fp/floating_point_symfpu.h)
-  and [symbolic wrapper](https://github.com/bitwuzla/bitwuzla/blob/0.10.0/src/solver/fp/symfpu_wrapper.cpp)
-  support word-blasting. These paths are related but distinct responsibilities;
-  MPFR is not thereby adopted by Dandelion. The
-  [0.10.0 SymFPU wrap](https://github.com/bitwuzla/bitwuzla/blob/0.10.0/subprojects/symfpu.wrap)
-  pins `40bdec00e99f8ea1b96c3dac0a05eed11c541639` and lists two local patches,
-  including experimental-format fixes. Exact supported formats and behavior
-  depend on that release's configuration; a solver's rejection of a tiny
-  format is not evidence that Dandelion may ignore its own accepted sorts.
+| Reference | Observation and design implication |
+| --- | --- |
+| Bitwuzla 0.10.0 | Integer owns an `mpz_t`. BV uses an unsigned word for small declared widths selected according to the GMP-facing machine word type, with GMP backing for wider widths. Dandelion stores up to 64 effective bits inline independently of declared width, and gives wide values a fixed 64-bit limb representation. [Integer](https://github.com/bitwuzla/bitwuzla/blob/0.10.0/src/util/integer.h), [BV](https://github.com/bitwuzla/bitwuzla/blob/0.10.0/src/bv/bitvector.h) |
+| cvc5 `282d5e0c84baf49c780704c532f87ba66d8b513d` | The GMP build wraps Integers and Rationals through GMP C++ types. Its BV value pairs width with an Integer. Dedicated unsigned BV storage in Dandelion keeps BV64's high half inline while preserving a full signed word for Integer. [Integer](https://github.com/cvc5/cvc5/blob/282d5e0c84baf49c780704c532f87ba66d8b513d/src/util/integer_gmp_imp.h), [Rational](https://github.com/cvc5/cvc5/blob/282d5e0c84baf49c780704c532f87ba66d8b513d/src/util/rational_gmp_imp.h), [BV](https://github.com/cvc5/cvc5/blob/282d5e0c84baf49c780704c532f87ba66d8b513d/src/util/bitvector.h) |
+| Z3 `430d19e697e2ec9bad79ff210d41b4a7a5fcfa3e` | Its small/large Integer and rational machinery illustrate how local representation choices can avoid allocations. Its FP implementation uses a multiprecision significand, an `int64_t` exponent, and explicit format bounds. Dandelion keeps the complete signed word inline and uses a wide FP working exponent to match its own format boundary. [Integer](https://github.com/Z3Prover/z3/blob/430d19e697e2ec9bad79ff210d41b4a7a5fcfa3e/src/util/mpz.h), [Rational](https://github.com/Z3Prover/z3/blob/430d19e697e2ec9bad79ff210d41b4a7a5fcfa3e/src/util/rational.h), [FP](https://github.com/Z3Prover/z3/blob/430d19e697e2ec9bad79ff210d41b4a7a5fcfa3e/src/util/mpf.h) |
+| Yices 2 `ccdf8998809c82763c683c5e4d9f78eabe6a24e3` | Its Rational supports a small fraction or a GMP rational, and its BV constants use separate word and limb implementations. Positivity of the canonical denominator gives Dandelion a zero tag with no lost denominator bits or pointer tagging. [Rational](https://github.com/SRI-CSL/yices2/blob/ccdf8998809c82763c683c5e4d9f78eabe6a24e3/src/terms/rationals.h), [BV64](https://github.com/SRI-CSL/yices2/blob/ccdf8998809c82763c683c5e4d9f78eabe6a24e3/src/terms/bv64_constants.h), [Wide BV](https://github.com/SRI-CSL/yices2/blob/ccdf8998809c82763c683c5e4d9f78eabe6a24e3/src/terms/bv_constants.h) |
 
-## cvc5 commit `282d5e0c84baf49c780704c532f87ba66d8b513d`
+The GMP C API provides exact integer and rational primitives and
+integer square root. An owning result can take over an existing
+buffer by swap. Stack-backed read-only GMP headers let word
+operands reach exact fallback routines without creating owning GMP
+word buffers. The BV limb fast path additionally requires exact
+limb-type and bit-width compatibility. GMP's actual allocation
+counts can be narrower than its public index types, and its allocator
+requires fatal behavior for OOM. [GNU MP 6.3 manual](https://gmplib.org/gmp-man-6.3.0.pdf)
 
-- Its GMP-backed [`Integer`](https://github.com/cvc5/cvc5/blob/282d5e0c84baf49c780704c532f87ba66d8b513d/src/util/integer_gmp_imp.h)
-  uses `mpz_class`, while its
-  [Rational](https://github.com/cvc5/cvc5/blob/282d5e0c84baf49c780704c532f87ba66d8b513d/src/util/rational_gmp_imp.h)
-  uses canonicalized `mpq_class`; alternative CLN implementation files also
-  exist. Its [`BitVector`](https://github.com/cvc5/cvc5/blob/282d5e0c84baf49c780704c532f87ba66d8b513d/src/util/bitvector.h)
-  pairs a `uint32_t` size with an Integer. This supports considering a direct
-  Integer-backed BV, but neither GMP wrapper has Dandelion's present inline
-  signed Integer contract.
-- [`FloatingPointLiteral`](https://github.com/cvc5/cvc5/blob/282d5e0c84baf49c780704c532f87ba66d8b513d/src/util/floatingpoint_literal.cpp)
-  selects an MPFR or SymFPU concrete backend at build time. The
-  [MPFR backend](https://github.com/cvc5/cvc5/blob/282d5e0c84baf49c780704c532f87ba66d8b513d/src/util/floatingpoint_literal_mpfr.cpp)
-  includes subnormal handling and a special nearest-away path; the
-  [SymFPU backend](https://github.com/cvc5/cvc5/blob/282d5e0c84baf49c780704c532f87ba66d8b513d/src/util/floatingpoint_literal_symfpu.h)
-  uses an unpacked SymFPU literal. Symbolic FP also uses SymFPU. Its
-  [dependency configuration](https://github.com/cvc5/cvc5/blob/282d5e0c84baf49c780704c532f87ba66d8b513d/cmake/FindSymFPU.cmake)
-  pins the same upstream commit as the Bitwuzla wrap for its downloaded
-  dependency, though system installations and downstream patches can differ.
-  A shared bug or shared semantics can therefore produce correlated answers.
-  The [project release notes](https://github.com/cvc5/cvc5/blob/282d5e0c84baf49c780704c532f87ba66d8b513d/NEWS.md)
-  document previous SymFPU divider fixes and MPFR backend changes; this is a
-  reason to pin and test, not a claim about the correctness of this commit.
+## FP semantics and reference independence
 
-## Z3 commit `430d19e697e2ec9bad79ff210d41b4a7a5fcfa3e`
+The selected SMT-LIB Int, BV, and FP documents govern mathematical
+results. The FP declaration gives the formal report precedence where
+they differ. In particular, FP-to-BV checks the rounded integer for
+range, and each opposite-zero min/max tuple has two permitted results.
+Integral rounding uses the integral subset of the FP domain, including
+infinity when rounding crosses the top integral endpoint of tiny
+formats. [Ints](https://smt-lib.org/theories-Ints.shtml),
+[FixedSizeBitVectors](https://smt-lib.org/theories-FixedSizeBitVectors.shtml),
+[FloatingPoint](https://smt-lib.org/theories-FloatingPoint.shtml),
+[formal FP semantics](https://smt-lib.org/papers/BTRW15.pdf)
 
-- [`mpz`](https://github.com/Z3Prover/z3/blob/430d19e697e2ec9bad79ff210d41b4a7a5fcfa3e/src/util/mpz.h)
-  distinguishes an inline `int` from a large value and has internal and GMP
-  build paths. [`rational`](https://github.com/Z3Prover/z3/blob/430d19e697e2ec9bad79ff210d41b4a7a5fcfa3e/src/util/rational.h)
-  builds on its numeral managers. BV numerals use a rational-valued numeral
-  parameter, with width recorded in the numeral declaration and the AST
-  sort; BV rewrites operate with that size. See the
-  [BV declaration plugin](https://github.com/Z3Prover/z3/blob/430d19e697e2ec9bad79ff210d41b4a7a5fcfa3e/src/ast/bv_decl_plugin.cpp)
-  and [BV rewriter](https://github.com/Z3Prover/z3/blob/430d19e697e2ec9bad79ff210d41b4a7a5fcfa3e/src/ast/rewriter/bv_rewriter.cpp).
-  This is close to Dandelion's *current node* arrangement, not proof that a
-  standalone width-bearing BV value is unnecessary.
-- Its [`mpf`](https://github.com/Z3Prover/z3/blob/430d19e697e2ec9bad79ff210d41b4a7a5fcfa3e/src/util/mpf.h)
-  stores format, sign, multiprecision significand and `int64_t` exponent,
-  and exposes five rounding modes through its own manager. It has explicit
-  field-width limits. Its separate
-  [FP-to-BV converter](https://github.com/Z3Prover/z3/blob/430d19e697e2ec9bad79ff210d41b4a7a5fcfa3e/src/ast/fpa/fpa2bv_converter.cpp)
-  handles symbolic expressions and treats NaN in equality. An independent
-  implementation is useful for differential testing within its actual format
-  limits, but its behavior is not the standard and does not prove correctness.
+Bitwuzla 0.10.0 uses MPFR-backed concrete FP and a separate SymFPU
+representation for symbolic lowering. The pinned cvc5 source can
+use an MPFR or SymFPU concrete backend. Both snapshots pin the same
+upstream SymFPU commit with project-specific integration. A later
+Bitwuzla patch documents small-format issues in integral rounding and
+conversion. Two solver runs can therefore share assumptions,
+implementation, or bugs. Test oracle records need actual formats,
+backend selections, revisions, and flags. [Bitwuzla FP](https://github.com/bitwuzla/bitwuzla/blob/0.10.0/src/fp/floating_point.cpp),
+[Bitwuzla SymFPU pin](https://github.com/bitwuzla/bitwuzla/blob/0.10.0/subprojects/symfpu.wrap),
+[cvc5 concrete selection](https://github.com/cvc5/cvc5/blob/282d5e0c84baf49c780704c532f87ba66d8b513d/src/util/floatingpoint_literal.cpp),
+[cvc5 dependency build](https://github.com/cvc5/cvc5/blob/282d5e0c84baf49c780704c532f87ba66d8b513d/cmake/FindSymFPU.cmake),
+[Bitwuzla tiny-format fixes](https://repo.or.cz/bitwuzla.git/commit/ed2819a17af7fd2559770c58dce9f3f91e9d9dd6)
 
-## Yices 2 commit `ccdf8998809c82763c683c5e4d9f78eabe6a24e3`
+The concrete runtime uses GMP and exact dyadics so its exponent
+semantics follow `FpFormat` under project control. MPFR is an optional
+test oracle for its supported precision and exponent ranges. A valid
+comparison must account for target subnormals, signed zeros,
+rounding-mode support, and overflow. Berkeley SoftFloat Release 3e
+offers another reference for supported IEEE formats. Choice sets,
+arbitrary formats, and the selected SMT-LIB conversion semantics
+need their own exact expectations. [MPFR 4.2.1 manual](https://www.mpfr.org/mpfr-4.2.1/mpfr.pdf),
+[SoftFloat 3e documentation](https://www.jhauser.us/arithmetic/SoftFloat-3/doc/SoftFloat.html)
 
-- [`rational_t`](https://github.com/SRI-CSL/yices2/blob/ccdf8998809c82763c683c5e4d9f78eabe6a24e3/src/terms/rationals.h)
-  stores a small signed numerator and denominator or a tagged pointer to GMP
-  `mpq`; it offers explicitly Euclidean SMT division. This combines small-value
-  arithmetic and a general rational domain. Its pointer tagging, allocation,
-  mutability and C portability assumptions are specific to that implementation.
-  The idea of testing a fast small representation is useful; copying the
-  tagging scheme is not a Dandelion decision.
-- [Small BV constants](https://github.com/SRI-CSL/yices2/blob/ccdf8998809c82763c683c5e4d9f78eabe6a24e3/src/terms/bv64_constants.h)
-  use a `uint64_t` with a separately supplied width; larger
-  [BV constants](https://github.com/SRI-CSL/yices2/blob/ccdf8998809c82763c683c5e4d9f78eabe6a24e3/src/terms/bv_constants.h)
-  use least-significant-first 32-bit words, normalization and explicit size.
-  Their existence demonstrates another storage option, not a performance
-  ranking. The files provide conversion and arithmetic primitives; the width
-  and ownership rules must accompany any use of the raw arrays.
-- The inspected snapshot does not provide an FP value implementation or
-  symbolic FP lowering comparable to the above systems; no claim of a Yices
-  FP oracle is made. Its [README](https://github.com/SRI-CSL/yices2/blob/ccdf8998809c82763c683c5e4d9f78eabe6a24e3/README.md)
-  identifies GMP and optional libpoly/CUDD for MCSAT. Its
-  [source overview](https://github.com/SRI-CSL/yices2/blob/ccdf8998809c82763c683c5e4d9f78eabe6a24e3/doc/NOTES)
-  locates polynomial and interval machinery in term/theory-specific code,
-  supporting an algorithm-owned boundary rather than a universal numeric type.
-
-## Standards and libraries
-
-[SMT-LIB Ints, 2026-01-16](https://smt-lib.org/theories-Ints.shtml),
-[FixedSizeBitVectors, 2025-09-09](https://smt-lib.org/theories-FixedSizeBitVectors.shtml),
-the [QF_BV extensions](https://smt-lib.org/logics-all.shtml), and
-[FloatingPoint, 2024-07-21](https://smt-lib.org/theories-FloatingPoint.shtml)
-define the target semantics in the selected profile. The FP declaration
-explicitly gives its [formal semantics](https://www.ccs.neu.edu/home/wahl/Publications/btrw15.pdf)
-precedence over its informal text. The formal document describes the
-opposite-zero min/max choice and the FP equality distinction.
-
-[GMP 6.3](https://gmplib.org/manual/) supplies exact integers, rationals,
-division variants and integer square root; it does not by itself implement
-the complete FP format, five rounding modes, specials, or underspecification.
-Its [allocation policy](https://gmplib.org/manual/Custom-Allocation) limits
-recoverability. [MPFR 4.2.1](https://www.mpfr.org/mpfr-4.2.1/mpfr.pdf)
-provides correctly rounded arithmetic with specified precision and exponent
-limits; simulating target subnormals and nearest-away still requires careful
-use of its interface. No MPFR is installed or selected here.
-
-The [SymFPU README at the shared commit](https://github.com/martin-cs/symfpu/blob/40bdec00e99f8ea1b96c3dac0a05eed11c541639/README.md)
-describes both concrete and symbolic instantiations and says its concrete
-instantiation is not expected to match a dedicated software FP library's
-performance. That is an upstream author statement, not a Dandelion measurement.
-[Berkeley SoftFloat Release 3e](https://www.jhauser.us/arithmetic/SoftFloat-3/doc/SoftFloat.html)
-is a useful additional IEEE concrete reference for its supported fixed formats,
-rounding and special-case comparison, not an arbitrary-format SMT-LIB or
-underspecified-function oracle. License, build and common ancestry must be
-checked before future integration; it is not a dependency of this proposal.
-
-No Dandelion numeric benchmark or performance experiment was run. Statements
-about allocation, complexity and potential fast paths in these documents are
-mechanistic expectations, not measured speedups. Reproducible tests and future
-measurements must record versions, configured backends and actual independence.
+The chosen layouts and direct paths describe storage and expected
+allocation behavior. The following examples are semantic cross-checks.
+They provide no Dandelion performance measurements.
 
 ## Small hand-case cross-check
 
@@ -190,7 +114,7 @@ The other lines gave exact fma `1/4`, rounded product `2`, sqrt midpoint
 square `169/64` greater than input `5/2`, and remainder `-1/2`. This checks
 only those arithmetic examples and depends on the hand-derived grid; it is
 not an independent SMT solver, an FP implementation test, a performance
-measurement, or a proof of the proposed evaluator.
+measurement, or a proof of the planned evaluator.
 
 ## Small local differential check
 

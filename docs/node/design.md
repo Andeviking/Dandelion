@@ -1,10 +1,14 @@
 # Expression Nodes and Node Manager
 
-Status: **implemented first-version contracts**. This document
-supersedes the earlier node design baseline. The companion
-[operator specification](operators.md) and [implementation plan](implementation.md)
-fix the initial representation and behavior. [Node testing](../testing/node.md)
-sets the test-first acceptance requirements.
+This document records the first-version contracts and the implemented Phase 1
+and Phase 2 additions. [Phase 1C](#10-phase-1c-numeric-boundary-and-typed-literals)
+specifies the typed literal API and the boundary between Node and util.
+[Node overview](README.md)
+
+The companion [operator specification](operators.md) and
+[implementation plan](implementation.md) specify the representation and
+behavior. [Node testing](../testing/node.md) sets the test-first acceptance
+requirements.
 
 ## 1. Responsibility and scope
 
@@ -119,6 +123,12 @@ arity. Instantiation requires exactly that many same-state concrete sorts.
 Frontend `define-sort` expands an alias and does not create a new semantic sort
 identity. Published sort and declaration records live until state destruction.
 
+Phase 1 adds a `MakeBvSort(std::uint64_t)` overload for a width already
+available as a machine word. Zero reports `kInvalidParameter`; a width above
+`UINT32_MAX` reports `kResourceLimit/kSize`. Validate before narrowing.
+Both overloads and derived BV sort inference return the same canonical
+sort identity for a given state and width.
+
 ```cpp
 enum class DeclKind : std::uint8_t {
   kFunction,
@@ -138,16 +148,22 @@ constructor has a group identity, constructor ordinal, ordered field templates,
 and result template. Each selector and tester has its own declaration identity
 and links to its constructor and, for a selector, field ordinal.
 
-The selected frontend design retains a closed application of an internal
-declaration whose body and formal identities are held in an owning definition
-table. That table and the ManagerRef are retained by a sealed query context
-and accompany every query or model using the application; the declaration
-must not be treated as unconstrained UF. Model-local abstract values can also
-use fresh internal constant nodes, distinguished by a model-owned binding
-table. Source scope and `:named` closedness use frontend occurrence records;
-the frontend does not expand calls or retain a second graph to enforce
-catalog fragment shapes. The frontend supplies the environment needed to
-interpret a definition call or a model-local proxy.
+The first-version frontend retains applications of internal declarations
+for nonrecursive definitions. Under the Phase 1 Node boundary, only
+definitions with formal parameters require retained declarations and
+instances. The frontend may bind a closed nullary definition directly to
+its typed body. It owns the body and preserves source name, rank, definition
+record, and occurrence information for scope, diagnostics, and output.
+
+For retained calls, the owning definition table records the body and formal
+identities. The sealed query context retains the table and the `ManagerRef`.
+Every query or model using a retained call needs that environment to
+interpret it as the associated definition. An aliased body can itself
+contain retained calls and therefore needs the same environment. Model-local
+abstract values can also use fresh internal constant nodes, distinguished
+by a model-owned binding table. Source scope and `:named` closedness use
+frontend occurrence records. Frontend admission checks the active signature
+and source profile while keeping retained calls compressed.
 [Frontend semantic interfaces](../frontend/semantic-interfaces.md)
 
 A `DeclInstance` has identity `(DeclId, ordered type arguments)` and exposes
@@ -201,16 +217,25 @@ Computing the magnitude of `INT64_MIN` must not overflow signed arithmetic.
 The GMP C API is private; neither `mpz_t` nor writable limbs are exported.
 Published payloads own their values and cannot be changed through the caller's
 original variable or a returned view.
+[Phase 1C payload design](implementation.md#phase-1c-numeric-payloads)
 
 A `Rational` is a normalized numerator and positive denominator with gcd one;
 zero is `0/1`. A zero denominator is invalid at the numeric API. The
 frontend's rational-to-FP compatibility grammar is specified in
 [operators.md](operators.md#6-floating-point).
 
-A BV value is `(width, nonnegative integer)` with `value < 2^width`; creation
-checks the bound and never truncates. A valid `(_ bvN w)` input has the same
-bound. The `int_to_bv` operation instead has its specified modulo semantics.
-Test the bound using sign and bit length rather than allocating `2^width`.
+A BV value of width `w` has an exact payload `0 <= v < 2^w`.
+`MakeBvValue` requires a canonical `numeric::BitVectorView` of the sort's
+width. To prepare a view from an integer without reduction, use
+`numeric::BitVector::FromIntegerExact`, which checks sign and bit length.
+The frontend reduces the unsigned numeral in SMT-LIB `(_ bvN w)` modulo
+`2^w` before constructing the Node value. The separate `int_to_bv` operation
+also has modulo semantics and is retained as an operation node.
+Phase 1's `MakeBvWordValue` accepts a `std::uint64_t` directly and uses the
+same canonical key and exact fit rule as `MakeBvValue`. It reports
+`kNullObject` for a null sort, `kForeignManager` for a foreign sort,
+`kSortMismatch` for a same-state non-BV sort, and `kInvalidLiteral` for a
+value outside the width.
 
 An explicit FP value is its FP sort and `NaN`, positive or negative infinity,
 positive or negative zero, or `FiniteBits` containing exact nonzero finite
@@ -220,14 +245,15 @@ are retained even for constant children. They may denote the same value as a
 literal without having the same structural identity. Rounding modes are RNE,
 RNA, RTP, RTN, and RTZ. MPFR is not required by this expression representation.
 
-For `MakeFpBits(F(e,s), bits)`, require nonnegative `bits` with bit length at
+To create an FP value from packed bits, use the checked util constructor. It
+requires nonnegative `bits` with bit length at
 most `e+s`. The high bit is sign, the next `e` bits are exponent, and the low
 `s-1` bits are fraction. An all-one exponent and nonzero fraction is NaN; an
 all-one exponent and zero fraction is signed infinity; an all-zero exponent
 and zero fraction is signed zero. Every remaining pattern is finite nonzero
 `FiniteBits`, including subnormals. Inspect fields without materializing a
-huge all-ones constant merely to recognize a special value. `MakeFpSpecial`
-selects the corresponding canonical category directly.
+huge all-ones constant merely to recognize a special value. The util special constructor selects
+the corresponding canonical category directly.
 
 ## 6. Ownership and lifetime
 
@@ -295,6 +321,8 @@ struct NodeError {
 
 `NodeError` has fixed-size fields and requires no allocation; an inapplicable
 index is `UINT64_MAX`. The frontend associates source occurrences separately.
+The ownership and translation of numeric errors are specified in
+[Phase 1C](#phase-1c-error-translation).
 Datatype diagnostics use a fixed-size, defaulted reason field. The builder
 reports `kEmptyGroup`, `kNoConstructor`, `kInvalidParameterScope`,
 `kNestedRecursiveSort` and `kNonproductive` under the established code
@@ -328,34 +356,20 @@ A terminated process must not fabricate `sat` or `unsat`.
 
 ## 8. Initial API
 
-The following establishes the first-version API shape; normal special members,
-private representation, and range boilerplate are omitted. Returned owning
-objects hold their references. Factory inputs are borrowed for the call and
-spans, names, and temporary views are not retained as payload.
+The following shows the implemented NodeManager API. The
+[typed literal and format queries](#phase-1c-typed-literal-and-sort-api)
+describe the numeric boundary.
+The [Phase 2 consuming additions](#phase-2-consuming-construction) follow
+the rebuild contract.
+Returned owning objects hold their references. Factory inputs are borrowed
+for the call and spans, names, and temporary views are not retained as payload.
 
 ```cpp
-class Integer {
- public:
-  explicit Integer(std::int64_t value) noexcept;
-  static Result<Integer> ParseDecimal(std::string_view text);
-  IntegerView Borrow() const & noexcept;
-  IntegerView Borrow() const && = delete;
-  std::string ToDecimal() const;
-};
-
-class Rational {
- public:
-  static Result<Rational> Make(IntegerView numerator,
-                               IntegerView denominator);
-  RationalView Borrow() const & noexcept;
-  RationalView Borrow() const && = delete;
-};
-
 struct BuiltinOpView {
   Kind kind;
-  std::span<const Integer> indices;
+  std::span<const numeric::Integer> indices;
   std::optional<SortView> qualifier;
-  std::optional<RationalView> rational;
+  std::optional<numeric::RationalView> rational;
 };
 
 class NodeManager {
@@ -376,8 +390,10 @@ class NodeManager {
   Result<Sort> BoolSort();
   Result<Sort> IntSort();
   Result<Sort> RoundingModeSort();
-  Result<Sort> MakeBvSort(IntegerView width);
-  Result<Sort> MakeFpSort(IntegerView exponent, IntegerView significand);
+  Result<Sort> MakeBvSort(numeric::IntegerView width);
+  Result<Sort> MakeBvSort(std::uint64_t width);  // Phase 1
+  Result<Sort> MakeFpSort(numeric::IntegerView exponent,
+                          numeric::IntegerView significand);
   Result<Sort> MakeArraySort(SortView index, SortView element);
   Result<SortConstructor> DeclareUninterpretedSort(
       std::string_view name_hint, std::uint64_t arity);
@@ -395,16 +411,22 @@ class NodeManager {
       DeclView declaration, std::span<const SortView> type_arguments);
 
   Result<Node> MakeBool(bool value);
-  Result<Node> MakeInt(IntegerView value);
-  Result<Node> MakeBvValue(SortView sort, IntegerView value);
-  Result<Node> MakeFpBits(SortView sort, IntegerView packed_bits);
-  Result<Node> MakeFpSpecial(SortView sort, FpSpecial value);
-  Result<Node> MakeRoundingMode(RoundingMode value);
+  Result<Node> MakeInt(numeric::IntegerView value);
+  Result<Node> MakeBvValue(SortView sort, numeric::BitVectorView value);
+  Result<Node> MakeBvWordValue(SortView sort, std::uint64_t value);  // Phase 1
+  Result<Node> MakeFpValue(SortView sort, numeric::FloatingPointView value);
+  Result<Node> MakeRoundingMode(numeric::RoundingMode value);
   Result<Node> MakeFreshConstant(std::string_view name_hint, SortView sort);
   Result<Sort> CheckBuiltin(BuiltinOpView op,
                             std::span<const NodeView> children);
   Result<Node> MakeBuiltin(BuiltinOpView op,
                             std::span<const NodeView> children);
+  // Phase 1
+  Result<Node> MakeWordIndexedBuiltin(
+      Kind kind, std::span<const std::uint64_t> indices,
+      std::span<const NodeView> children);
+  Result<Node> RebuildNode(
+      NodeView original, std::span<const NodeView> children);  // Phase 1
   Result<Node> MakeApply(DeclInstanceView declaration,
                          std::span<const NodeView> arguments);
   Result<DatatypeBuilder> BeginDatatypeGroup(
@@ -418,22 +440,116 @@ length, hash, and checked narrowing without writable GMP state. `IsSmall()`
 means the value fits a signed word. `ParseDecimal`
 accepts an optional leading minus and one or more decimal digits, with no
 whitespace or leading plus; leading zeroes and negative zero normalize to the
-same mathematical value. Invalid text is `kInvalidLiteral`. `ToDecimal`
-returns a canonical signed decimal string and can throw C++ allocation failure.
-`Rational::Make` rejects denominator zero as `kInvalidParameter` and copies
-and normalizes both values. These numeric APIs do not promise recovery from
-GMP limb OOM.
+same mathematical value. Util reports malformed text as `kInvalidText` and
+a zero rational denominator as `kDivisionByZero`. `ToDecimal` returns a
+canonical signed decimal string and can throw C++ allocation failure.
 
 `CheckBuiltin` and `MakeBuiltin` use the same operator rules. The former may
-intern a valid result sort but does not create a node. `MakeFpBits` and
-`MakeBvValue` require a nonnegative value fitting the target format. Fresh
-declarations never intern by name. Source namespace and redeclaration checks
+intern a valid result sort but does not create a node. Fresh declarations
+never intern by name. Source namespace and redeclaration checks
 belong to the frontend.
+
+`MakeWordIndexedBuiltin` has the behavior of `MakeBuiltin` with the same
+kind, exact index values and ordered children, and absent qualifier and
+rational fields. It uses the same validation and canonical structural key,
+with no caller-owned `Integer` vector required. Use the general factory for
+indices beyond the unsigned word range or payloads requiring a qualifier
+or rational.
+
+### Phase 1 payload-preserving rebuild
+
+`RebuildNode` accepts a live, nonnull original in the receiving manager
+state. The replacement span must have the same length as
+`original.GetChildren()`. Each replacement must be live, nonnull, in that
+state, and have the same concrete sort as the original child at its position.
+The caller keeps the original and replacements alive throughout the call.
+Null views, foreign states, wrong arity and wrong operand sorts return
+`NodeError` with `kNullObject`, `kForeignManager`, `kInvalidArity` or
+`kSortMismatch`, respectively. Report the child position for a child error.
+
+When every child has the same identity as the original child at its
+position, checked-retain and return the original directly, without hashing
+a key or probing the table. This includes all zero-child nodes. Otherwise,
+intern the replacement child sequence while preserving the original kind,
+established result sort, and exact payload, including indices, qualifier,
+rational parameter, or `DeclInstance` identity as applicable. Same-position
+sort equality preserves the original rank. The rebuild uses it directly,
+skipping `CheckBuiltin` and result-sort inference and borrowing the original
+payload without reconstructing an index vector. The result shares identity
+with ordinary construction of the same kind, children, and payload while
+both results are live. An exact hit returns a new owner of that node.
+A miss owns its payload and child edges before
+publication. The factory guarantees in §7 apply to both paths.
+
+### Phase 2 consuming construction
+
+Add these checked `NodeManager` members.
+
+```cpp
+Result<Node> MakeBuiltinConsuming(BuiltinOpView op,
+                                   std::span<Node> children);
+Result<Node> MakeWordIndexedBuiltinConsuming(
+    Kind kind, std::span<const std::uint64_t> indices,
+    std::span<Node> children);
+Result<Node> RebuildNodeConsuming(NodeView original,
+                                  std::span<Node> children);
+Result<Node> MakeApplyConsuming(DeclInstanceView declaration,
+                                 std::span<Node> arguments);
+Result<Sort> CheckBuiltinOperands(BuiltinOpView op,
+                                  std::span<const Node> children);
+```
+
+Every slot is a distinct mutable owning handle, with the range kept live
+and stable for the call. The slots may own the same node. Validate null
+and foreign handles, typed rank, index and payload rules and error
+attribution as for the equivalent borrowed factory. The same-position
+sort and live-original requirements of `RebuildNode` apply. Payload views,
+including views into the original or operands, remain valid through key
+comparison and preparation. If the original is owned by an input slot
+with no other owner, the caller's original view is usable after a miss
+only if the result or another live owner keeps that node alive.
+
+| Outcome | Inputs and result |
+| --- | --- |
+| New parent | Transfer the ownership of each slot into the corresponding published child edge and make each input slot null. Each transferred reference remains counted once, with no per-edge retain or release. Adopt the new parent as the result. |
+| Exact hit | Checked-retain and return the canonical parent. Every input slot still owns its original node. This includes an unchanged rebuild and an empty operand range. The caller can release inputs normally. |
+| Recoverable error | Return the corresponding `NodeError`. Every input slot still owns its original node. Publish no parent or new node ID. The existing private capacity and derived sort guarantees apply. |
+
+A consumed `[a, a]` has two input owners and two edges. The parent
+destructor releases both references. Separate caller-owned children,
+roots and other parents retain their own references. Since transfer
+already has the needed references, exhaustion that would block a
+borrowed child retain does not block a move-in miss. A failed result
+retain on a hit or manager-state retain on a miss still reports
+`kResourceLimit/kReferenceCount`. The existing borrowed factories remain
+available for callers with borrowed inputs. Both paths share the same key
+and payload storage and interoperate with the same unique table.
+
+The consuming interface takes contiguous `Node` storage. Frontend
+operands use that layout with separate position and dependency buffers.
+An array of larger records with a `Node` member must never be cast to a
+`std::span<Node>`. Internally, rank validation, hashing, equality and
+payload preparation read each child through its typed input range. This
+avoids building a second array of `NodeView` handles.
+`CheckBuiltinOperands` is the check-only counterpart of `CheckBuiltin`
+for owning slots. It returns the inferred sort or the same structured
+diagnostic and preserves each slot, without allocating a parent. The
+frontend uses it to replay rank validation in written order when an
+optional operand permutation fails.
+
+### Handle ownership and views
 
 The `Retain*` operations check nonnull and same-state views and return new
 owning handles, translating count exhaustion to `kResourceLimit`. A borrowed
 view's owner must remain alive throughout the call; these operations cannot
 recover a reclaimed object from a stale pointer or raw ID.
+
+`RootRange` has private storage and can be constructed only through typed
+`RootRange::From(std::span<Node>)` or
+`RootRange::From<&Record::member>(std::span<Record>)` factories, where the
+member is a `Node`. Arbitrary user callback pointers are not accepted.
+The static batch `ReleaseRoots` accepts a manager and a span of these ranges;
+it validates all slots before clearing any; reclamation may attempt a table rebuild.
 
 `ReleaseRoots` consumes a span of owning handles, clearing each slot. Null
 slots are allowed. A foreign handle rejects the whole span before any slot
@@ -479,8 +595,9 @@ live `Node` objects. `Child` returns an owning node; an out-of-range index is
 for ID; other accessors require a live, nonnull object. Wrong view lifetime is
 a caller contract violation. `NodeIndices` is a borrowed range in operand
 index order. Its elements expose an exact `IntegerView` via `Borrow()` and
-can format it with `ToDecimal()`. To pass them to a factory, copy the values
-that need to be materialized as `Integer` objects.
+can format it with `ToDecimal()`. General builtin construction takes
+`Integer` objects. Phase 1 also accepts a span of exact unsigned words for
+word-sized indices and can reuse the stored payload directly when rebuilding.
 `SortView` exposes kind and applicable parameters;
 `DeclView` and `DeclInstanceView` expose category, identity, type arguments,
 signatures, and datatype links; `LiteralView` exposes its immutable value.
@@ -550,10 +667,12 @@ indexing and range iteration; their iterators borrow the owning state or DAG.
 existing constructor or recursive group slot, and checked recipe arguments.
 Datatype declarations expose checked domain recipes and an optional range
 recipe; ordinary declarations expose concrete signatures. Wrong-category
-optional queries return no value. Read-only numeric magnitude chunks are in
-least-significant-first order and never expose GMP storage. A wide numeric
+optional queries return no value. Numeric views expose read-only magnitude
+chunks in least-significant-first order. A wide numeric
 view requires its backing value to stay alive and unchanged. Replacing, moving
 from, or destroying the owning numeric value may invalidate the view.
+Each numeric literal exposes its corresponding
+[typed value view](#phase-1c-typed-literal-and-sort-api).
 
 `SortRecipeView::GetId() -> std::uint64_t` identifies that recipe only
 within its owning datatype group and NodeManager state, for as long as the
@@ -582,3 +701,94 @@ destination is unchanged. Moving an Integer leaves zero; moving a Rational
 leaves canonical 0/1. Rational moves do not allocate, are noexcept, and preserve
 self-move. Numeric and manager allocation injection exists only in test builds. Normal public factories still catch real `std::bad_alloc` and
 size errors, with GMP limb allocation following its independent fatal policy.
+
+## 10. Phase 1C numeric boundary and typed literals
+
+Standalone exact values and their operations belong to
+`dandelion.util.numeric`, whose declarations are in `dandelion::numeric`.
+Node owns checked expression construction, sort compatibility, interning,
+and the storage for published node values. It uses a direct
+`import dandelion.util.numeric;`. Callers that name or construct util values
+import that module explicitly. The former `dandelion.numeric`
+module was removed in Phase 4A.
+Public module interfaces carry no test peer declarations or test-only friends.
+[Numeric layer contracts](../util/design.md)
+[Phase 1C module and test boundary](implementation.md#phase-1c-module-and-test-boundary)
+
+### Phase 1C typed literal and sort API
+
+The signatures below show the affected methods in their owning classes.
+`MakeInt` and `GetRationalParameter` retain their contracts using util's
+views. `MakeBvWordValue` retains its direct `uint64_t` input and fit check.
+
+```cpp
+// NodeManager
+Result<Node> MakeInt(numeric::IntegerView value);
+Result<Node> MakeBvValue(SortView sort, numeric::BitVectorView value);
+Result<Node> MakeBvWordValue(SortView sort, std::uint64_t value);
+Result<Node> MakeFpValue(SortView sort, numeric::FloatingPointView value);
+
+// LiteralView
+std::optional<numeric::IntegerView> GetInteger() const noexcept;
+std::optional<numeric::BitVectorView> GetBitVector() const noexcept;
+std::optional<numeric::FloatingPointView> GetFloatingPoint() const noexcept;
+
+// SortView
+std::optional<numeric::FpFormat> GetFpFormat() const noexcept;
+
+// NodeView
+std::optional<numeric::RationalView> GetRationalParameter() const noexcept;
+```
+
+- Validate the explicit sort's ownership and category. A null sort reports
+  `kNullObject`, a foreign sort reports `kForeignManager`, and a sort of the
+  wrong category reports `kSortMismatch`. For `MakeBvValue`, the width in the
+  typed value must equal the BV sort width. For `MakeFpValue`, both format
+  fields must equal the sort's exponent and significand widths. A disagreement
+  reports `kSortMismatch`. The util value's construction establishes its
+  numeric invariants. `MakeBvWordValue` checks the input directly and reports
+  `kInvalidLiteral` for a word that exceeds the width.
+- `GetInteger()` serves Int literals only. `GetBitVector()` serves BV
+  literals and includes their width. `GetFloatingPoint()` serves FP literals
+  and includes their format and canonical category, with exact packed bits
+  for finite nonzero values. Querying another literal category returns
+  `std::nullopt`. `GetFpFormat()` returns both widths for an FP sort and
+  `std::nullopt` for other sorts. Accessors on views require a live owner.
+- Construct FP values with `numeric::FloatingPointValue::FromBits` or
+  `numeric::FloatingPointValue::Special` and pass the view to `MakeFpValue`.
+  `GetFloatingPoint()` provides the category and any finite bits.
+  `GetFpFormat()` provides the format widths. NaNs intern once per format,
+  signed zeros and signed infinities remain distinct, and finite bits retain
+  their exact value. Packed bit classification belongs to util.
+- The typed and word BV paths select the same canonical key for a matching
+  sort and magnitude. Node copies the canonical numeric content on a miss.
+  Borrowed results allocate no storage and take no references. A wide result
+  borrows directly from the published node and requires an owner of that node
+  to remain live. Destroying or changing the original util input after the
+  call has no effect on the node. Rational parameters remain exact, normalized
+  `to_fp` payloads, and `fp` and `to_fp` applications remain operation nodes.
+
+### Phase 1C error translation
+
+`dandelion.node` defines and exports `ErrorCode`, `ResourceKind`,
+`DatatypeReason`, `NodeError`, `Result<T>`, and `ReferenceLimit`.
+`dandelion.util.numeric` owns `numeric::NumericError` and
+`numeric::NumericResult<T>`. When a util operation inside a checked factory
+returns an error, NodeManager translates it before returning a `Result<T>`.
+
+| Util failure | Node result |
+| --- | --- |
+| `kInvalidText`, `kInvalidArgument`, `kValueOutOfRange` | `kInvalidLiteral` for a literal payload or `kInvalidParameter` for an operator or sort parameter. |
+| `kDivisionByZero` | `kInvalidParameter` when preparing an exact numeric parameter requires a nonzero denominator. |
+| `kSizeLimit` | `kResourceLimit/kSize`. |
+| `kCppAllocation` | `kResourceLimit/kCppAllocation`. |
+
+Node fills an operand or parameter index only when the failing input has a
+known position in the Node call. Other positions stay `UINT64_MAX` and the
+datatype reason stays `kNone`. Manager and sort mismatches are determined by
+Node validation, and util results returned directly to other callers keep
+their numeric error type. Checked numeric division concerns concrete
+arithmetic. Symbolic Int `div` and `mod` remain valid with a zero divisor.
+Factory failures preserve the existing publication and ownership guarantees.
+Checked reference limits and actual GMP allocator termination follow the
+policies in [Errors and factory guarantees](#7-errors-and-factory-guarantees).
